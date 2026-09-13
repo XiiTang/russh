@@ -277,6 +277,7 @@ pub enum Method {
     None,
     Password {
         password: String,
+        new_password: Option<String>,
     },
     PublicKey {
         key: PrivateKeyWithHashAlg,
@@ -306,8 +307,9 @@ pub enum Method {
 
 impl Drop for Method {
     fn drop(&mut self) {
-        if let Method::Password { password } = self {
+        if let Method::Password { password, new_password } = self {
             password.zeroize();
+            new_password.zeroize();
         }
     }
 }
@@ -371,6 +373,7 @@ pub(crate) struct AuthPrincipal {
 #[doc(hidden)]
 #[derive(Debug)]
 pub enum CurrentRequest {
+    Password,
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     PublicKey {
         #[allow(dead_code)]
@@ -400,6 +403,7 @@ impl AuthRequest {
 
     pub(crate) fn new(method: &Method) -> Self {
         let current = match method {
+            Method::Password {..} => Some(CurrentRequest::Password),
             Method::KeyboardInteractive { submethods } => {
                 Some(CurrentRequest::KeyboardInteractive {
                     submethods: submethods.to_string(),
