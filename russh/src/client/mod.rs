@@ -114,6 +114,7 @@ impl Drop for Session {
 #[allow(clippy::large_enum_variant)]
 enum Reply {
     AuthSuccess,
+    AuthPasswordChange { prompt: String, language: String },
     AuthFailure {
         proceed_with_methods: MethodSet,
         partial_success: bool,
@@ -258,6 +259,14 @@ impl From<(ChannelId, ChannelMsg)> for Msg {
 /// `AdministrativelyProhibited` rejection to the server.
 pub type ChannelOpenHandle = crate::ChannelOpenHandleInner<Msg>;
 
+/// Password authentication either completes or explicitly requests a new password.
+#[derive(Debug)]
+pub enum PasswordAuthResponse {
+    Success,
+    Failure { remaining_methods: MethodSet, partial_success: bool },
+    ChangeRequired { prompt: String, language: String },
+}
+
 #[derive(Debug)]
 pub enum KeyboardInteractiveAuthResponse {
     Success,
@@ -343,11 +352,35 @@ impl<H: Handler> Handle<H> {
                 user,
                 method: auth::Method::Password {
                     password: password.into(),
+                    new_password: None,
                 },
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
         self.wait_recv_reply().await
+    }
+
+    /// Begin password authentication, returning RFC 4252 password-change prompts.
+    pub async fn authenticate_password_start<U: Into<String>, P: Into<String>>(&mut self, user: U, password: P) -> Result<PasswordAuthResponse, crate::Error> {
+        self.sender.send(Msg::Authenticate { user: user.into(), method: auth::Method::Password { password: password.into(), new_password: None } }).await.map_err(|_| crate::Error::SendError)?;
+        self.wait_password_reply().await
+    }
+
+    /// Submit an explicitly supplied replacement password. No retry or storage occurs.
+    pub async fn authenticate_password_change<U: Into<String>, P: Into<String>, N: Into<String>>(&mut self, user: U, old_password: P, new_password: N) -> Result<PasswordAuthResponse, crate::Error> {
+        self.sender.send(Msg::Authenticate { user: user.into(), method: auth::Method::Password { password: old_password.into(), new_password: Some(new_password.into()) } }).await.map_err(|_| crate::Error::SendError)?;
+        self.wait_password_reply().await
+    }
+    async fn wait_password_reply(&mut self) -> Result<PasswordAuthResponse, crate::Error> {
+        loop {
+            match self.receiver.recv().await {
+                Some(Reply::AuthSuccess) => return Ok(PasswordAuthResponse::Success),
+                Some(Reply::AuthFailure {proceed_with_methods:remaining_methods,partial_success}) => return Ok(PasswordAuthResponse::Failure {remaining_methods,partial_success}),
+                Some(Reply::AuthPasswordChange {prompt,language}) => return Ok(PasswordAuthResponse::ChangeRequired {prompt,language}),
+                None => return Err(crate::Error::Disconnect),
+                _ => {},
+            }
+        }
     }
 
     /// Initiate Keyboard-Interactive based SSH authentication.
@@ -425,6 +458,7 @@ impl<H: Handler> Handle<H> {
     async fn wait_recv_reply(&mut self) -> Result<AuthResult, crate::Error> {
         loop {
             match self.receiver.recv().await {
+                Some(Reply::AuthPasswordChange {..}) => return Err(crate::Error::PasswordChangeRequired),
                 Some(Reply::AuthSuccess) => return Ok(AuthResult::Success),
                 Some(Reply::AuthFailure {
                     proceed_with_methods: remaining_methods,
