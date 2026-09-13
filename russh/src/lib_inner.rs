@@ -183,6 +183,9 @@ pub enum Error {
     /// Missing authentication method.
     #[error("No authentication method")]
     NoAuthMethod,
+    /// Use the explicit password-change authentication API to continue.
+    #[error("Server requires an explicit password change")]
+    PasswordChangeRequired,
 
     #[error("Channel send error")]
     SendError,
