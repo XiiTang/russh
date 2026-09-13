@@ -143,7 +143,13 @@ impl Session {
                             }
                         }
                         Some((&msg::USERAUTH_INFO_REQUEST_OR_USERAUTH_PK_OK, mut r)) => {
-                            if let Some(auth::CurrentRequest::GssapiWithMic) = auth_request.current
+                            if let Some(auth::CurrentRequest::Password) = auth_request.current {
+                                let prompt = map_err!(String::decode(&mut r))?;
+                                let language = map_err!(String::decode(&mut r))?;
+                                map_err!(ensure_end(&r))?;
+                                self.sender.send(Reply::AuthPasswordChange {prompt,language}).map_err(|_| crate::Error::SendError)?;
+                                return Ok(());
+                            } else if let Some(auth::CurrentRequest::GssapiWithMic) = auth_request.current
                             {
                                 debug!("userauth_gssapi_response");
                                 let selected_mechanism = map_err!(Bytes::decode(&mut r))?.to_vec();
@@ -1333,12 +1339,13 @@ impl Encrypted {
                     "none".encode(&mut self.write)?;
                     true
                 }
-                auth::Method::Password { ref password } => {
+                auth::Method::Password { ref password, ref new_password } => {
                     user.encode(&mut self.write)?;
                     "ssh-connection".encode(&mut self.write)?;
                     "password".encode(&mut self.write)?;
-                    0u8.encode(&mut self.write)?;
+                    u8::from(new_password.is_some()).encode(&mut self.write)?;
                     password.encode(&mut self.write)?;
+                    if let Some(new_password) = new_password { new_password.encode(&mut self.write)?; }
                     true
                 }
                 auth::Method::PublicKey { ref key } => {
