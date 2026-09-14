@@ -96,6 +96,7 @@ pub struct Session {
     target_window_size: u32,
     pending_reads: Vec<Vec<u8>>,
     pending_len: u32,
+    managed_close: Arc<tokio::sync::Notify>,
     priority_sender: UnboundedSender<Msg>,
     priority_receiver: UnboundedReceiver<Msg>,
     inbound_channel_sender: Sender<Msg>,
@@ -306,6 +307,7 @@ pub enum DisconnectReason<E: From<crate::Error> + Send> {
 /// Handle to a session, used to send messages to a client outside of
 /// the request/response cycle.
 pub struct Handle<H: Handler> {
+    managed_close: Arc<tokio::sync::Notify>,
     sender: Sender<Msg>,
     receiver: UnboundedReceiver<Reply>,
     join: russh_util::runtime::JoinHandle<Result<(), H::Error>>,
@@ -826,6 +828,19 @@ impl<H: Handler> Handle<H> {
     /// connection is authenticated, but the channel only becomes
     /// usable when it's confirmed by the server, as indicated by the
     /// `confirmed` field of the corresponding `Channel`.
+    /// Open a cancellation-owned session channel. An abandoned OPEN is closed
+    /// on confirmation; cancellation never waits behind window-blocked data.
+    pub async fn channel_open_session_managed(&self) -> Result<crate::channels::ManagedChannel<Msg>, crate::Error> {
+        let guard = crate::channels::managed::CloseGuard::new(self.managed_close.clone());
+        let (sender, receiver) = channel(self.channel_buffer_size);
+        let mut channel_ref = ChannelRef::new(sender);
+        channel_ref.managed_close = Some(guard.flag.clone());
+        let window_size_ref = channel_ref.window_size().clone();
+        self.sender.send(Msg::ChannelOpenSession { channel_ref }).await.map_err(|_|crate::Error::SendError)?;
+        let channel = self.wait_channel_confirmation(receiver, window_size_ref).await?;
+        Ok(crate::channels::ManagedChannel { channel, guard })
+    }
+
     pub async fn channel_open_session(&self) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let channel_ref = ChannelRef::new(sender);
@@ -1184,6 +1199,7 @@ where
         session_receiver,
         session_sender,
     );
+    let managed_close = session.managed_close.clone();
     session.begin_rekey()?;
     let (kex_done_signal, kex_done_signal_rx) = oneshot::channel();
     let join = russh_util::runtime::spawn(session.run(stream, handler, Some(kex_done_signal)));
@@ -1197,6 +1213,7 @@ where
     }
 
     Ok(Handle {
+        managed_close,
         sender: handle_sender,
         receiver: handle_receiver,
         join,
@@ -1249,6 +1266,7 @@ impl Session {
             sender,
             kex: SessionKexState::Idle,
             target_window_size,
+            managed_close: Arc::new(tokio::sync::Notify::new()),
             priority_sender,
             priority_receiver,
             inbound_channel_sender,
@@ -1343,8 +1361,12 @@ impl Session {
             // Keep reading the network for window adjustments, but leave
             // application output in its bounded receivers while a channel is
             // window-blocked.
+            let managed_close = self.managed_close.clone();
             let can_receive_outbound = !self.kex.active() && !self.common.has_any_pending_data();
             tokio::select! {
+                () = managed_close.notified(), if !self.kex.active() => {
+                    self.close_managed_channels()?;
+                }
                 r = &mut reading => {
                     let (stream_read, mut buffer, mut opening_cipher) = match r {
                         Ok((_, stream_read, buffer, opening_cipher)) => (stream_read, buffer, opening_cipher),
@@ -1436,6 +1458,7 @@ impl Session {
                 }
             };
 
+            self.close_managed_channels()?;
             self.flush()?;
             crate::flush_or_timeout(
                 &mut self.common.packet_writer,
@@ -1507,6 +1530,23 @@ impl Session {
     /// whose confirmation is still sitting in the priority queue, and
     /// dispatching that data first would silently drop it (the channel is
     /// only registered when its open reply is processed).
+    fn close_managed_channels(&mut self) -> Result<(), crate::Error> {
+        if self.kex.active() { return Ok(()); }
+        let ids: Vec<_> = self.channels.iter().filter_map(|(id, channel)| {
+            (channel.managed_close.as_ref().is_some_and(|flag|flag.load(std::sync::atomic::Ordering::Acquire)) && self.common.is_established_channel(*id)).then_some(*id)
+        }).collect();
+        for id in ids {
+            if let Some(enc) = self.common.encrypted.as_mut() {
+                if let Some(channel) = enc.channels.get_mut(&id) {
+                    channel.pending_data.clear();
+                }
+                enc.close(id)?;
+            }
+            self.channels.remove(&id);
+        }
+        Ok(())
+    }
+
     fn drain_priority_msgs(&mut self) -> Result<(), crate::Error> {
         while !self.kex.active() {
             match self.priority_receiver.try_recv() {

@@ -349,7 +349,7 @@ impl Session {
                                 let _language_tag = map_err!(String::decode(&mut r))?;
                                 map_err!(ensure_end(&r))?;
                                 warn!(
-                                    "userauth_gssapi_error major={major_status} minor={minor_status}: {message}"
+                                    "userauth_gssapi_error major={major_status} minor={minor_status}"
                                 );
                                 self.sender
                                     .send(Reply::AuthGssapiError {
