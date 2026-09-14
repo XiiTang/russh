@@ -9,6 +9,7 @@ use crate::ChannelMsg;
 pub struct ChannelRef {
     pub(super) sender: Sender<ChannelMsg>,
     pub(super) window_size: WindowSizeRef,
+    pub(crate) managed_close: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl ChannelRef {
@@ -16,6 +17,7 @@ impl ChannelRef {
         Self {
             sender,
             window_size: WindowSizeRef::new(0),
+            managed_close: None,
         }
     }
 

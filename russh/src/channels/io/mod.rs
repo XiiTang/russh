@@ -9,7 +9,7 @@ pub use tx::ChannelTx;
 use crate::{Channel, ChannelId, ChannelMsg, ChannelReadHalf};
 
 #[derive(Debug)]
-pub struct ChannelCloseOnDrop<S: From<(ChannelId, ChannelMsg)> + Send + 'static>(pub Channel<S>);
+pub struct ChannelCloseOnDrop<S: From<(ChannelId, ChannelMsg)> + Send + 'static>(pub Channel<S>, pub(crate) Option<super::managed::CloseGuard>);
 
 impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Borrow<ChannelReadHalf>
     for ChannelCloseOnDrop<S>
@@ -29,6 +29,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> BorrowMut<ChannelReadHal
 
 impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Drop for ChannelCloseOnDrop<S> {
     fn drop(&mut self) {
+        if self.1.is_some() { return; }
         let id = self.0.write_half.id;
         let sender = self.0.write_half.sender.clone();
 
