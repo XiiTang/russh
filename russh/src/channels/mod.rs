@@ -14,6 +14,8 @@ pub use channel_ref::ChannelRef;
 
 mod channel_stream;
 pub use channel_stream::ChannelStream;
+pub(crate) mod managed;
+pub use managed::ManagedChannel;
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -484,6 +486,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
             ChannelRef {
                 sender: tx,
                 window_size,
+                managed_close: None,
             },
         )
     }
@@ -659,6 +662,9 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
     /// Consume the [`Channel`] to produce a bidirectionnal stream,
     /// sending and receiving [`ChannelMsg::Data`] as `AsyncRead` + `AsyncWrite`.
     pub fn into_stream(self) -> ChannelStream<S> {
+        self.stream_with_close(None)
+    }
+    fn stream_with_close(self, close: Option<managed::CloseGuard>) -> ChannelStream<S> {
         ChannelStream::new(
             io::ChannelTx::new(
                 self.write_half.sender.clone(),
@@ -668,7 +674,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
                 self.write_half.max_packet_size,
                 None,
             ),
-            io::ChannelRx::new(io::ChannelCloseOnDrop(self), None),
+            io::ChannelRx::new(io::ChannelCloseOnDrop(self, close), None),
         )
     }
 
