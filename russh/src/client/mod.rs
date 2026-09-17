@@ -92,7 +92,6 @@ pub struct Session {
     receiver: Receiver<Msg>,
     sender: UnboundedSender<Reply>,
     channels: HashMap<ChannelId, ChannelRef>,
-    target_window_size: u32,
     pending_reads: Vec<Vec<u8>>,
     pending_len: u32,
     managed_close: Arc<tokio::sync::Notify>,
@@ -734,11 +733,13 @@ impl<H: Handler> Handle<H> {
     /// Wait for confirmation that a channel is open
     async fn wait_channel_confirmation(
         &self,
-        mut receiver: Receiver<ChannelMsg>,
+        receiver: Receiver<ChannelMsg>,
+        inbox: Arc<crate::channels::inbox::Inbox>,
         window_size_ref: WindowSizeRef,
     ) -> Result<Channel<Msg>, crate::Error> {
+        let mut read_half = ChannelReadHalf { receiver, inbox: Some(inbox) };
         loop {
-            match receiver.recv().await {
+            match read_half.wait().await {
                 Some(ChannelMsg::Open {
                     id,
                     max_packet_size,
@@ -753,7 +754,7 @@ impl<H: Handler> Handle<H> {
                             max_packet_size,
                             window_size: window_size_ref,
                         },
-                        read_half: ChannelReadHalf { receiver },
+                        read_half,
                     });
                 }
                 Some(ChannelMsg::OpenFailure(reason)) => {
@@ -841,23 +842,27 @@ impl<H: Handler> Handle<H> {
         let guard = crate::channels::managed::CloseGuard::new(self.managed_close.clone());
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
+        let inbox = crate::channels::inbox::Inbox::new(self.managed_close.clone(), self.channel_buffer_size);
+        channel_ref.inbox = Some(inbox.clone());
         channel_ref.managed_close = Some(guard.flag.clone());
         let window_size_ref = channel_ref.window_size().clone();
         self.sender.send(Msg::ChannelOpenSession { channel_ref }).await.map_err(|_|crate::Error::SendError)?;
-        let channel = self.wait_channel_confirmation(receiver, window_size_ref).await?;
+        let channel = self.wait_channel_confirmation(receiver, inbox, window_size_ref).await?;
         Ok(crate::channels::ManagedChannel { channel, guard })
     }
 
     pub async fn channel_open_session(&self) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let mut channel_ref = ChannelRef::new(sender);
+        let inbox = crate::channels::inbox::Inbox::new(self.managed_close.clone(), self.channel_buffer_size);
+        channel_ref.inbox = Some(inbox.clone());
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
             .send(Msg::ChannelOpenSession { channel_ref })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, inbox, window_size_ref)
             .await
     }
 
@@ -868,7 +873,9 @@ impl<H: Handler> Handle<H> {
         originator_port: u32,
     ) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let mut channel_ref = ChannelRef::new(sender);
+        let inbox = crate::channels::inbox::Inbox::new(self.managed_close.clone(), self.channel_buffer_size);
+        channel_ref.inbox = Some(inbox.clone());
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -879,7 +886,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, inbox, window_size_ref)
             .await
     }
 
@@ -899,7 +906,9 @@ impl<H: Handler> Handle<H> {
         originator_port: u32,
     ) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let mut channel_ref = ChannelRef::new(sender);
+        let inbox = crate::channels::inbox::Inbox::new(self.managed_close.clone(), self.channel_buffer_size);
+        channel_ref.inbox = Some(inbox.clone());
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -912,7 +921,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, inbox, window_size_ref)
             .await
     }
 
@@ -921,7 +930,9 @@ impl<H: Handler> Handle<H> {
         socket_path: S,
     ) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let mut channel_ref = ChannelRef::new(sender);
+        let inbox = crate::channels::inbox::Inbox::new(self.managed_close.clone(), self.channel_buffer_size);
+        channel_ref.inbox = Some(inbox.clone());
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -931,7 +942,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, inbox, window_size_ref)
             .await
     }
 
@@ -1317,7 +1328,7 @@ impl Session {
     }
 
     fn new(
-        target_window_size: u32,
+        _target_window_size: u32,
         common: CommonSession<Arc<Config>>,
         receiver: Receiver<Msg>,
         sender: UnboundedSender<Reply>,
@@ -1329,7 +1340,6 @@ impl Session {
             receiver,
             sender,
             kex: SessionKexState::Idle,
-            target_window_size,
             managed_close: Arc::new(tokio::sync::Notify::new()),
             priority_sender,
             priority_receiver,
@@ -1616,8 +1626,13 @@ impl Session {
     /// only registered when its open reply is processed).
     fn close_managed_channels(&mut self) -> Result<(), crate::Error> {
         if self.kex.active() { return Ok(()); }
+        if let Some(enc) = self.common.encrypted.as_mut() {
+            for (id, channel) in &self.channels {
+                if let Some(inbox) = &channel.inbox { enc.replenish_window(*id, inbox.take_consumed())?; }
+            }
+        }
         let ids: Vec<_> = self.channels.iter().filter_map(|(id, channel)| {
-            (channel.managed_close.as_ref().is_some_and(|flag|flag.load(std::sync::atomic::Ordering::Acquire)) && self.common.is_established_channel(*id)).then_some(*id)
+            ((channel.managed_close.as_ref().is_some_and(|flag|flag.load(std::sync::atomic::Ordering::Acquire)) || channel.inbox.as_ref().is_some_and(|inbox|inbox.abandoned())) && self.common.is_established_channel(*id)).then_some(*id)
         }).collect();
         for id in ids {
             if let Some(enc) = self.common.encrypted.as_mut() {

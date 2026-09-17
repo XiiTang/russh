@@ -36,7 +36,7 @@ where
     ) -> Poll<io::Result<()>> {
         let (msg, mut idx) = match self.buffer.take() {
             Some(msg) => msg,
-            None => match ready!(self.channel.borrow_mut().receiver.poll_recv(cx)) {
+            None => match ready!(self.channel.borrow_mut().poll_recv(cx)) {
                 Some(msg) => (msg, 0),
                 None => return Poll::Ready(Ok(())),
             },
@@ -72,7 +72,7 @@ where
                 Poll::Ready(Ok(()))
             }
             (ChannelMsg::Eof, _) => {
-                self.channel.borrow_mut().receiver.close();
+                self.channel.borrow_mut().close();
 
                 Poll::Ready(Ok(()))
             }
