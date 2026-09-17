@@ -601,16 +601,9 @@ impl Session {
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
-                let target = self.common.config.window_size;
-                #[allow(clippy::collapsible_if)]
                 if let Some(ref mut enc) = self.common.encrypted {
-                    if enc.adjust_window_size(channel_num, &data, target)? {
-                        let next_window =
-                            client.adjust_window(channel_num, self.target_window_size);
-                        if next_window > 0 {
-                            self.target_window_size = next_window
-                        }
-                    }
+                    // Receive credit belongs to the application reader, not packet arrival.
+                    enc.debit_window(channel_num, data.len())?;
                 }
 
                 if let Some(chan) = self.channels.get(&channel_num) {
@@ -628,16 +621,9 @@ impl Session {
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
-                let target = self.common.config.window_size;
-                #[allow(clippy::collapsible_if)]
                 if let Some(ref mut enc) = self.common.encrypted {
-                    if enc.adjust_window_size(channel_num, &data, target)? {
-                        let next_window =
-                            client.adjust_window(channel_num, self.target_window_size);
-                        if next_window > 0 {
-                            self.target_window_size = next_window
-                        }
-                    }
+                    // Receive credit belongs to the application reader, not packet arrival.
+                    enc.debit_window(channel_num, data.len())?;
                 }
 
                 if let Some(chan) = self.channels.get(&channel_num) {
@@ -863,13 +849,17 @@ impl Session {
                     pending_close: false,
                 };
 
-                let (channel, channel_ref) = Channel::new(
+                let (mut channel, mut channel_ref) = Channel::new(
                     id,
                     self.inbound_channel_sender.clone(),
                     channel_params.recipient_maximum_packet_size,
                     channel_params.recipient_window_size,
                     self.common.config.channel_buffer_size,
                 );
+
+                let inbox = crate::channels::inbox::Inbox::new(self.managed_close.clone(), self.common.config.channel_buffer_size);
+                channel.read_half.inbox = Some(inbox.clone());
+                channel_ref.inbox = Some(inbox);
 
                 let pending = crate::PendingChannelOpen {
                     recipient_channel: msg.recipient_channel,
