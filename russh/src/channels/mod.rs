@@ -1,3 +1,4 @@
+pub(crate) mod inbox;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -145,6 +146,7 @@ impl WindowSizeRef {
 /// Allows you to read from a channel without borrowing the session
 pub struct ChannelReadHalf {
     pub(crate) receiver: Receiver<ChannelMsg>,
+    pub(crate) inbox: Option<Arc<inbox::Inbox>>,
 }
 
 impl std::fmt::Debug for ChannelReadHalf {
@@ -153,10 +155,21 @@ impl std::fmt::Debug for ChannelReadHalf {
     }
 }
 
+impl Drop for ChannelReadHalf {
+    fn drop(&mut self) { if let Some(inbox) = &self.inbox { inbox.close_reader(); } }
+}
+
 impl ChannelReadHalf {
+    pub(crate) fn poll_recv(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<ChannelMsg>> {
+        match &self.inbox { Some(inbox) => inbox.poll_recv(cx), None => self.receiver.poll_recv(cx) }
+    }
+    pub(crate) fn close(&mut self) {
+        if let Some(inbox) = &self.inbox { inbox.close_reader(); }
+        self.receiver.close();
+    }
     /// Awaits an incoming [`ChannelMsg`], this method returns [`None`] if the channel has been closed.
     pub async fn wait(&mut self) -> Option<ChannelMsg> {
-        self.receiver.recv().await
+        std::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
 
     /// Make a reader for the [`Channel`] to receive [`ChannelMsg::Data`]
@@ -470,7 +483,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
     ) -> (Self, ChannelRef) {
         let (tx, rx) = tokio::sync::mpsc::channel(channel_buffer_size);
         let window_size = WindowSizeRef::new(window_size);
-        let read_half = ChannelReadHalf { receiver: rx };
+        let read_half = ChannelReadHalf { receiver: rx, inbox: None };
         let write_half = ChannelWriteHalf {
             id,
             sender,
@@ -487,6 +500,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
                 sender: tx,
                 window_size,
                 managed_close: None,
+                inbox: None,
             },
         )
     }
