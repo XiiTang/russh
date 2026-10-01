@@ -60,7 +60,9 @@ macro_rules! push_packet {
 }
 
 mod channels;
-pub use channels::{Channel, ChannelMsg, ChannelReadHalf, ChannelStream, ChannelWriteHalf, ManagedChannel};
+pub use channels::{
+    Channel, ChannelMsg, ChannelReadHalf, ChannelStream, ChannelWriteHalf, ManagedChannel,
+};
 
 mod parsing;
 mod session;
@@ -515,6 +517,8 @@ pub(crate) struct ChannelParams {
     pending_data: std::collections::VecDeque<(bytes::Bytes, Option<u32>, usize)>,
     pending_eof: bool,
     pending_close: bool,
+    close_sent: bool,
+    close_received: bool,
 }
 
 impl ChannelParams {

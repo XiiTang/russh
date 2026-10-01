@@ -147,9 +147,12 @@ impl Session {
                                 let prompt = map_err!(String::decode(&mut r))?;
                                 let language = map_err!(String::decode(&mut r))?;
                                 map_err!(ensure_end(&r))?;
-                                self.sender.send(Reply::AuthPasswordChange {prompt,language}).map_err(|_| crate::Error::SendError)?;
+                                self.sender
+                                    .send(Reply::AuthPasswordChange { prompt, language })
+                                    .map_err(|_| crate::Error::SendError)?;
                                 return Ok(());
-                            } else if let Some(auth::CurrentRequest::GssapiWithMic) = auth_request.current
+                            } else if let Some(auth::CurrentRequest::GssapiWithMic) =
+                                auth_request.current
                             {
                                 debug!("userauth_gssapi_response");
                                 let selected_mechanism = map_err!(Bytes::decode(&mut r))?.to_vec();
@@ -492,7 +495,7 @@ impl Session {
                 if let Some(ref mut enc) = self.common.encrypted {
                     // The CHANNEL_CLOSE message must be sent to the server at this point or the session
                     // will not be released.
-                    enc.close(channel_num)?;
+                    enc.receive_close(channel_num)?;
                 }
                 // Forward the close to the channel before removing it, so that
                 // consumers waiting on `Channel::wait()` receive an explicit
@@ -706,13 +709,11 @@ impl Session {
                 let is_rekeying = self.kex.active();
                 let common = &mut self.common;
                 if let Some(enc) = common.encrypted.as_mut() {
-                    new_size -= enc
-                        .flush_pending_with_writer(
-                            &mut common.packet_writer,
-                            channel_num,
-                            is_rekeying,
-                        )?
-                        as u32;
+                    new_size -= enc.flush_pending_with_writer(
+                        &mut common.packet_writer,
+                        channel_num,
+                        is_rekeying,
+                    )? as u32;
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
                     chan.window_size().update(new_size).await;
@@ -803,6 +804,8 @@ impl Session {
                     pending_data: std::collections::VecDeque::new(),
                     pending_eof: false,
                     pending_close: false,
+                    close_sent: false,
+                    close_received: false,
                 };
 
                 let (mut channel, mut channel_ref) = Channel::new(
@@ -813,7 +816,10 @@ impl Session {
                     self.common.config.channel_buffer_size,
                 );
 
-                let inbox = crate::channels::inbox::Inbox::new(self.managed_close.clone(), self.common.config.channel_buffer_size);
+                let inbox = crate::channels::inbox::Inbox::new(
+                    self.managed_close.clone(),
+                    self.common.config.channel_buffer_size,
+                );
                 channel.read_half.inbox = Some(inbox.clone());
                 channel_ref.inbox = Some(inbox);
 
@@ -1218,15 +1224,12 @@ mod tests {
         ensure_end(&mic).unwrap();
     }
 
-
     fn rsa_user_certificate() -> ssh_key::Certificate {
-        let subject = ssh_key::PrivateKey::random(
-            &mut rand::rng(),
-            ssh_key::Algorithm::Rsa { hash: None },
-        )
-        .unwrap();
-        let ca = ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519)
-            .unwrap();
+        let subject =
+            ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Rsa { hash: None })
+                .unwrap();
+        let ca =
+            ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
         let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
             &mut rand::rng(),
             subject.public_key(),
@@ -1331,13 +1334,18 @@ impl Encrypted {
                     "none".encode(&mut self.write)?;
                     true
                 }
-                auth::Method::Password { ref password, ref new_password } => {
+                auth::Method::Password {
+                    ref password,
+                    ref new_password,
+                } => {
                     user.encode(&mut self.write)?;
                     "ssh-connection".encode(&mut self.write)?;
                     "password".encode(&mut self.write)?;
                     u8::from(new_password.is_some()).encode(&mut self.write)?;
                     password.encode(&mut self.write)?;
-                    if let Some(new_password) = new_password { new_password.encode(&mut self.write)?; }
+                    if let Some(new_password) = new_password {
+                        new_password.encode(&mut self.write)?;
+                    }
                     true
                 }
                 auth::Method::PublicKey { ref key } => {
@@ -1505,8 +1513,12 @@ impl Encrypted {
     ) -> Result<(), crate::Error> {
         match method {
             auth::Method::PublicKey { key } => {
-                let i0 =
-                    self.client_make_to_sign(user, &PublicKeyOrCertificate::from(key), None, buffer)?;
+                let i0 = self.client_make_to_sign(
+                    user,
+                    &PublicKeyOrCertificate::from(key),
+                    None,
+                    buffer,
+                )?;
 
                 // Extend with self-signature.
                 sign_with_hash_alg(key, buffer)?.encode(&mut *buffer)?;

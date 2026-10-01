@@ -658,7 +658,9 @@ mod tests {
 
     fn test_auth_encrypted() -> Encrypted {
         Encrypted {
-            state: EncryptedState::WaitingAuthRequest(AuthRequest::server(MethodSet::server_supported())),
+            state: EncryptedState::WaitingAuthRequest(AuthRequest::server(
+                MethodSet::server_supported(),
+            )),
             exchange: Some(Exchange::default()),
             kex: KEXES.get(&KEX_NONE).expect("none kex").make(),
             key: 0,
@@ -1183,7 +1185,7 @@ impl Session {
                 }
                 if let Some(ref mut enc) = self.common.encrypted {
                     // Reply with CHANNEL_CLOSE per RFC 4254 Section 5.3.
-                    enc.close(channel_num)?;
+                    enc.receive_close(channel_num)?;
                 }
                 // Forward the close to the channel before removing it, so that
                 // consumers waiting on `Channel::wait()` receive an explicit
@@ -1271,13 +1273,11 @@ impl Session {
                 let is_rekeying = self.kex.active();
                 let common = &mut self.common;
                 if let Some(enc) = common.encrypted.as_mut() {
-                    new_size -= enc
-                        .flush_pending_with_writer(
-                            &mut common.packet_writer,
-                            channel_num,
-                            is_rekeying,
-                        )?
-                        as u32;
+                    new_size -= enc.flush_pending_with_writer(
+                        &mut common.packet_writer,
+                        channel_num,
+                        is_rekeying,
+                    )? as u32;
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
                     chan.window_size().update(new_size).await;
@@ -1793,6 +1793,8 @@ impl Session {
             pending_data: std::collections::VecDeque::new(),
             pending_eof: false,
             pending_close: false,
+            close_sent: false,
+            close_received: false,
         };
 
         let (channel, channel_ref) = Channel::new(
