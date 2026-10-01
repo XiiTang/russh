@@ -285,10 +285,41 @@ impl Encrypted {
     }
 
     pub fn close(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
-        if let Some(channel) = self.has_pending_data_mut(channel) {
-            channel.pending_close = true;
-        } else {
-            self.byte(channel, msg::CHANNEL_CLOSE)?;
+        let Some(ch) = self.channels.get_mut(&channel) else {
+            return Ok(());
+        };
+        if ch.close_sent {
+            return Ok(());
+        }
+        if !ch.pending_data.is_empty() && !ch.close_received {
+            ch.pending_close = true;
+            return Ok(());
+        }
+        ch.pending_close = false;
+        ch.close_sent = true;
+        self.byte(channel, msg::CHANNEL_CLOSE)?;
+        if self
+            .channels
+            .get(&channel)
+            .is_some_and(|ch| ch.close_received)
+        {
+            self.channels.remove(&channel);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn receive_close(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+        if let Some(ch) = self.channels.get_mut(&channel) {
+            ch.close_received = true;
+            // The peer has closed its receive direction; queued writes cannot progress.
+            ch.pending_data.clear();
+        }
+        self.close(channel)?;
+        if self
+            .channels
+            .get(&channel)
+            .is_some_and(|ch| ch.close_sent && ch.close_received)
+        {
             self.channels.remove(&channel);
         }
         Ok(())
@@ -305,14 +336,26 @@ impl Encrypted {
     pub(crate) fn debit_window(&mut self, id: ChannelId, bytes: usize) -> Result<(), crate::Error> {
         if let Some(channel) = self.channels.get_mut(&id) {
             let bytes = u32::try_from(bytes).map_err(|_| crate::Error::Inconsistent)?;
-            channel.sender_window_size = channel.sender_window_size.checked_sub(bytes).ok_or(crate::Error::Inconsistent)?;
+            channel.sender_window_size = channel
+                .sender_window_size
+                .checked_sub(bytes)
+                .ok_or(crate::Error::Inconsistent)?;
         }
         Ok(())
     }
-    pub(crate) fn replenish_window(&mut self, id: ChannelId, bytes: u32) -> Result<(), crate::Error> {
-        if bytes == 0 { return Ok(()); }
+    pub(crate) fn replenish_window(
+        &mut self,
+        id: ChannelId,
+        bytes: u32,
+    ) -> Result<(), crate::Error> {
+        if bytes == 0 {
+            return Ok(());
+        }
         if let Some(channel) = self.channels.get_mut(&id) {
-            channel.sender_window_size = channel.sender_window_size.checked_add(bytes).ok_or(crate::Error::Inconsistent)?;
+            channel.sender_window_size = channel
+                .sender_window_size
+                .checked_add(bytes)
+                .ok_or(crate::Error::Inconsistent)?;
             push_packet!(self.write, {
                 self.write.push(msg::CHANNEL_WINDOW_ADJUST);
                 channel.recipient_channel.encode(&mut self.write)?;
@@ -617,6 +660,9 @@ impl Encrypted {
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
         if let Some(channel) = self.channels.get_mut(&channel) {
+            if channel.close_sent || channel.close_received || channel.pending_close {
+                return Ok(());
+            }
             assert!(channel.confirmed);
             if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, None, 0));
@@ -641,6 +687,9 @@ impl Encrypted {
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
         if let Some(channel) = self.channels.get_mut(&channel) {
+            if channel.close_sent || channel.close_received || channel.pending_close {
+                return Ok(());
+            }
             assert!(channel.confirmed);
             if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, None, 0));
@@ -670,6 +719,9 @@ impl Encrypted {
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
         if let Some(channel) = self.channels.get_mut(&channel) {
+            if channel.close_sent || channel.close_received || channel.pending_close {
+                return Ok(());
+            }
             assert!(channel.confirmed);
             if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, Some(ext), 0));
@@ -693,6 +745,9 @@ impl Encrypted {
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
         if let Some(channel) = self.channels.get_mut(&channel) {
+            if channel.close_sent || channel.close_received || channel.pending_close {
+                return Ok(());
+            }
             assert!(channel.confirmed);
             if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, Some(ext), 0));
@@ -803,6 +858,8 @@ impl Encrypted {
                     pending_data: std::collections::VecDeque::new(),
                     pending_eof: false,
                     pending_close: false,
+                    close_sent: false,
+                    close_received: false,
                 });
                 return ChannelId(self.last_channel_id.0);
             }
@@ -932,6 +989,8 @@ mod tests {
             pending_data: VecDeque::from([(Bytes::from_static(b"hello"), None, 0)]),
             pending_eof,
             pending_close,
+            close_sent: false,
+            close_received: false,
         }
     }
 
@@ -986,7 +1045,25 @@ mod tests {
             pending_data: VecDeque::from([(Bytes::from_static(b"hello"), None, 0)]),
             pending_eof,
             pending_close,
+            close_sent: false,
+            close_received: false,
         }
+    }
+
+    #[test]
+    fn active_close_reclaims_state_only_after_peer_close() {
+        let id = ChannelId(10);
+        let mut encrypted = test_encrypted();
+        encrypted.channels.insert(id, test_ready_channel(id, 42));
+        encrypted.close(id).unwrap();
+        assert!(encrypted.channels[&id].close_sent);
+        assert!(!encrypted.channels[&id].close_received);
+        encrypted.close(id).unwrap();
+        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_CLOSE]);
+        encrypted.receive_close(id).unwrap();
+        assert!(!encrypted.channels.contains_key(&id));
+        encrypted.receive_close(id).unwrap();
+        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_CLOSE]);
     }
 
     // flush_pending (single-channel path)
@@ -1015,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_pending_replays_deferred_close_and_removes_channel() {
+    fn flush_pending_replays_deferred_close_then_waits_for_peer() {
         let channel_id = ChannelId(11);
         let mut encrypted = test_encrypted();
         encrypted
@@ -1027,6 +1104,8 @@ mod tests {
             packet_types(&encrypted.write),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF, msg::CHANNEL_CLOSE]
         );
+        assert!(encrypted.channels[&channel_id].close_sent);
+        encrypted.receive_close(channel_id).unwrap();
         assert!(!encrypted.channels.contains_key(&channel_id));
     }
 
@@ -1073,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_all_pending_replays_deferred_close_and_removes_channel() {
+    fn flush_all_pending_replays_deferred_close_then_waits_for_peer() {
         let channel_id = ChannelId(2);
         let mut encrypted = test_encrypted();
         encrypted
@@ -1085,6 +1164,8 @@ mod tests {
             packet_types(&encrypted.write),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF, msg::CHANNEL_CLOSE]
         );
+        assert!(encrypted.channels[&channel_id].close_sent);
+        encrypted.receive_close(channel_id).unwrap();
         assert!(!encrypted.channels.contains_key(&channel_id));
     }
 
@@ -1125,6 +1206,8 @@ mod tests {
             1
         );
         assert!(encrypted.channels.contains_key(&channel_a));
+        assert!(encrypted.channels[&channel_b].close_sent);
+        encrypted.receive_close(channel_b).unwrap();
         assert!(!encrypted.channels.contains_key(&channel_b));
     }
 
@@ -1317,6 +1400,8 @@ mod tests {
             clear_packet_types(&writer.buffer().buffer),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF, msg::CHANNEL_CLOSE]
         );
+        assert!(encrypted.channels[&channel_id].close_sent);
+        encrypted.receive_close(channel_id).unwrap();
         assert!(!encrypted.channels.contains_key(&channel_id));
     }
 

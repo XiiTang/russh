@@ -251,7 +251,9 @@ mod channels {
     #[tokio::test]
     async fn test_server_channels() {
         #[derive(Debug)]
-        struct Client {}
+        struct Client {
+            channel: Option<crate::Channel<client::Msg>>,
+        }
 
         impl client::Handler for Client {
             type Error = crate::Error;
@@ -261,6 +263,17 @@ mod channels {
                 _server_public_key: &PublicKeyOrCertificate,
             ) -> Result<bool, Self::Error> {
                 Ok(true)
+            }
+
+            async fn server_channel_open_session(
+                &mut self,
+                channel: crate::Channel<client::Msg>,
+                reply: client::ChannelOpenHandle,
+                _: &mut client::Session,
+            ) -> Result<(), Self::Error> {
+                self.channel = Some(channel);
+                reply.accept().await;
+                Ok(())
             }
 
             async fn data(
@@ -308,7 +321,7 @@ mod channels {
         let mut sh = ServerHandle { did_auth: None };
         let a = sh.get_auth_waiter();
         test_session(
-            Client {},
+            Client { channel: None },
             sh,
             |c| async move { c },
             |s| async move {
@@ -779,7 +792,9 @@ mod channels {
         )
         .await;
 
-        received.try_recv().expect("server never saw the pty request")
+        received
+            .try_recv()
+            .expect("server never saw the pty request")
     }
 }
 
@@ -940,9 +955,7 @@ pub(crate) mod raw_no_crypto {
             Self::connect_without_kex_with_config(no_crypto_server_config()).await
         }
 
-        pub(crate) async fn connect_without_kex_with_config(
-            config: Arc<server::Config>,
-        ) -> Self {
+        pub(crate) async fn connect_without_kex_with_config(config: Arc<server::Config>) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let events = Arc::new(Mutex::new(Vec::new()));
@@ -1068,8 +1081,8 @@ pub(crate) mod raw_no_crypto {
     }
 
     async fn ignore_during_initial_kex(kex_names: &[&str]) -> ServerSignal {
-        let mut session = RawSession::connect_without_kex_with_config(strict_kex_server_config())
-            .await;
+        let mut session =
+            RawSession::connect_without_kex_with_config(strict_kex_server_config()).await;
         session
             .send_packet(&real_kexinit_payload(kex_names))
             .await
@@ -1737,7 +1750,10 @@ mod rekey_under_load {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            server::run_stream(config, socket, Echo).await.unwrap().await
+            server::run_stream(config, socket, Echo)
+                .await
+                .unwrap()
+                .await
         });
 
         let key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();

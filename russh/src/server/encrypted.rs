@@ -1449,7 +1449,7 @@ impl Session {
                 }
                 if let Some(ref mut enc) = self.common.encrypted {
                     // Reply with CHANNEL_CLOSE per RFC 4254 Section 5.3.
-                    enc.close(channel_num)?;
+                    enc.receive_close(channel_num)?;
                 }
                 // Forward the close to the channel before removing it, so that
                 // consumers waiting on `Channel::wait()` receive an explicit
@@ -2051,6 +2051,8 @@ impl Session {
             pending_data: std::collections::VecDeque::new(),
             pending_eof: false,
             pending_close: false,
+            close_sent: false,
+            close_received: false,
         };
 
         let (channel, channel_ref) = Channel::new(
