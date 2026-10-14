@@ -939,28 +939,17 @@ impl Session {
                         debug!("no-more-sessions@openssh.com requests success");
                     }
                     Some(GlobalRequestResponse::TcpIpForward(return_channel)) => {
-                        let result = if r.is_empty() {
-                            // If a specific port was requested, the reply has no data
-                            Some(0)
+                        // If a specific port was requested, the reply has no
+                        // data. A reply that cannot be decoded is a protocol
+                        // error, not the server's REQUEST_FAILURE.
+                        let port = if r.is_empty() {
+                            0
                         } else {
-                            match u32::decode(&mut r) {
-                                Ok(port) => {
-                                    if let Err(e) = ensure_end(&r) {
-                                        error!(
-                                            "Error parsing port for TcpIpForward request: {e:?}"
-                                        );
-                                        None
-                                    } else {
-                                        Some(port)
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Error parsing port for TcpIpForward request: {e:?}");
-                                    None
-                                }
-                            }
+                            let port = map_err!(u32::decode(&mut r))?;
+                            map_err!(ensure_end(&r))?;
+                            port
                         };
-                        let _ = return_channel.send(result);
+                        let _ = return_channel.send(Some(port));
                     }
                     Some(GlobalRequestResponse::CancelTcpIpForward(return_channel)) => {
                         map_err!(ensure_end(&r))?;
