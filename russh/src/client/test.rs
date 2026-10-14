@@ -45,7 +45,7 @@ mod tests {
                 let mut clients = self.clients.lock().unwrap();
                 clients.insert((self.id, channel.id()), session.handle());
             }
-            reply.accept().await;
+            reply.accept().await?;
             Ok(())
         }
 
