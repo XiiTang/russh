@@ -1170,6 +1170,73 @@ pub(crate) mod raw_no_crypto {
         ));
     }
 
+    /// A REQUEST_SUCCESS to tcpip-forward that does not decode is a protocol
+    /// error that ends the session, not the server's REQUEST_FAILURE.
+    #[tokio::test]
+    async fn an_undecodable_forward_success_ends_the_session() {
+        const MSG_GLOBAL_REQUEST: u8 = 80;
+        const MSG_REQUEST_SUCCESS: u8 = 81;
+        struct Trusting;
+        impl client::Handler for Trusting {
+            type Error = Error;
+            async fn check_server_key(
+                &mut self,
+                _: &crate::keys::PublicKeyOrCertificate,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"SSH-2.0-raw-server\r\n").await.unwrap();
+            read_ssh_id(&mut stream).await.unwrap();
+            stream
+                .write_all(&ssh_packet(&kexinit_payload("none")))
+                .await
+                .unwrap();
+            while let Ok(payload) = read_packet(&mut stream).await {
+                let reply = match payload.first() {
+                    // With the none kex the client ends the exchange with its
+                    // own NEWKEYS and expects none back.
+                    Some(&MSG_SERVICE_REQUEST) => {
+                        let mut accept = vec![MSG_SERVICE_ACCEPT];
+                        encode_string(&mut accept, b"ssh-userauth");
+                        accept
+                    }
+                    Some(&MSG_USERAUTH_REQUEST) => vec![MSG_USERAUTH_SUCCESS],
+                    // The allocated port, then bytes the reply does not have.
+                    Some(&MSG_GLOBAL_REQUEST) => {
+                        let mut success = vec![MSG_REQUEST_SUCCESS];
+                        push_u32(&mut success, 4000);
+                        push_u32(&mut success, 7);
+                        success
+                    }
+                    _ => continue,
+                };
+                stream.write_all(&ssh_packet(&reply)).await.unwrap();
+            }
+        });
+        let config = client::Config {
+            preferred: no_crypto_preferred(),
+            ..Default::default()
+        };
+        let mut session = client::connect(Arc::new(config), addr, Trusting)
+            .await
+            .unwrap();
+        assert!(session.authenticate_none("raw").await.unwrap().success());
+        assert!(matches!(
+            session.tcpip_forward("127.0.0.1", 0).await,
+            Err(Error::Disconnect)
+        ));
+        drop(session);
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("the raw server sees the session end")
+            .unwrap();
+    }
+
     fn no_crypto_server_config() -> Arc<server::Config> {
         let mut config = server::Config::default();
         config.inactivity_timeout = None;
