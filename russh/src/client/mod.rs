@@ -3012,7 +3012,7 @@ pub trait Handler: Sized + Send {
         session: &mut Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            reply.accept().await;
+            reply.accept().await?;
             Ok(())
         }
     }
@@ -3031,7 +3031,7 @@ pub trait Handler: Sized + Send {
         session: &mut Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            reply.accept().await;
+            reply.accept().await?;
             Ok(())
         }
     }
@@ -3049,7 +3049,7 @@ pub trait Handler: Sized + Send {
         session: &mut Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            reply.accept().await;
+            reply.accept().await?;
             Ok(())
         }
     }
@@ -3097,7 +3097,7 @@ pub trait Handler: Sized + Send {
         session: &mut Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            reply.accept().await;
+            reply.accept().await?;
             Ok(())
         }
     }
@@ -3120,7 +3120,7 @@ pub trait Handler: Sized + Send {
         session: &mut Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            reply.accept().await;
+            reply.accept().await?;
             Ok(())
         }
     }
@@ -3139,7 +3139,7 @@ pub trait Handler: Sized + Send {
         session: &mut Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            reply.accept().await;
+            reply.accept().await?;
             Ok(())
         }
     }
@@ -3159,7 +3159,7 @@ pub trait Handler: Sized + Send {
         session: &mut Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            reply.accept().await;
+            reply.accept().await?;
             Ok(())
         }
     }

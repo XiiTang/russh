@@ -185,7 +185,7 @@ impl russh::client::Handler for Client {
             let len = stream.read_u32_le().await.unwrap();
             stream.write_all(&bytes[..len as usize]).await.unwrap();
         });
-        reply.accept().await;
+        reply.accept().await?;
         Ok(())
     }
 }

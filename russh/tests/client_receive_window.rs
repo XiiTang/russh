@@ -12,7 +12,7 @@ impl server::Handler for Peer {
         reply: server::ChannelOpenHandle,
         _: &mut server::Session,
     ) -> Result<(), Self::Error> {
-        reply.accept().await;
+        reply.accept().await?;
         Ok(())
     }
     async fn exec_request(
