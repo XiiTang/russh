@@ -25,7 +25,7 @@ impl server::Handler for Peer {
             self.first = false;
             self.opens.send((channel.id(), reply)).unwrap();
         } else {
-            reply.accept().await;
+            reply.accept().await?;
         }
         Ok(())
     }
@@ -87,7 +87,7 @@ async fn cancelled_open_and_window_blocked_stream_close_in_engine_with_live_sibl
         _ = &mut pending => panic!("open was not confirmed"),
     };
     drop(pending);
-    reply.accept().await;
+    reply.accept().await.unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(2), closed.recv())
             .await
@@ -142,4 +142,53 @@ async fn cancelled_open_and_window_blocked_stream_close_in_engine_with_live_sibl
         Ok(()) | Err(russh::Error::Disconnect)
     ));
     server.await.unwrap().unwrap();
+}
+#[tokio::test]
+async fn a_reply_after_its_session_ended_returns_the_send_failure() {
+    let (left, right) = tokio::io::duplex(65536);
+    let (opens, mut opened) = tokio::sync::mpsc::unbounded_channel();
+    let (closes, _closed) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let config = server::Config {
+            keys: vec![key()],
+            auth_rejection_time: Duration::ZERO,
+            ..Default::default()
+        };
+        server::run_stream(
+            Arc::new(config),
+            right,
+            Peer {
+                first: true,
+                opens,
+                closes,
+            },
+        )
+        .await
+        .unwrap()
+        .await
+    });
+    let mut client = russh::client::connect_stream(Arc::new(Default::default()), left, Trusted)
+        .await
+        .unwrap();
+    assert!(client.authenticate_none("fixture").await.unwrap().success());
+    let mut pending = Box::pin(client.channel_open_session_managed());
+    let (_, reply) = tokio::select! {
+        value = opened.recv() => value.unwrap(),
+        _ = &mut pending => panic!("open was not confirmed"),
+    };
+    drop(pending);
+    client
+        .disconnect(russh::Disconnect::ByApplication, "fixture complete", "en")
+        .await
+        .unwrap();
+    let _ = client.await;
+    // The server's session ended, so the reply reaches nothing.
+    let _ = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("the server session ends")
+        .unwrap();
+    assert!(matches!(
+        reply.accept().await,
+        Err(russh::Error::SendError)
+    ));
 }

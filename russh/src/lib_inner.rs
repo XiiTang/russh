@@ -599,18 +599,26 @@ impl<M: Send> ChannelOpenHandleInner<M> {
         }
     }
 
-    /// Accept the channel open request.
-    pub async fn accept(mut self) {
-        if let Some(pending) = self.inner.take() {
-            let _ = self.sender.send((self.make_msg)(pending, Ok(())));
-        }
+    /// Accept the channel open request. Fails with [`Error::SendError`] when
+    /// the session no longer runs, so that nothing was sent.
+    pub async fn accept(mut self) -> Result<(), Error> {
+        self.reply(Ok(()))
     }
 
-    /// Reject the channel open request with a reason.
-    pub async fn reject(mut self, reason: ChannelOpenFailure) {
-        if let Some(pending) = self.inner.take() {
-            let _ = self.sender.send((self.make_msg)(pending, Err(reason)));
-        }
+    /// Reject the channel open request with a reason. Fails with
+    /// [`Error::SendError`] when the session no longer runs, so that nothing
+    /// was sent.
+    pub async fn reject(mut self, reason: ChannelOpenFailure) -> Result<(), Error> {
+        self.reply(Err(reason))
+    }
+
+    fn reply(&mut self, result: Result<(), ChannelOpenFailure>) -> Result<(), Error> {
+        let Some(pending) = self.inner.take() else {
+            return Ok(());
+        };
+        self.sender
+            .send((self.make_msg)(pending, result))
+            .map_err(|_| Error::SendError)
     }
 }
 
