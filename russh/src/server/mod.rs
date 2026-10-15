@@ -1073,6 +1073,7 @@ where
         priority_sender,
         sender,
         channel_buffer_size: config.channel_buffer_size,
+        released: Arc::new(tokio::sync::Notify::new()),
     };
 
     let common = read_ssh_id(config, &mut stream).await?;

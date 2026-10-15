@@ -8,8 +8,16 @@ pub use tx::ChannelTx;
 
 use crate::{Channel, ChannelId, ChannelMsg, ChannelReadHalf};
 
+/// The channel a [`super::ChannelStream`] owns: its reader reads through it,
+/// and it carries a managed channel's [`super::managed::CloseGuard`]. Dropping
+/// it does nothing itself: a managed channel is cancelled by its guard, and any
+/// other channel is closed gracefully by its engine once both halves are gone.
 #[derive(Debug)]
-pub struct ChannelCloseOnDrop<S: From<(ChannelId, ChannelMsg)> + Send + 'static>(pub Channel<S>, pub(crate) Option<super::managed::CloseGuard>);
+pub struct ChannelCloseOnDrop<S: From<(ChannelId, ChannelMsg)> + Send + 'static>(
+    pub Channel<S>,
+    // Held for its drop, which cancels a managed channel.
+    #[allow(dead_code)] pub(crate) Option<super::managed::CloseGuard>,
+);
 
 impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Borrow<ChannelReadHalf>
     for ChannelCloseOnDrop<S>
@@ -24,22 +32,5 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> BorrowMut<ChannelReadHal
 {
     fn borrow_mut(&mut self) -> &mut ChannelReadHalf {
         &mut self.0.read_half
-    }
-}
-
-impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Drop for ChannelCloseOnDrop<S> {
-    fn drop(&mut self) {
-        if self.1.is_some() { return; }
-        let id = self.0.write_half.id;
-        let sender = self.0.write_half.sender.clone();
-
-        // Best effort: async drop where possible
-        #[cfg(not(target_arch = "wasm32"))]
-        tokio::spawn(async move {
-            let _ = sender.send((id, ChannelMsg::Close).into()).await;
-        });
-
-        #[cfg(target_arch = "wasm32")]
-        let _ = sender.try_send((id, ChannelMsg::Close).into());
     }
 }

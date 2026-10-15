@@ -52,6 +52,7 @@ pub struct ChannelTx<S> {
     window_size_notication: WatchNotification,
     max_packet_size: u32,
     ext: Option<u32>,
+    _writer: Option<Arc<crate::channels::handles::WriterHold>>,
 }
 
 impl<S> ChannelTx<S>
@@ -76,7 +77,14 @@ where
             window_size_fut: None,
             max_packet_size,
             ext,
+            _writer: None,
         }
+    }
+
+    /// Keeps the channel's write direction held while this writer lives.
+    pub(crate) fn holding(mut self, writer: Option<Arc<crate::channels::handles::WriterHold>>) -> Self {
+        self._writer = writer;
+        self
     }
 
     fn poll_writable(&mut self, cx: &mut Context<'_>, buf_len: usize) -> Poll<NonZeroUsize> {

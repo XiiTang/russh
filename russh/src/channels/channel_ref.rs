@@ -11,6 +11,7 @@ pub struct ChannelRef {
     pub(super) sender: Sender<ChannelMsg>,
     pub(super) window_size: WindowSizeRef,
     pub(crate) managed_close: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) handles: Option<std::sync::Arc<super::handles::Handles>>,
 }
 
 impl Drop for ChannelRef {
@@ -26,6 +27,7 @@ impl ChannelRef {
             window_size: WindowSizeRef::new(0),
             managed_close: None,
             inbox: None,
+            handles: None,
         }
     }
 

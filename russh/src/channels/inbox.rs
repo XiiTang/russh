@@ -1,5 +1,7 @@
 //! Client receive queues are bounded by the advertised SSH byte window.
 //! The connection reader must never await an application channel receiver.
+//! A reader that stops reading ends only the inbound direction: data that
+//! reaches nobody still counts as consumed, so the peer's window keeps moving.
 use crate::ChannelMsg;
 use std::{
     collections::VecDeque,
@@ -15,6 +17,7 @@ struct State {
     consumed: u32,
     closed: bool,
     reader_closed: bool,
+    overflowed: bool,
     waker: Option<Waker>,
 }
 #[derive(Debug)]
@@ -32,6 +35,7 @@ impl Inbox {
                 consumed: 0,
                 closed: false,
                 reader_closed: false,
+                overflowed: false,
                 waker: None,
             }),
             wake_session,
@@ -43,7 +47,11 @@ impl Inbox {
         message: ChannelMsg,
     ) -> Result<(), tokio::sync::mpsc::error::SendError<ChannelMsg>> {
         let mut state = self.state.lock().unwrap();
-        if state.reader_closed || state.closed {
+        if state.reader_closed {
+            state.consumed += bytes(&message);
+            return Err(tokio::sync::mpsc::error::SendError(message));
+        }
+        if state.overflowed || state.closed {
             return Err(tokio::sync::mpsc::error::SendError(message));
         }
         if bytes(&message) == 0 {
@@ -55,7 +63,7 @@ impl Inbox {
                 return Ok(());
             }
             if state.controls == self.control_limit {
-                state.reader_closed = true;
+                state.overflowed = true;
                 self.wake_session.notify_one();
                 if let Some(waker) = state.waker.take() {
                     waker.wake();
@@ -82,7 +90,7 @@ impl Inbox {
             }
             return Poll::Ready(Some(message));
         }
-        if state.closed || state.reader_closed {
+        if state.closed || state.reader_closed || state.overflowed {
             return Poll::Ready(None);
         }
         state.waker = Some(cx.waker().clone());
@@ -91,11 +99,19 @@ impl Inbox {
     pub(crate) fn take_consumed(&self) -> u32 {
         std::mem::take(&mut self.state.lock().unwrap().consumed)
     }
-    pub(crate) fn abandoned(&self) -> bool {
-        self.state.lock().unwrap().reader_closed
+    /// Whether the peer queued more controls than the reader takes; the
+    /// engine then closes the channel.
+    pub(crate) fn overflowed(&self) -> bool {
+        self.state.lock().unwrap().overflowed
     }
+    /// Ends inbound delivery: what is queued and what arrives later counts as
+    /// consumed.
     pub(crate) fn close_reader(&self) {
-        self.state.lock().unwrap().reader_closed = true;
+        let mut state = self.state.lock().unwrap();
+        state.reader_closed = true;
+        let queued: u32 = state.queue.drain(..).map(|message| bytes(&message)).sum();
+        state.consumed += queued;
+        state.controls = 0;
         self.wake_session.notify_one();
     }
     pub(crate) fn close_sender(&self) {

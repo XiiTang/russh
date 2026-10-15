@@ -36,6 +36,8 @@ inbox the reader never waits on; the advertised SSH window is replenished only
 as the program consumes data, which bounds what is queued. Run
 `cargo test -p russh --test client_receive_window`
 (`unread_channel_keeps_sibling_and_keepalive_live_then_delivers_exact_tail`).
+A reader that stops reading ends only the inbound direction; see "Letting a
+channel go ends it gracefully".
 
 ## Channel close state and terminal boundaries (`2d5830f`)
 
@@ -128,3 +130,36 @@ channel, certificate-authentication, natural-error, and fork regressions pass
 on the base client module and on this patch: diagnostic messages, paths and
 source excerpts match after ignoring shifted line numbers. No lint is suppressed
 and no unrelated Clippy repair is included.
+
+## Letting a channel go ends it gracefully
+
+The client engine treated a closed reader, whether dropped or after reading the
+peer's EOF, as a cancellation of the whole channel: it discarded the channel's
+pending data and sent CLOSE before the messages its handles had already queued,
+so data accepted by `write_all` was lost. Upstream's detached close task, which
+queued CLOSE behind those messages, was an unowned task.
+
+Letting a channel go now ends it the way OpenSSH and TCP do: what was accepted
+leaves first. A reader-side event ends only the inbound direction; data that
+reaches no reader still counts as consumed, so the peer's window keeps moving
+(OpenSSH `channels.c` `channel_input_data`). The engine closes a channel on the
+program's behalf only once its read half and every writer are gone: it handles
+the messages already queued, then queues CLOSE behind the pending data. Only a
+managed channel's cancellation discards pending data. A control overflow closes
+the channel the same graceful way. The two ends differ in which channels this
+covers:
+
+- A client closes every channel let go of. A dropped client channel already
+  closed itself on this branch, and Boundless relies on it.
+- A server closes only a channel turned into a stream (`into_stream`). Upstream
+  never closed a dropped server `Channel`: a server handler may drop it and keep
+  writing by id through its session, and upstream's own tests do so.
+
+Run `cargo test -p russh --test channel_release`.
+`queued_messages_leave_before_the_close_of_a_released_channel`,
+`a_window_blocked_stream_let_go_sends_its_pending_data_then_closes`,
+`a_stream_still_writes_after_reading_the_peers_eof` and
+`letting_the_read_half_go_keeps_the_write_half_and_credits_the_peer` fail on
+the previous commit; `a_server_stream_let_go_closes_after_its_queued_data`
+keeps a server stream's close without the detached task. Upstream's
+`tests::channels::test_channel_streams` no longer fails intermittently.
