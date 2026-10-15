@@ -197,3 +197,22 @@ for. `Encrypted::close` writes the CLOSE itself. Regressions:
 `no_request_follows_this_sides_close`, which write `[97, 96, 93, 94]` (EOF,
 window adjustment, replayed data) and `[97, 98, 99]` (exit-status, SUCCESS) on
 the previous commit instead of `[97]`.
+
+## Preserve spawned task panic payloads (#63, batch 5)
+
+On native hosts the existing spawn wrapper now retains Tokio's join handle and
+original join error, instead of detaching it and reporting a closed oneshot.
+`JoinError` keeps the actual payload, formats string payloads and exposes Tokio's
+error through `std::error::Error::source`. No spawn or Future result signature
+changes. The WASM path keeps its previous local-spawn mechanism. Upstream's
+wrapper and Tokio's native `JoinError` payload/source implementation were read;
+this uses the runtime's own panic capture instead of another unwind boundary.
+
+Regression: `cargo test --locked -p russh-util --lib panic_tests`. Both tests fail on the original
+wrapper (exit 101) and pass with the patch (2 tests, exit 0) on macOS arm64.
+They cover string and non-string panics, payload ownership until the error is
+dropped, and ordinary task success. WASM was not built or exercised.
+
+Rebuilt on ac22f3b for batch 5; only this patch is added. The existing
+PendingSession and Handle stop changes remain intact, and client/mod.rs is
+unchanged. The managed direct TCP/IP patch 0f22b8a is excluded.
