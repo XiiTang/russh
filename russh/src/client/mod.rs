@@ -110,6 +110,12 @@ impl Drop for Session {
     }
 }
 
+struct Opening {
+    inbox: Arc<crate::channels::inbox::Inbox>,
+    reader: crate::channels::handles::ReaderHold,
+    writer: Arc<crate::channels::handles::WriterHold>,
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum Reply {
@@ -757,13 +763,25 @@ impl<H: Handler> Handle<H> {
     }
 
     /// Wait for confirmation that a channel is open
+    /// A channel's receive queue and its handles' holds, attached to its
+    /// engine reference before the OPEN is sent. Dropping the open before its
+    /// confirmation lets both holds go, and the engine closes the channel.
+    fn opening(&self, channel_ref: &mut ChannelRef) -> Opening {
+        let inbox = crate::channels::inbox::Inbox::new(self.managed_close.clone(), self.channel_buffer_size);
+        let (handles, reader, writer) = crate::channels::handles::Handles::new(self.managed_close.clone());
+        channel_ref.inbox = Some(inbox.clone());
+        channel_ref.handles = Some(handles);
+        Opening { inbox, reader, writer }
+    }
+
     async fn wait_channel_confirmation(
         &self,
         receiver: Receiver<ChannelMsg>,
-        inbox: Arc<crate::channels::inbox::Inbox>,
+        opening: Opening,
         window_size_ref: WindowSizeRef,
     ) -> Result<Channel<Msg>, crate::Error> {
-        let mut read_half = ChannelReadHalf { receiver, inbox: Some(inbox) };
+        let Opening { inbox, reader, writer } = opening;
+        let mut read_half = ChannelReadHalf { receiver, inbox: Some(inbox), _hold: Some(reader) };
         loop {
             match read_half.wait().await {
                 Some(ChannelMsg::Open {
@@ -779,6 +797,7 @@ impl<H: Handler> Handle<H> {
                             sender: self.sender.clone(),
                             max_packet_size,
                             window_size: window_size_ref,
+                            hold: Some(writer),
                         },
                         read_half,
                     });
@@ -868,27 +887,25 @@ impl<H: Handler> Handle<H> {
         let guard = crate::channels::managed::CloseGuard::new(self.managed_close.clone());
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
-        let inbox = crate::channels::inbox::Inbox::new(self.managed_close.clone(), self.channel_buffer_size);
-        channel_ref.inbox = Some(inbox.clone());
+        let opening = self.opening(&mut channel_ref);
         channel_ref.managed_close = Some(guard.flag.clone());
         let window_size_ref = channel_ref.window_size().clone();
         self.sender.send(Msg::ChannelOpenSession { channel_ref }).await.map_err(|_|crate::Error::SendError)?;
-        let channel = self.wait_channel_confirmation(receiver, inbox, window_size_ref).await?;
+        let channel = self.wait_channel_confirmation(receiver, opening, window_size_ref).await?;
         Ok(crate::channels::ManagedChannel { channel, guard })
     }
 
     pub async fn channel_open_session(&self) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
-        let inbox = crate::channels::inbox::Inbox::new(self.managed_close.clone(), self.channel_buffer_size);
-        channel_ref.inbox = Some(inbox.clone());
+        let opening = self.opening(&mut channel_ref);
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
             .send(Msg::ChannelOpenSession { channel_ref })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, inbox, window_size_ref)
+        self.wait_channel_confirmation(receiver, opening, window_size_ref)
             .await
     }
 
@@ -900,8 +917,7 @@ impl<H: Handler> Handle<H> {
     ) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
-        let inbox = crate::channels::inbox::Inbox::new(self.managed_close.clone(), self.channel_buffer_size);
-        channel_ref.inbox = Some(inbox.clone());
+        let opening = self.opening(&mut channel_ref);
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -912,7 +928,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, inbox, window_size_ref)
+        self.wait_channel_confirmation(receiver, opening, window_size_ref)
             .await
     }
 
@@ -933,8 +949,7 @@ impl<H: Handler> Handle<H> {
     ) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
-        let inbox = crate::channels::inbox::Inbox::new(self.managed_close.clone(), self.channel_buffer_size);
-        channel_ref.inbox = Some(inbox.clone());
+        let opening = self.opening(&mut channel_ref);
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -947,7 +962,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, inbox, window_size_ref)
+        self.wait_channel_confirmation(receiver, opening, window_size_ref)
             .await
     }
 
@@ -957,8 +972,7 @@ impl<H: Handler> Handle<H> {
     ) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
-        let inbox = crate::channels::inbox::Inbox::new(self.managed_close.clone(), self.channel_buffer_size);
-        channel_ref.inbox = Some(inbox.clone());
+        let opening = self.opening(&mut channel_ref);
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -968,7 +982,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, inbox, window_size_ref)
+        self.wait_channel_confirmation(receiver, opening, window_size_ref)
             .await
     }
 
@@ -1426,7 +1440,7 @@ impl Session {
             let can_receive_outbound = !self.kex.active() && !self.common.has_any_pending_data();
             tokio::select! {
                 () = managed_close.notified(), if !self.kex.active() => {
-                    self.close_managed_channels()?;
+                    self.close_released_channels()?;
                 }
                 r = &mut reading => {
                     let (stream_read, mut buffer, mut opening_cipher) = match r {
@@ -1519,7 +1533,7 @@ impl Session {
                 }
             };
 
-            self.close_managed_channels()?;
+            self.close_released_channels()?;
             self.flush()?;
             crate::flush_or_timeout(
                 &mut self.common.packet_writer,
@@ -1586,26 +1600,44 @@ impl Session {
         })
     }
 
-    /// Channel open replies must be dispatched before any channel traffic
-    /// queued after them: the bounded receivers may hold data for a channel
-    /// whose confirmation is still sitting in the priority queue, and
-    /// dispatching that data first would silently drop it (the channel is
-    /// only registered when its open reply is processed).
-    fn close_managed_channels(&mut self) -> Result<(), crate::Error> {
+    /// The one place the engine closes a channel on the program's behalf. A
+    /// cancelled managed channel loses its unsent data and closes now. A
+    /// channel the program let go of, or whose controls overflowed, closes
+    /// gracefully: the messages already queued are handled first, and CLOSE
+    /// waits behind its pending data.
+    fn close_released_channels(&mut self) -> Result<(), crate::Error> {
         if self.kex.active() { return Ok(()); }
         if let Some(enc) = self.common.encrypted.as_mut() {
             for (id, channel) in &self.channels {
                 if let Some(inbox) = &channel.inbox { enc.replenish_window(*id, inbox.take_consumed())?; }
             }
         }
-        let ids: Vec<_> = self.channels.iter().filter_map(|(id, channel)| {
-            ((channel.managed_close.as_ref().is_some_and(|flag|flag.load(std::sync::atomic::Ordering::Acquire)) || channel.inbox.as_ref().is_some_and(|inbox|inbox.abandoned())) && self.common.is_established_channel(*id)).then_some(*id)
-        }).collect();
-        for id in ids {
+        let mut cancelled = Vec::new();
+        let mut released = Vec::new();
+        for (id, channel) in &self.channels {
+            if !self.common.is_established_channel(*id) {
+                continue;
+            }
+            if channel.managed_close.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                cancelled.push(*id);
+            } else if channel.handles.as_ref().is_some_and(|handles| handles.released())
+                || channel.inbox.as_ref().is_some_and(|inbox| inbox.overflowed())
+            {
+                released.push(*id);
+            }
+        }
+        for id in cancelled {
             if let Some(enc) = self.common.encrypted.as_mut() {
-                if let Some(channel) = enc.channels.get_mut(&id) {
-                    channel.pending_data.clear();
-                }
+                enc.cancel(id)?;
+            }
+            self.channels.remove(&id);
+        }
+        if released.is_empty() {
+            return Ok(());
+        }
+        self.handle_queued_msgs()?;
+        for id in released {
+            if let Some(enc) = self.common.encrypted.as_mut() {
                 enc.close(id)?;
             }
             self.channels.remove(&id);
@@ -1613,6 +1645,32 @@ impl Session {
         Ok(())
     }
 
+    /// Handles the outbound messages queued so far, past the window gate: a
+    /// released handle queued its messages before it let go, so they are all
+    /// here. Bounded by the queues' capacities.
+    fn handle_queued_msgs(&mut self) -> Result<(), crate::Error> {
+        for _ in 0..self.receiver.len() {
+            self.drain_priority_msgs()?;
+            match self.receiver.try_recv() {
+                Ok(msg) => self.handle_msg(msg)?,
+                Err(_) => break,
+            }
+        }
+        for _ in 0..self.inbound_channel_receiver.len() {
+            self.drain_priority_msgs()?;
+            match self.inbound_channel_receiver.try_recv() {
+                Ok(msg) => self.handle_msg(msg)?,
+                Err(_) => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Channel open replies must be dispatched before any channel traffic
+    /// queued after them: the bounded receivers may hold data for a channel
+    /// whose confirmation is still sitting in the priority queue, and
+    /// dispatching that data first would silently drop it (the channel is
+    /// only registered when its open reply is processed).
     fn drain_priority_msgs(&mut self) -> Result<(), crate::Error> {
         while !self.kex.active() {
             match self.priority_receiver.try_recv() {
