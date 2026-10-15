@@ -718,6 +718,9 @@ impl Session {
                         break;
                     }
                 }
+                // An open reply drained here may register a stream already let
+                // go of, whose wakeup came before it was registered.
+                self.close_released_channels()?;
                 if drained > 0 {
                     self.flush()?;
                     crate::flush_or_timeout(
@@ -1700,5 +1703,83 @@ mod tests {
         assert!(
             matches!(err, crate::Error::PacketSize(len) if len > crate::cipher::MAXIMUM_DECOMPRESSED_PACKET_LEN)
         );
+    }
+
+    struct Written(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl tokio::io::AsyncRead for Written {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+    impl tokio::io::AsyncWrite for Written {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_let_go_before_its_open_is_accepted_closes_once_registered() {
+        let mut session = authenticated_session();
+        let enc = session.common.encrypted.as_mut().unwrap();
+        let id = enc.new_channel(64, 32);
+        let mut params = enc.channels.remove(&id).unwrap();
+        params.confirmed = true;
+        params.recipient_channel = 99;
+        params.recipient_maximum_packet_size = 32;
+        params.recipient_window_size = 64;
+        let (channel, channel_ref) =
+            Channel::new(id, session.sender.sender.clone(), 32, 64, 2, session.sender.released.clone());
+        // The handler let the stream go and still holds its open reply; the
+        // wakeup is spent before the reply registers the channel.
+        drop(channel.into_stream());
+        session.sender.released.notified().await;
+        session.close_released_channels().unwrap();
+        let pending = crate::PendingChannelOpen {
+            recipient_channel: 99,
+            sender_channel: id,
+            window_size: 64,
+            packet_size: 32,
+            channel_ref,
+            channel_params: params,
+        };
+        session
+            .sender
+            .priority_sender
+            .send(Msg::ChannelOpenReply { pending, result: Ok(()) })
+            .unwrap();
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let running = session.run(crate::ssh_read::SshRead::new(Written(output.clone())), TestHandler);
+        tokio::pin!(running);
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        let bytes = output.lock().unwrap();
+        let mut types = Vec::new();
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            let length = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            types.push(bytes[cursor + 5]);
+            cursor += 4 + length;
+        }
+        assert_eq!(types, [msg::CHANNEL_OPEN_CONFIRMATION, msg::CHANNEL_CLOSE]);
     }
 }

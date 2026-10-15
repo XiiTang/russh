@@ -161,5 +161,12 @@ Run `cargo test -p russh --test channel_release`.
 `a_stream_still_writes_after_reading_the_peers_eof` and
 `letting_the_read_half_go_keeps_the_write_half_and_credits_the_peer` fail on
 the previous commit; `a_server_stream_let_go_closes_after_its_queued_data`
-keeps a server stream's close without the detached task. Upstream's
+keeps a server stream's close without the detached task. The `--lib` tests
+`a_channel_closing_behind_pending_data_still_credits_what_arrives`,
+`a_managed_channel_let_go_is_cancelled_though_its_holds_drop_first`,
+`a_rekey_the_queue_starts_holds_the_close_behind_what_is_still_queued` and
+`a_stream_let_go_before_its_open_is_accepted_closes_once_registered` cover the
+close's edges: credit while CLOSE waits, a managed channel's guard dropping
+after its holds, a rekey started while handling the queue, and a server stream
+registered after its wakeup. Upstream's
 `tests::channels::test_channel_streams` no longer fails intermittently.

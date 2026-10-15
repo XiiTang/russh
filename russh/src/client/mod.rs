@@ -1620,8 +1620,11 @@ impl Session {
             }
             if channel.managed_close.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
                 cancelled.push(*id);
-            } else if channel.handles.as_ref().is_some_and(|handles| handles.released())
-                || channel.inbox.as_ref().is_some_and(|inbox| inbox.overflowed())
+            } else if channel.inbox.as_ref().is_some_and(|inbox| inbox.overflowed())
+                // A managed channel let go of is cancelled by its guard, which
+                // drops after its holds.
+                || (channel.managed_close.is_none()
+                    && channel.handles.as_ref().is_some_and(|handles| handles.released()))
             {
                 released.push(*id);
             }
@@ -1636,11 +1639,26 @@ impl Session {
             return Ok(());
         }
         self.handle_queued_msgs()?;
+        // A rekey the queue started holds the rest of it; the channels close
+        // after it, behind what is still queued.
+        if self.kex.active() {
+            return Ok(());
+        }
         for id in released {
             if let Some(enc) = self.common.encrypted.as_mut() {
                 enc.close(id)?;
             }
             self.channels.remove(&id);
+        }
+        Ok(())
+    }
+
+    /// Data for an open channel no reader holds any more, such as one closing
+    /// behind its pending data, still counts as consumed.
+    pub(crate) fn credit_unread(&mut self, channel: ChannelId, bytes: usize) -> Result<(), crate::Error> {
+        if let Some(enc) = self.common.encrypted.as_mut() {
+            let bytes = u32::try_from(bytes).map_err(|_| crate::Error::Inconsistent)?;
+            enc.replenish_window(channel, bytes)?;
         }
         Ok(())
     }
@@ -1651,6 +1669,9 @@ impl Session {
     fn handle_queued_msgs(&mut self) -> Result<(), crate::Error> {
         for _ in 0..self.receiver.len() {
             self.drain_priority_msgs()?;
+            if self.kex.active() {
+                return Ok(());
+            }
             match self.receiver.try_recv() {
                 Ok(msg) => self.handle_msg(msg)?,
                 Err(_) => break,
@@ -1658,6 +1679,9 @@ impl Session {
         }
         for _ in 0..self.inbound_channel_receiver.len() {
             self.drain_priority_msgs()?;
+            if self.kex.active() {
+                return Ok(());
+            }
             match self.inbound_channel_receiver.try_recv() {
                 Ok(msg) => self.handle_msg(msg)?,
                 Err(_) => break,
@@ -2337,6 +2361,86 @@ mod tests {
         assert!(
             matches!(err, crate::Error::PacketSize(len) if len > crate::cipher::MAXIMUM_DECOMPRESSED_PACKET_LEN)
         );
+    }
+
+    /// An established, inboxed channel registered with the engine, whose peer
+    /// window is `outbound_window`.
+    fn released_test_channel(
+        session: &mut Session,
+        sender: &tokio::sync::mpsc::Sender<Msg>,
+        outbound_window: u32,
+    ) -> Channel<Msg> {
+        let enc = session.common.encrypted.as_mut().unwrap();
+        enc.state = EncryptedState::Authenticated;
+        let id = enc.new_channel(64, 32);
+        let params = enc.channels.get_mut(&id).unwrap();
+        params.confirmed = true;
+        params.recipient_channel = id.0 + 100;
+        params.recipient_maximum_packet_size = 32;
+        params.recipient_window_size = outbound_window;
+        let (mut channel, mut reference) =
+            Channel::new(id, sender.clone(), 32, outbound_window, 2, session.managed_close.clone());
+        let inbox = crate::channels::inbox::Inbox::new(session.managed_close.clone(), 2);
+        channel.read_half.inbox = Some(inbox.clone());
+        reference.inbox = Some(inbox);
+        session.channels.insert(id, reference);
+        channel
+    }
+
+    #[tokio::test]
+    async fn a_channel_closing_behind_pending_data_still_credits_what_arrives() {
+        let (mut session, sender, _replies) = keyboard_interactive_session();
+        let channel = released_test_channel(&mut session, &sender, 0);
+        let id = channel.id();
+        session
+            .handle_msg(Msg::Channel(id, ChannelMsg::Data { data: bytes::Bytes::from_static(b"unsent output") }))
+            .unwrap();
+        drop(channel);
+        session.close_released_channels().unwrap();
+        let enc = session.common.encrypted.as_ref().unwrap();
+        assert!(enc.channels[&id].pending_close && !enc.channels[&id].close_sent);
+        let mut packet = Vec::new();
+        msg::CHANNEL_DATA.encode(&mut packet).unwrap();
+        id.encode(&mut packet).unwrap();
+        (&[7u8; 64][..]).encode(&mut packet).unwrap();
+        session.process_packet(&mut TestHandler, &packet).await.unwrap();
+        assert_eq!(session.common.encrypted.as_ref().unwrap().channels[&id].sender_window_size, 64);
+    }
+
+    #[tokio::test]
+    async fn a_managed_channel_let_go_is_cancelled_though_its_holds_drop_first() {
+        let (mut session, sender, _replies) = keyboard_interactive_session();
+        let channel = released_test_channel(&mut session, &sender, 0);
+        let id = channel.id();
+        let guard = crate::channels::managed::CloseGuard::new(session.managed_close.clone());
+        session.channels.get_mut(&id).unwrap().managed_close = Some(guard.flag.clone());
+        session
+            .handle_msg(Msg::Channel(id, ChannelMsg::Data { data: bytes::Bytes::from_static(b"managed output") }))
+            .unwrap();
+        // A managed channel drops its channel before its guard; the engine may
+        // run between the two.
+        drop(channel);
+        session.close_released_channels().unwrap();
+        drop(guard);
+        session.close_released_channels().unwrap();
+        let params = &session.common.encrypted.as_ref().unwrap().channels[&id];
+        assert!(params.close_sent && params.pending_data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rekey_the_queue_starts_holds_the_close_behind_what_is_still_queued() {
+        let (mut session, sender, _replies) = keyboard_interactive_session();
+        let channel = released_test_channel(&mut session, &sender, 64);
+        let id = channel.id();
+        session.common.encrypted.as_mut().unwrap().kex = KEXES.get(&crate::kex::CURVE25519).unwrap().make();
+        sender.try_send(Msg::Rekey).unwrap();
+        sender.try_send(Msg::Channel(id, ChannelMsg::Eof)).unwrap();
+        drop(channel);
+        session.close_released_channels().unwrap();
+        assert!(session.kex.active());
+        assert_eq!(session.receiver.len(), 1);
+        assert!(session.channels.contains_key(&id));
+        assert!(!session.common.encrypted.as_ref().unwrap().channels[&id].close_sent);
     }
 }
 

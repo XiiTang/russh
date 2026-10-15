@@ -565,6 +565,8 @@ impl Session {
 
                 if let Some(chan) = self.channels.get(&channel_num) {
                     let _ = chan.send(ChannelMsg::Data { data: data.clone() }).await;
+                } else {
+                    self.credit_unread(channel_num, data.len())?;
                 }
 
                 client.data(channel_num, &data, self).await
@@ -590,6 +592,8 @@ impl Session {
                             data: data.clone(),
                         })
                         .await;
+                } else {
+                    self.credit_unread(channel_num, data.len())?;
                 }
 
                 client
