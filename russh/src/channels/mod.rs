@@ -1,3 +1,4 @@
+pub(crate) mod handles;
 pub(crate) mod inbox;
 use std::sync::Arc;
 
@@ -149,6 +150,7 @@ impl WindowSizeRef {
 pub struct ChannelReadHalf {
     pub(crate) receiver: Receiver<ChannelMsg>,
     pub(crate) inbox: Option<Arc<inbox::Inbox>>,
+    pub(crate) _hold: Option<handles::ReaderHold>,
 }
 
 impl std::fmt::Debug for ChannelReadHalf {
@@ -195,6 +197,7 @@ pub struct ChannelWriteHalf<Send: From<(ChannelId, ChannelMsg)>> {
     pub(crate) sender: Sender<Send>,
     pub(crate) max_packet_size: u32,
     pub(crate) window_size: WindowSizeRef,
+    pub(crate) hold: Option<Arc<handles::WriterHold>>,
 }
 
 impl<S: From<(ChannelId, ChannelMsg)>> std::fmt::Debug for ChannelWriteHalf<S> {
@@ -456,6 +459,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
             self.max_packet_size,
             ext,
         )
+        .holding(self.hold.clone())
     }
 }
 
@@ -482,15 +486,18 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
         max_packet_size: u32,
         window_size: u32,
         channel_buffer_size: usize,
+        wake: Arc<Notify>,
     ) -> (Self, ChannelRef) {
         let (tx, rx) = tokio::sync::mpsc::channel(channel_buffer_size);
         let window_size = WindowSizeRef::new(window_size);
-        let read_half = ChannelReadHalf { receiver: rx, inbox: None };
+        let (handles, reader, writer) = handles::Handles::new(wake);
+        let read_half = ChannelReadHalf { receiver: rx, inbox: None, _hold: Some(reader) };
         let write_half = ChannelWriteHalf {
             id,
             sender,
             max_packet_size,
             window_size: window_size.clone(),
+            hold: Some(writer),
         };
 
         (
@@ -503,6 +510,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
                 window_size,
                 managed_close: None,
                 inbox: None,
+                handles: Some(handles),
             },
         )
     }
@@ -681,6 +689,9 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
         self.stream_with_close(None)
     }
     fn stream_with_close(self, close: Option<managed::CloseGuard>) -> ChannelStream<S> {
+        if let Some(hold) = &self.write_half.hold {
+            hold.mark_streamed();
+        }
         ChannelStream::new(
             io::ChannelTx::new(
                 self.write_half.sender.clone(),
@@ -689,7 +700,8 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
                 self.write_half.window_size.subscribe(),
                 self.write_half.max_packet_size,
                 None,
-            ),
+            )
+            .holding(self.write_half.hold.clone()),
             io::ChannelRx::new(io::ChannelCloseOnDrop(self, close), None),
         )
     }
@@ -739,6 +751,7 @@ mod tests {
                 sender,
                 max_packet_size,
                 window_size,
+                hold: None,
             },
             receiver,
         )
@@ -851,7 +864,7 @@ mod tests {
     async fn channel_data_bytes_forwards_to_write_half() {
         let (sender, mut receiver) = mpsc::channel(8);
         let (channel, _reference) =
-            Channel::<(ChannelId, ChannelMsg)>::new(ChannelId(9), sender, 1024, 1024, 8);
+            Channel::<(ChannelId, ChannelMsg)>::new(ChannelId(9), sender, 1024, 1024, 8, Default::default());
 
         channel.data_bytes(Bytes::from_static(b"channel")).await.unwrap();
 

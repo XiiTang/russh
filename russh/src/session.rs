@@ -308,6 +308,16 @@ impl Encrypted {
         Ok(())
     }
 
+    /// Cancels a channel: its unsent data is discarded and CLOSE is sent now.
+    /// Only a managed channel's cancellation does this; letting a channel go
+    /// closes it with [`Self::close`], behind its pending data.
+    pub(crate) fn cancel(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+        if let Some(ch) = self.channels.get_mut(&channel) {
+            ch.pending_data.clear();
+        }
+        self.close(channel)
+    }
+
     pub(crate) fn receive_close(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
         if let Some(ch) = self.channels.get_mut(&channel) {
             ch.close_received = true;

@@ -113,6 +113,8 @@ pub struct Handle {
     pub(crate) priority_sender: UnboundedSender<Msg>,
     pub(crate) sender: Sender<Msg>,
     pub(crate) channel_buffer_size: usize,
+    /// Wakes the session when the program lets a channel's handle go.
+    pub(crate) released: Arc<tokio::sync::Notify>,
 }
 
 impl Handle {
@@ -247,7 +249,8 @@ impl Handle {
     /// [PROTOCOL.agent](https://datatracker.ietf.org/doc/html/draft-miller-ssh-agent).
     pub async fn channel_open_agent(&self) -> Result<Channel<Msg>, Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let mut channel_ref = ChannelRef::new(sender);
+        let opening = self.opening(&mut channel_ref);
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -255,7 +258,7 @@ impl Handle {
             .await
             .map_err(|_| Error::SendError)?;
 
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, opening, window_size_ref)
             .await
     }
 
@@ -266,7 +269,8 @@ impl Handle {
     /// `confirmed` field of the corresponding `Channel`.
     pub async fn channel_open_session(&self) -> Result<Channel<Msg>, Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let mut channel_ref = ChannelRef::new(sender);
+        let opening = self.opening(&mut channel_ref);
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -274,7 +278,7 @@ impl Handle {
             .await
             .map_err(|_| Error::SendError)?;
 
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, opening, window_size_ref)
             .await
     }
 
@@ -291,7 +295,8 @@ impl Handle {
         originator_port: u32,
     ) -> Result<Channel<Msg>, Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let mut channel_ref = ChannelRef::new(sender);
+        let opening = self.opening(&mut channel_ref);
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -304,7 +309,7 @@ impl Handle {
             })
             .await
             .map_err(|_| Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, opening, window_size_ref)
             .await
     }
 
@@ -314,7 +319,8 @@ impl Handle {
         socket_path: A,
     ) -> Result<Channel<Msg>, Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let mut channel_ref = ChannelRef::new(sender);
+        let opening = self.opening(&mut channel_ref);
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -324,7 +330,7 @@ impl Handle {
             })
             .await
             .map_err(|_| Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, opening, window_size_ref)
             .await
     }
 
@@ -336,7 +342,8 @@ impl Handle {
         originator_port: u32,
     ) -> Result<Channel<Msg>, Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let mut channel_ref = ChannelRef::new(sender);
+        let opening = self.opening(&mut channel_ref);
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -349,7 +356,7 @@ impl Handle {
             })
             .await
             .map_err(|_| Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, opening, window_size_ref)
             .await
     }
 
@@ -358,7 +365,8 @@ impl Handle {
         server_socket_path: A,
     ) -> Result<Channel<Msg>, Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let mut channel_ref = ChannelRef::new(sender);
+        let opening = self.opening(&mut channel_ref);
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -368,7 +376,7 @@ impl Handle {
             })
             .await
             .map_err(|_| Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, opening, window_size_ref)
             .await
     }
 
@@ -378,7 +386,8 @@ impl Handle {
         originator_port: u32,
     ) -> Result<Channel<Msg>, Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let mut channel_ref = ChannelRef::new(sender);
+        let opening = self.opening(&mut channel_ref);
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -389,13 +398,26 @@ impl Handle {
             })
             .await
             .map_err(|_| Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, opening, window_size_ref)
             .await
+    }
+
+    /// The holds of a channel's handles, attached to its engine reference
+    /// before the OPEN is sent. Dropping the open before its confirmation lets
+    /// both go, and the engine closes the channel.
+    fn opening(
+        &self,
+        channel_ref: &mut ChannelRef,
+    ) -> (crate::channels::handles::ReaderHold, Arc<crate::channels::handles::WriterHold>) {
+        let (handles, reader, writer) = crate::channels::handles::Handles::new(self.released.clone());
+        channel_ref.handles = Some(handles);
+        (reader, writer)
     }
 
     async fn wait_channel_confirmation(
         &self,
         mut receiver: Receiver<ChannelMsg>,
+        (reader, writer): (crate::channels::handles::ReaderHold, Arc<crate::channels::handles::WriterHold>),
         window_size_ref: WindowSizeRef,
     ) -> Result<Channel<Msg>, Error> {
         loop {
@@ -413,8 +435,9 @@ impl Handle {
                             sender: self.sender.clone(),
                             max_packet_size,
                             window_size: window_size_ref,
+                            hold: Some(writer),
                         },
-                        read_half: ChannelReadHalf { receiver, inbox: None },
+                        read_half: ChannelReadHalf { receiver, inbox: None, _hold: Some(reader) },
                     });
                 }
                 Some(ChannelMsg::OpenFailure(reason)) => {
@@ -714,6 +737,7 @@ impl Session {
             let rekey_timer = future_or_pending(self.rekey_time_remaining(), tokio::time::sleep);
             pin!(rekey_timer);
 
+            let released = self.sender.released.clone();
             tokio::select! {
                 r = &mut reading => {
                     let (stream_read, mut buffer, mut opening_cipher) = match r {
@@ -788,6 +812,8 @@ impl Session {
                         }
                     }
                 }
+                // A handle was let go; the channel closes below.
+                () = released.notified(), if !self.kex.active() => {}
                 msg = self.receiver.recv(), if !self.kex.active() && !self.common.has_any_pending_data() => {
                     // Channel open replies must be dispatched before any
                     // channel traffic queued after them: `msg` may be data for
@@ -806,6 +832,7 @@ impl Session {
                     }
                 }
             }
+            self.close_released_channels()?;
             self.flush()?;
 
             crate::flush_or_timeout(
@@ -866,6 +893,47 @@ impl Session {
             }
         }
 
+        Ok(())
+    }
+
+    /// The one place the engine closes a channel on the program's behalf: a
+    /// stream whose both directions the program let go of. The messages
+    /// already queued are handled first, past the window gate, and CLOSE waits
+    /// behind its pending data. A plain channel dropped stays open, as
+    /// upstream: its program may keep writing to it by id.
+    fn close_released_channels(&mut self) -> Result<(), Error> {
+        if self.kex.active() {
+            return Ok(());
+        }
+        let released: Vec<_> = self
+            .channels
+            .iter()
+            .filter(|(id, channel)| {
+                channel
+                    .handles
+                    .as_ref()
+                    .is_some_and(|handles| handles.streamed() && handles.released())
+                    && self.common.is_established_channel(**id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if released.is_empty() {
+            return Ok(());
+        }
+        // A released handle queued its messages before it let go.
+        for _ in 0..self.receiver.len() {
+            while let Ok(reply) = self.priority_receiver.try_recv() {
+                self.dispatch_msg(reply)?;
+            }
+            match self.receiver.try_recv() {
+                Ok(msg) => self.dispatch_msg(msg)?,
+                Err(_) => break,
+            }
+        }
+        for id in released {
+            self.close(id)?;
+            self.channels.remove(&id);
+        }
         Ok(())
     }
 
@@ -1625,6 +1693,7 @@ mod tests {
             priority_sender,
             sender,
             channel_buffer_size: config.channel_buffer_size,
+            released: Arc::new(tokio::sync::Notify::new()),
         };
 
         Session {
