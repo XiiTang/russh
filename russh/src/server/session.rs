@@ -29,6 +29,10 @@ pub struct Session {
     pub(crate) channels: HashMap<ChannelId, ChannelRef>,
     pub(crate) open_global_requests: VecDeque<GlobalRequestResponse>,
     pub(crate) kex: SessionKexState<ServerKex>,
+    /// Messages taken from the application queue, and for each released
+    /// stream the count it closes behind.
+    pub(crate) taken: u64,
+    pub(crate) release_fences: HashMap<ChannelId, u64>,
 }
 
 #[derive(Debug)]
@@ -706,14 +710,13 @@ impl Session {
                 while drained < MAX_MESSAGES_PER_BATCH {
                     // Only Empty/Disconnected end the drain; both mean "nothing
                     // more to hand off right now", so treat them the same.
-                    let msg = match self.priority_receiver.try_recv() {
-                        Ok(msg) => msg,
+                    match self.priority_receiver.try_recv() {
+                        Ok(msg) => self.dispatch_msg(msg)?,
                         Err(_) => match self.receiver.try_recv() {
-                            Ok(msg) => msg,
+                            Ok(msg) => self.dispatch_app_msg(msg)?,
                             Err(_) => break,
                         },
-                    };
-                    self.dispatch_msg(msg)?;
+                    }
                     drained += 1;
                     if self.common.has_any_pending_data() {
                         break;
@@ -828,7 +831,7 @@ impl Session {
                         self.dispatch_msg(reply)?;
                     }
                     match msg {
-                        Some(msg) => self.dispatch_msg(msg)?,
+                        Some(msg) => self.dispatch_app_msg(msg)?,
                         None => {
                             debug!("self.receiver: received None");
                         }
@@ -900,10 +903,12 @@ impl Session {
     }
 
     /// The one place the engine closes a channel on the program's behalf: a
-    /// stream whose both directions the program let go of. The messages
-    /// already queued are handled first, past the window gate, and CLOSE waits
-    /// behind its pending data. A plain channel dropped stays open, as
-    /// upstream: its program may keep writing to it by id.
+    /// stream whose both directions the program let go of. It closes once the
+    /// engine has taken, through its ordinary window gate, every message the
+    /// application queue held when it first saw the release, and CLOSE then
+    /// waits behind its pending data. A sibling the peer's window holds back
+    /// holds that close back too, as upstream. A plain channel dropped stays
+    /// open, as upstream: its program may keep writing to it by id.
     fn close_released_channels(&mut self) -> Result<(), Error> {
         if self.kex.active() {
             return Ok(());
@@ -920,24 +925,27 @@ impl Session {
             })
             .map(|(id, _)| *id)
             .collect();
-        if released.is_empty() {
-            return Ok(());
-        }
-        // A released handle queued its messages before it let go.
-        for _ in 0..self.receiver.len() {
-            while let Ok(reply) = self.priority_receiver.try_recv() {
-                self.dispatch_msg(reply)?;
-            }
-            match self.receiver.try_recv() {
-                Ok(msg) => self.dispatch_msg(msg)?,
-                Err(_) => break,
-            }
-        }
+        // A release is seen after everything its handles queued, so the
+        // queue's length then covers it. The fence is never moved.
+        let fence = self.taken + self.receiver.len() as u64;
         for id in released {
+            if self.taken < *self.release_fences.entry(id).or_insert(fence) {
+                continue;
+            }
             self.close(id)?;
             self.channels.remove(&id);
         }
+        let channels = &self.channels;
+        self.release_fences.retain(|id, _| channels.contains_key(id));
         Ok(())
+    }
+
+    /// The one place a message from the application queue is handled, through
+    /// the window gate of whichever path took it; released streams close
+    /// behind the count.
+    fn dispatch_app_msg(&mut self, msg: Msg) -> Result<(), Error> {
+        self.taken += 1;
+        self.dispatch_msg(msg)
     }
 
     /// Get a handle to this session.
@@ -1744,6 +1752,8 @@ mod tests {
             channels: HashMap::new(),
             open_global_requests: VecDeque::new(),
             kex: SessionKexState::Idle,
+            taken: 0,
+            release_fences: HashMap::new(),
         }
     }
 

@@ -47,11 +47,10 @@ impl Inbox {
         message: ChannelMsg,
     ) -> Result<(), tokio::sync::mpsc::error::SendError<ChannelMsg>> {
         let mut state = self.state.lock().unwrap();
-        if state.reader_closed {
+        // What the inbox refuses reaches nobody and still counts as consumed:
+        // an overflowed channel stays registered until the engine closes it.
+        if state.reader_closed || state.overflowed || state.closed {
             state.consumed += bytes(&message);
-            return Err(tokio::sync::mpsc::error::SendError(message));
-        }
-        if state.overflowed || state.closed {
             return Err(tokio::sync::mpsc::error::SendError(message));
         }
         if bytes(&message) == 0 {

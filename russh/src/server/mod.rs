@@ -1127,6 +1127,8 @@ where
         channels: HashMap::new(),
         open_global_requests: VecDeque::new(),
         kex: SessionKexState::Idle,
+        taken: 0,
+        release_fences: HashMap::new(),
     };
 
     session.begin_rekey()?;

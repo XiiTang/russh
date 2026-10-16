@@ -99,6 +99,10 @@ pub struct Session {
     priority_receiver: UnboundedReceiver<Msg>,
     inbound_channel_sender: Sender<Msg>,
     inbound_channel_receiver: Receiver<Msg>,
+    /// Messages taken from the application queues, and for each released
+    /// channel the count it closes behind.
+    taken: Taken,
+    release_fences: HashMap<ChannelId, Taken>,
     open_global_requests: VecDeque<GlobalRequestResponse>,
     server_sig_algs: Option<Vec<Algorithm>>,
     /// Number of EXT_INFO messages received (RFC 8308 allows at most two).
@@ -109,6 +113,27 @@ impl Drop for Session {
     fn drop(&mut self) {
         debug!("drop session")
     }
+}
+
+/// Messages taken from the two application queues: the bounded receiver of
+/// handles and channels the program opened, and the one of channels the
+/// server opened.
+#[derive(Debug, Default, Clone, Copy)]
+struct Taken {
+    outbound: u64,
+    inbound: u64,
+}
+
+impl Taken {
+    fn reached(&self, fence: &Taken) -> bool {
+        self.outbound >= fence.outbound && self.inbound >= fence.inbound
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AppQueue {
+    Outbound,
+    Inbound,
 }
 
 struct Opening {
@@ -1456,6 +1481,8 @@ impl Session {
             priority_receiver,
             inbound_channel_sender,
             inbound_channel_receiver,
+            taken: Taken::default(),
+            release_fences: HashMap::new(),
             channels: HashMap::new(),
             pending_reads: Vec::new(),
             pending_len: 0,
@@ -1627,7 +1654,7 @@ impl Session {
                 msg = self.receiver.recv(), if can_receive_outbound => {
                     self.drain_priority_msgs()?;
                     match msg {
-                        Some(msg) => self.handle_msg(msg)?,
+                        Some(msg) => self.handle_app_msg(AppQueue::Outbound, msg)?,
                         None => {
                             self.common.disconnected = true;
                             break
@@ -1638,7 +1665,7 @@ impl Session {
                     while !self.kex.active() && !self.common.has_any_pending_data() {
                         self.drain_priority_msgs()?;
                         match self.receiver.try_recv() {
-                            Ok(next) => self.handle_msg(next)?,
+                            Ok(next) => self.handle_app_msg(AppQueue::Outbound, next)?,
                             Err(_) => break
                         }
                     }
@@ -1655,7 +1682,7 @@ impl Session {
                 msg = self.inbound_channel_receiver.recv(), if can_receive_outbound => {
                     self.drain_priority_msgs()?;
                     match msg {
-                        Some(msg) => self.handle_msg(msg)?,
+                        Some(msg) => self.handle_app_msg(AppQueue::Inbound, msg)?,
                         None => (),
                     }
 
@@ -1663,7 +1690,7 @@ impl Session {
                     while !self.kex.active() && !self.common.has_any_pending_data() {
                         self.drain_priority_msgs()?;
                         match self.inbound_channel_receiver.try_recv() {
-                            Ok(next) => self.handle_msg(next)?,
+                            Ok(next) => self.handle_app_msg(AppQueue::Inbound, next)?,
                             Err(_) => break
                         }
                     }
@@ -1740,8 +1767,10 @@ impl Session {
     /// The one place the engine closes a channel on the program's behalf. A
     /// cancelled managed channel loses its unsent data and closes now. A
     /// channel the program let go of, or whose controls overflowed, closes
-    /// gracefully: the messages already queued are handled first, and CLOSE
-    /// waits behind its pending data.
+    /// gracefully: once the engine has taken, through its ordinary window
+    /// gate, every message the application queues held when it first saw the
+    /// release, and CLOSE then waits behind its pending data. A sibling the
+    /// peer's window holds back holds that close back too, as upstream.
     fn close_released_channels(&mut self) -> Result<(), crate::Error> {
         if self.kex.active() { return Ok(()); }
         if let Some(enc) = self.common.encrypted.as_mut() {
@@ -1772,22 +1801,36 @@ impl Session {
             }
             self.channels.remove(&id);
         }
-        if released.is_empty() {
-            return Ok(());
-        }
-        self.handle_queued_msgs()?;
-        // A rekey the queue started holds the rest of it; the channels close
-        // after it, behind what is still queued.
-        if self.kex.active() {
-            return Ok(());
-        }
+        // A release is seen after everything its handles queued, so the
+        // queues' lengths then cover it. The fence is never moved.
+        let fence = Taken {
+            outbound: self.taken.outbound + self.receiver.len() as u64,
+            inbound: self.taken.inbound + self.inbound_channel_receiver.len() as u64,
+        };
         for id in released {
+            let fence = *self.release_fences.entry(id).or_insert(fence);
+            if !self.taken.reached(&fence) {
+                continue;
+            }
             if let Some(enc) = self.common.encrypted.as_mut() {
                 enc.close(id)?;
             }
             self.channels.remove(&id);
         }
+        let channels = &self.channels;
+        self.release_fences.retain(|id, _| channels.contains_key(id));
         Ok(())
+    }
+
+    /// The one place a message from an application queue is handled, through
+    /// the window gate of whichever path took it; released channels close
+    /// behind the count.
+    fn handle_app_msg(&mut self, queue: AppQueue, msg: Msg) -> Result<(), crate::Error> {
+        match queue {
+            AppQueue::Outbound => self.taken.outbound += 1,
+            AppQueue::Inbound => self.taken.inbound += 1,
+        }
+        self.handle_msg(msg)
     }
 
     /// Data for an open channel no reader holds any more, such as one closing
@@ -1796,33 +1839,6 @@ impl Session {
         if let Some(enc) = self.common.encrypted.as_mut() {
             let bytes = u32::try_from(bytes).map_err(|_| crate::Error::Inconsistent)?;
             enc.replenish_window(channel, bytes)?;
-        }
-        Ok(())
-    }
-
-    /// Handles the outbound messages queued so far, past the window gate: a
-    /// released handle queued its messages before it let go, so they are all
-    /// here. Bounded by the queues' capacities.
-    fn handle_queued_msgs(&mut self) -> Result<(), crate::Error> {
-        for _ in 0..self.receiver.len() {
-            self.drain_priority_msgs()?;
-            if self.kex.active() {
-                return Ok(());
-            }
-            match self.receiver.try_recv() {
-                Ok(msg) => self.handle_msg(msg)?,
-                Err(_) => break,
-            }
-        }
-        for _ in 0..self.inbound_channel_receiver.len() {
-            self.drain_priority_msgs()?;
-            if self.kex.active() {
-                return Ok(());
-            }
-            match self.inbound_channel_receiver.try_recv() {
-                Ok(msg) => self.handle_msg(msg)?,
-                Err(_) => break,
-            }
         }
         Ok(())
     }
@@ -2847,6 +2863,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_overflowed_channel_waiting_at_its_fence_still_credits_what_arrives() {
+        let (mut session, sender, _replies) = keyboard_interactive_session();
+        let channel = released_test_channel(&mut session, &sender, 0);
+        let id = channel.id();
+        // The reader stays; the peer floods controls past the inbox limit while
+        // an EOF the program queued keeps the fence ahead.
+        sender.try_send(Msg::Channel(id, ChannelMsg::Eof)).unwrap();
+        let inbox = session.channels[&id].inbox.clone().unwrap();
+        while !inbox.overflowed() {
+            let _ = inbox.send(ChannelMsg::XonXoff { client_can_do: false });
+        }
+        session.close_released_channels().unwrap();
+        assert!(session.channels.contains_key(&id));
+        let mut packet = Vec::new();
+        msg::CHANNEL_DATA.encode(&mut packet).unwrap();
+        id.encode(&mut packet).unwrap();
+        (&[7u8; 64][..]).encode(&mut packet).unwrap();
+        session.process_packet(&mut TestHandler, &packet).await.unwrap();
+        session.close_released_channels().unwrap();
+        assert_eq!(session.common.encrypted.as_ref().unwrap().channels[&id].sender_window_size, 64);
+        drop(channel);
+    }
+
+    #[tokio::test]
     async fn a_managed_channel_let_go_is_cancelled_though_its_holds_drop_first() {
         let (mut session, sender, _replies) = keyboard_interactive_session();
         let channel = released_test_channel(&mut session, &sender, 0);
@@ -2866,20 +2906,75 @@ mod tests {
         assert!(params.close_sent && params.pending_data.is_empty());
     }
 
+    fn pending_messages(session: &Session, id: ChannelId) -> usize {
+        session.common.encrypted.as_ref().unwrap().channels[&id].pending_data.len()
+    }
+
     #[tokio::test]
-    async fn a_rekey_the_queue_starts_holds_the_close_behind_what_is_still_queued() {
+    async fn releases_never_take_messages_past_a_blocked_siblings_window() {
+        let (mut session, _sender, _replies) = keyboard_interactive_session();
+        let (outbound, receiver) = channel(2);
+        let (inbound, inbound_receiver) = channel(2);
+        session.receiver = receiver;
+        session.inbound_channel_receiver = inbound_receiver;
+        // A sibling on each application queue, held by a closed peer window,
+        // with data written past it by id.
+        let held = released_test_channel(&mut session, &outbound, 0);
+        let held_inbound = released_test_channel(&mut session, &inbound, 0);
+        for (id, queue) in [(held.id(), &outbound), (held_inbound.id(), &inbound)] {
+            session
+                .handle_msg(Msg::Channel(id, ChannelMsg::Data { data: bytes::Bytes::from(vec![1; 64]) }))
+                .unwrap();
+            while queue
+                .try_send(Msg::Channel(id, ChannelMsg::Data { data: bytes::Bytes::from(vec![2; 64]) }))
+                .is_ok()
+            {}
+        }
+        for _ in 0..8 {
+            let released = released_test_channel(&mut session, &outbound, 32);
+            let id = released.id();
+            drop(released);
+            session.close_released_channels().unwrap();
+            assert_eq!(pending_messages(&session, held.id()), 1);
+            assert_eq!(pending_messages(&session, held_inbound.id()), 1);
+            assert_eq!((session.receiver.len(), session.inbound_channel_receiver.len()), (2, 2));
+            assert!(!session.common.encrypted.as_ref().unwrap().channels[&id].close_sent);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_release_during_kex_closes_after_it_behind_its_fixed_fence() {
         let (mut session, sender, _replies) = keyboard_interactive_session();
         let channel = released_test_channel(&mut session, &sender, 64);
         let id = channel.id();
         session.common.encrypted.as_mut().unwrap().kex = KEXES.get(&crate::kex::CURVE25519).unwrap().make();
-        sender.try_send(Msg::Rekey).unwrap();
         sender.try_send(Msg::Channel(id, ChannelMsg::Eof)).unwrap();
         drop(channel);
-        session.close_released_channels().unwrap();
+        session.handle_msg(Msg::Rekey).unwrap();
         assert!(session.kex.active());
-        assert_eq!(session.receiver.len(), 1);
+        session.close_released_channels().unwrap();
         assert!(session.channels.contains_key(&id));
-        assert!(!session.common.encrypted.as_ref().unwrap().channels[&id].close_sent);
+        // The exchange ends; the queue held the EOF when the release was seen.
+        session.kex = SessionKexState::Idle;
+        session.close_released_channels().unwrap();
+        assert!(session.channels.contains_key(&id));
+        // A message queued after the release does not move the fence.
+        sender.try_send(Msg::Channel(ChannelId(999), ChannelMsg::Eof)).unwrap();
+        let eof = session.receiver.try_recv().unwrap();
+        session.handle_app_msg(AppQueue::Outbound, eof).unwrap();
+        session.close_released_channels().unwrap();
+        let enc = session.common.encrypted.as_ref().unwrap();
+        assert!(enc.channels[&id].close_sent);
+        assert_eq!(session.receiver.len(), 1);
+        let mut types = Vec::new();
+        let mut cursor = 0;
+        while cursor < enc.write.len() {
+            let len = u32::from_be_bytes(enc.write[cursor..cursor + 4].try_into().unwrap()) as usize;
+            types.push(enc.write[cursor + 4]);
+            cursor += 4 + len;
+        }
+        types.retain(|t| [msg::CHANNEL_EOF, msg::CHANNEL_CLOSE].contains(t));
+        assert_eq!(types, [msg::CHANNEL_EOF, msg::CHANNEL_CLOSE]);
     }
 }
 
