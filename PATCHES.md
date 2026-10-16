@@ -67,3 +67,26 @@ now a protocol error that ends the session, and `tcpip_forward` returns
 `Disconnect`. Regression:
 `cargo test -p russh --lib an_undecodable_forward_success_ends_the_session`,
 which fails on the previous commit with `RequestDenied`.
+
+## Own the client session until key exchange hands it to Handle (#63)
+
+A private PendingSession owns the session join and an AbortHandle through every
+await before Handle construction. Dropping establishment aborts its existing
+session future; successful construction transfers its join and disarms the
+guard. The futures Abortable runs inside that same session task, so an
+owner-requested stop returns Ok(()) without a detached monitor or error report.
+Natural session errors and panics retain the base fork's existing result path.
+No public establishment API changes. The futures Abortable source was inspected:
+abort wakes the existing task, whose wrapper drops the stopped session future.
+
+This adapts 991c731 onto d2a3313 without the managed direct TCP/IP patch 0f22b8a
+or the independent runtime panic-payload patch 04d3d6b. Only PATCHES.md context
+needed conflict resolution; the client-module change and regression are retained.
+
+Regression: `cargo test --locked -p russh --test cancelled_establishment`.
+A handler-entered signal establishes suspended key exchange; dropping
+establishment must release the handler/session before peer teardown, and both
+owned peer and session must finish. The timeout is only a hang budget.
+On macOS arm64 the unchanged regression fails against d2a3313's client module
+(exit 101, handler/session still running) and passes with this adaptation
+(1 test, exit 0). The ignored lockfile is copied from the original fork clone.
