@@ -320,6 +320,24 @@ pub enum DisconnectReason<E: From<crate::Error> + Send> {
     Error(E),
 }
 
+// Own the session through every await before a completed Handle can own it.
+struct PendingSession<T: Send> {
+    join: Option<russh_util::runtime::JoinHandle<T>>,
+    abort: futures::future::AbortHandle,
+}
+impl<T: Send> PendingSession<T> {
+    fn into_join(mut self) -> Option<russh_util::runtime::JoinHandle<T>> {
+        self.join.take()
+    }
+}
+impl<T: Send> Drop for PendingSession<T> {
+    fn drop(&mut self) {
+        if self.join.is_some() {
+            self.abort.abort();
+        }
+    }
+}
+
 /// Handle to a session, used to send messages to a client outside of
 /// the request/response cycle.
 pub struct Handle<H: Handler> {
@@ -1319,15 +1337,32 @@ where
     let managed_close = session.managed_close.clone();
     session.begin_rekey()?;
     let (kex_done_signal, kex_done_signal_rx) = oneshot::channel();
-    let join = russh_util::runtime::spawn(session.run(stream, handler, Some(kex_done_signal)));
+    let (abort, registration) = futures::future::AbortHandle::new_pair();
+    let join = russh_util::runtime::spawn(async move {
+        futures::future::Abortable::new(
+            session.run(stream, handler, Some(kex_done_signal)),
+            registration,
+        )
+        .await
+        .unwrap_or(Ok(())) // An owner-requested stop is not a session failure.
+    });
+    let mut pending = PendingSession {
+        join: Some(join),
+        abort,
+    };
 
     let agent_session_binding = match kex_done_signal_rx.await {
         Ok(binding) => binding,
         Err(err) => {
             // kex_done_signal Sender is dropped when the session
-            // fails before a successful key exchange
+            // fails before a successful key exchange.
             debug!("kex_done_signal sender was dropped {err:?}");
-            join.await.map_err(crate::Error::Join)??;
+            pending
+                .join
+                .as_mut()
+                .ok_or(crate::Error::Inconsistent)?
+                .await
+                .map_err(crate::Error::Join)??;
             return Err(H::Error::from(crate::Error::Disconnect));
         }
     };
@@ -1336,7 +1371,7 @@ where
         managed_close,
         sender: handle_sender,
         receiver: handle_receiver,
-        join,
+        join: pending.into_join().ok_or(crate::Error::Inconsistent)?,
         channel_buffer_size,
         agent_session_binding,
     })
