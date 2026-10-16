@@ -263,9 +263,27 @@ impl<C> CommonSession<C> {
     }
 }
 
+/// The one gate every writer of a channel message passes: nothing follows
+/// this side's CLOSE (RFC 4254 section 5.3). [`Encrypted::close`] writes the
+/// CLOSE itself.
+pub(crate) fn sendable(
+    channels: &HashMap<ChannelId, ChannelParams>,
+    id: ChannelId,
+) -> Option<&ChannelParams> {
+    channels.get(&id).filter(|channel| !channel.close_sent)
+}
+
+/// [`sendable`], for a writer that also updates the channel's state.
+pub(crate) fn sendable_mut(
+    channels: &mut HashMap<ChannelId, ChannelParams>,
+    id: ChannelId,
+) -> Option<&mut ChannelParams> {
+    channels.get_mut(&id).filter(|channel| !channel.close_sent)
+}
+
 impl Encrypted {
     pub fn byte(&mut self, channel: ChannelId, msg: u8) -> Result<(), crate::Error> {
-        if let Some(channel) = self.channels.get(&channel) {
+        if let Some(channel) = sendable(&self.channels, channel) {
             push_packet!(self.write, {
                 self.write.push(msg);
                 channel.recipient_channel.encode(&mut self.write)?;
@@ -296,7 +314,11 @@ impl Encrypted {
         }
         ch.pending_close = false;
         ch.close_sent = true;
-        self.byte(channel, msg::CHANNEL_CLOSE)?;
+        let recipient_channel = ch.recipient_channel;
+        push_packet!(self.write, {
+            self.write.push(msg::CHANNEL_CLOSE);
+            recipient_channel.encode(&mut self.write)?;
+        });
         if self
             .channels
             .get(&channel)
@@ -360,7 +382,7 @@ impl Encrypted {
         if bytes == 0 {
             return Ok(());
         }
-        if let Some(channel) = self.channels.get_mut(&id) {
+        if let Some(channel) = sendable_mut(&mut self.channels, id) {
             channel.sender_window_size = channel
                 .sender_window_size
                 .checked_add(bytes)
@@ -380,7 +402,7 @@ impl Encrypted {
         data: &[u8],
         target: u32,
     ) -> Result<bool, crate::Error> {
-        if let Some(channel) = self.channels.get_mut(&channel) {
+        if let Some(channel) = sendable_mut(&mut self.channels, channel) {
             trace!(
                 "adjust_window_size, channel = {}, size = {},",
                 channel.sender_channel, target
@@ -475,7 +497,7 @@ impl Encrypted {
     }
 
     pub fn flush_pending(&mut self, channel: ChannelId) -> Result<usize, crate::Error> {
-        let flush_result = match self.channels.get_mut(&channel) {
+        let flush_result = match sendable_mut(&mut self.channels, channel) {
             Some(ch) => Self::flush_channel(&mut self.write, ch)?,
             None => return Ok(0),
         };
@@ -490,7 +512,7 @@ impl Encrypted {
         channel: ChannelId,
         is_rekeying: bool,
     ) -> Result<usize, crate::Error> {
-        let flush_result = match self.channels.get_mut(&channel) {
+        let flush_result = match sendable_mut(&mut self.channels, channel) {
             Some(ch) => Self::flush_channel_with_writer(&mut self.write, writer, ch, is_rekeying)?,
             None => return Ok(0),
         };
@@ -668,8 +690,8 @@ impl Encrypted {
         is_rekeying: bool,
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
-        if let Some(channel) = self.channels.get_mut(&channel) {
-            if channel.close_sent || channel.close_received || channel.pending_close {
+        if let Some(channel) = sendable_mut(&mut self.channels, channel) {
+            if channel.close_received || channel.pending_close {
                 return Ok(());
             }
             assert!(channel.confirmed);
@@ -695,8 +717,8 @@ impl Encrypted {
         is_rekeying: bool,
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
-        if let Some(channel) = self.channels.get_mut(&channel) {
-            if channel.close_sent || channel.close_received || channel.pending_close {
+        if let Some(channel) = sendable_mut(&mut self.channels, channel) {
+            if channel.close_received || channel.pending_close {
                 return Ok(());
             }
             assert!(channel.confirmed);
@@ -727,8 +749,8 @@ impl Encrypted {
         is_rekeying: bool,
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
-        if let Some(channel) = self.channels.get_mut(&channel) {
-            if channel.close_sent || channel.close_received || channel.pending_close {
+        if let Some(channel) = sendable_mut(&mut self.channels, channel) {
+            if channel.close_received || channel.pending_close {
                 return Ok(());
             }
             assert!(channel.confirmed);
@@ -753,8 +775,8 @@ impl Encrypted {
         is_rekeying: bool,
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
-        if let Some(channel) = self.channels.get_mut(&channel) {
-            if channel.close_sent || channel.close_received || channel.pending_close {
+        if let Some(channel) = sendable_mut(&mut self.channels, channel) {
+            if channel.close_received || channel.pending_close {
                 return Ok(());
             }
             assert!(channel.confirmed);
@@ -1032,6 +1054,23 @@ mod tests {
             close_sent: false,
             close_received: false,
         }
+    }
+
+    #[test]
+    fn nothing_follows_this_sides_close() {
+        let id = ChannelId(10);
+        let mut encrypted = test_encrypted();
+        encrypted.channels.insert(id, test_ready_channel(id, 42));
+        encrypted.close(id).unwrap();
+        encrypted.eof(id).unwrap();
+        encrypted.data(id, Bytes::from_static(b"late"), false).unwrap();
+        encrypted.replenish_window(id, 64).unwrap();
+        // CLOSE waits for pending data, so none is left to replay; the replay
+        // passes the gate all the same.
+        let channel = encrypted.channels.get_mut(&id).unwrap();
+        channel.pending_data.push_back((Bytes::from_static(b"held"), None, 0));
+        encrypted.flush_pending(id).unwrap();
+        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_CLOSE]);
     }
 
     #[test]

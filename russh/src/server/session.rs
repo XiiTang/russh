@@ -1074,7 +1074,7 @@ impl Session {
     /// client expects an answer).
     pub fn channel_success(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get_mut(&channel) {
+            if let Some(channel) = crate::session::sendable_mut(&mut enc.channels, channel) {
                 assert!(channel.confirmed);
                 if channel.wants_reply {
                     channel.wants_reply = false;
@@ -1092,7 +1092,7 @@ impl Session {
     /// Send a "failure" reply to a global request.
     pub fn channel_failure(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get_mut(&channel) {
+            if let Some(channel) = crate::session::sendable_mut(&mut enc.channels, channel) {
                 assert!(channel.confirmed);
                 if channel.wants_reply {
                     channel.wants_reply = false;
@@ -1230,7 +1230,7 @@ impl Session {
         client_can_do: bool,
     ) -> Result<(), Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
+            if let Some(channel) = crate::session::sendable(&enc.channels, channel) {
                 assert!(channel.confirmed);
                 push_packet!(enc.write, {
                     msg::CHANNEL_REQUEST.encode(&mut enc.write)?;
@@ -1282,7 +1282,7 @@ impl Session {
         exit_status: u32,
     ) -> Result<(), Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
+            if let Some(channel) = crate::session::sendable(&enc.channels, channel) {
                 assert!(channel.confirmed);
                 push_packet!(enc.write, {
                     msg::CHANNEL_REQUEST.encode(&mut enc.write)?;
@@ -1307,7 +1307,7 @@ impl Session {
         language_tag: &str,
     ) -> Result<(), Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
+            if let Some(channel) = crate::session::sendable(&enc.channels, channel) {
                 assert!(channel.confirmed);
                 push_packet!(enc.write, {
                     msg::CHANNEL_REQUEST.encode(&mut enc.write)?;
@@ -1686,6 +1686,28 @@ mod tests {
         buffer.buffer.extend_from_slice(&[0; 5]);
         buffer.buffer.extend_from_slice(&compressed);
         buffer
+    }
+
+    #[test]
+    fn no_request_follows_this_sides_close() {
+        let mut session = authenticated_session();
+        let enc = session.common.encrypted.as_mut().unwrap();
+        let id = enc.new_channel(1024, 1024);
+        let channel = enc.channels.get_mut(&id).unwrap();
+        channel.confirmed = true;
+        channel.wants_reply = true;
+        enc.close(id).unwrap();
+        session.exit_status_request(id, 0).unwrap();
+        session.channel_success(id).unwrap();
+        let write = &session.common.encrypted.as_ref().unwrap().write;
+        let mut types = Vec::new();
+        let mut cursor = 0;
+        while cursor < write.len() {
+            let len = u32::from_be_bytes(write[cursor..cursor + 4].try_into().unwrap()) as usize;
+            types.push(write[cursor + 4]);
+            cursor += 4 + len;
+        }
+        assert_eq!(types, vec![msg::CHANNEL_CLOSE]);
     }
 
     #[tokio::test]
