@@ -180,3 +180,20 @@ after its holds, repeated releases beside siblings held on both client queues
 (their pending data does not grow), a key exchange pausing the count, and a
 server stream registered after its wakeup. Upstream's
 `tests::channels::test_channel_streams` no longer fails intermittently.
+
+## Nothing follows this side's CHANNEL_CLOSE
+
+RFC 4254 section 5.3 allows no message on a channel after this side sent
+CHANNEL_CLOSE. Data was already refused, but EOF, window adjustments and every
+channel request (`exec`, `request_pty`, `request_shell`, `signal`, `set_env`,
+`request_subsystem`, `request_x11`, `window_change`, `agent_forward`,
+`exit_status_request`, `exit_signal_request`, `xon_xoff_request`,
+`channel_success`, `channel_failure`) only checked that the channel was still
+in the table, which it stays until the peer's CLOSE arrives. Every writer of a
+channel message now passes `session::sendable`, which refuses a channel whose
+CLOSE was sent; so does the replay of pending data, which CLOSE already waits
+for. `Encrypted::close` writes the CLOSE itself. Regressions:
+`cargo test -p russh --lib nothing_follows_this_sides_close` and
+`no_request_follows_this_sides_close`, which write `[97, 96, 93, 94]` (EOF,
+window adjustment, replayed data) and `[97, 98, 99]` (exit-status, SUCCESS) on
+the previous commit instead of `[97]`.

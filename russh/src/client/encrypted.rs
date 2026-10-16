@@ -708,7 +708,7 @@ impl Session {
                             if let Some(ref mut enc) = self.common.encrypted {
                                 trace!("Received channel keep alive message: {req:?}",);
                                 self.common.wants_reply = false;
-                                if let Some(ch) = enc.channels.get(&channel_num) {
+                                if let Some(ch) = crate::session::sendable(&enc.channels, channel_num) {
                                     push_packet!(enc.write, {
                                         map_err!(msg::CHANNEL_SUCCESS.encode(&mut enc.write))?;
                                         map_err!(ch.recipient_channel.encode(&mut enc.write))?;
@@ -726,7 +726,7 @@ impl Session {
                             && let Some(ref mut enc) = self.common.encrypted
                         {
                             self.common.wants_reply = false;
-                            if let Some(ch) = enc.channels.get(&channel_num) {
+                            if let Some(ch) = crate::session::sendable(&enc.channels, channel_num) {
                                 push_packet!(enc.write, {
                                     map_err!(msg::CHANNEL_FAILURE.encode(&mut enc.write))?;
                                     map_err!(ch.recipient_channel.encode(&mut enc.write))?;
