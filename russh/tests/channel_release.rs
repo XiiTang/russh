@@ -108,16 +108,19 @@ async fn read_until_close(channel: &mut russh::Channel<server::Msg>) -> Vec<u8> 
 }
 
 // The check point: a channel let go of closes only after the messages it
-// queued, even while a sibling's zero window keeps the engine from taking more.
+// queued. A sibling the peer's window holds back holds the close back too;
+// once it moves, the queued EOF leaves, then CLOSE.
 #[tokio::test]
 async fn queued_messages_leave_before_the_close_of_a_released_channel() {
-    let Pair { client, mut seen, opened: _opened } = pair(0, Default::default(), None).await;
-    let blocked = client.channel_open_session().await.unwrap();
+    let (open, gate) = tokio::sync::oneshot::channel();
+    let Pair { client, mut seen, opened: _opened } = pair(8, Default::default(), Some(gate)).await;
+    let held = client.channel_open_session().await.unwrap();
     let released = client.channel_open_session().await.unwrap();
     let id = released.id();
-    client.data(blocked.id(), bytes::Bytes::from_static(b"held by a zero window")).await.unwrap();
+    client.data(held.id(), bytes::Bytes::from_static(b"sixteen bytes!!!")).await.unwrap();
     released.eof().await.unwrap();
     drop(released);
+    open.send(()).unwrap();
     let mut order = Vec::new();
     loop {
         match next(&mut seen).await {
