@@ -143,8 +143,15 @@ Letting a channel go now ends it the way OpenSSH and TCP do: what was accepted
 leaves first. A reader-side event ends only the inbound direction; data that
 reaches no reader still counts as consumed, so the peer's window keeps moving
 (OpenSSH `channels.c` `channel_input_data`). The engine closes a channel on the
-program's behalf only once its read half and every writer are gone: it handles
-the messages already queued, then queues CLOSE behind the pending data. Only a
+program's behalf only once its read half and every writer are gone. When it
+first sees the release it fixes a fence on each application queue: the
+messages taken so far plus those queued then, which include everything the
+released handles queued. Messages are still taken only through the ordinary
+window gate, which leaves application output in the bounded queues while a
+channel is window-blocked; once the count reaches the fence and no key exchange
+runs, `Encrypted::close` queues CLOSE behind the channel's pending data. A
+sibling the peer's window holds back therefore holds the close back too, as
+upstream's ordered Close did, and the queues stay the memory bound. Only a
 managed channel's cancellation discards pending data. A control overflow closes
 the channel the same graceful way. The two ends differ in which channels this
 covers:
@@ -163,10 +170,13 @@ Run `cargo test -p russh --test channel_release`.
 the previous commit; `a_server_stream_let_go_closes_after_its_queued_data`
 keeps a server stream's close without the detached task. The `--lib` tests
 `a_channel_closing_behind_pending_data_still_credits_what_arrives`,
+`an_overflowed_channel_waiting_at_its_fence_still_credits_what_arrives`,
 `a_managed_channel_let_go_is_cancelled_though_its_holds_drop_first`,
-`a_rekey_the_queue_starts_holds_the_close_behind_what_is_still_queued` and
+`releases_never_take_messages_past_a_blocked_siblings_window`,
+`a_release_during_kex_closes_after_it_behind_its_fixed_fence` and
 `a_stream_let_go_before_its_open_is_accepted_closes_once_registered` cover the
-close's edges: credit while CLOSE waits, a managed channel's guard dropping
-after its holds, a rekey started while handling the queue, and a server stream
-registered after its wakeup. Upstream's
+close's edges: credit while CLOSE or the fence waits, a managed channel's guard dropping
+after its holds, repeated releases beside siblings held on both client queues
+(their pending data does not grow), a key exchange pausing the count, and a
+server stream registered after its wakeup. Upstream's
 `tests::channels::test_channel_streams` no longer fails intermittently.

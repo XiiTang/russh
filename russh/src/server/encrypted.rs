@@ -725,6 +725,8 @@ mod tests {
             channels: std::collections::HashMap::new(),
             open_global_requests: std::collections::VecDeque::new(),
             kex: SessionKexState::Idle,
+            taken: 0,
+            release_fences: std::collections::HashMap::new(),
         }
     }
 
