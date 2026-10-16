@@ -338,6 +338,7 @@ pub struct Handle<H: Handler> {
     sender: Sender<Msg>,
     receiver: UnboundedReceiver<Reply>,
     join: russh_util::runtime::JoinHandle<Result<(), H::Error>>,
+    abort: futures::future::AbortHandle,
     channel_buffer_size: usize,
 }
 
@@ -348,6 +349,20 @@ impl<H: Handler> Drop for Handle<H> {
 }
 
 impl<H: Handler> Handle<H> {
+    /// Request cancellation of this session, including authentication waits.
+    ///
+    /// This wakes the session task and drops its future. The peer sees the TCP
+    /// connection close; no SSH DISCONNECT is sent, and channel data already
+    /// queued is not guaranteed to be sent. This is cancellation, distinct from
+    /// the graceful end of an ordinary channel when that channel is let go of.
+    ///
+    /// The request returns immediately. Await this Handle to read the session's
+    /// end; an owner-requested stop returns Ok(()). An already completed session
+    /// keeps its result. Repeated stop requests are harmless.
+    pub fn stop(&self) {
+        self.abort.abort();
+    }
+
     pub fn is_closed(&self) -> bool {
         self.sender.is_closed()
     }
@@ -1326,6 +1341,7 @@ where
         managed_close,
         sender: handle_sender,
         receiver: handle_receiver,
+        abort: pending.abort.clone(),
         join: pending.into_join().ok_or(crate::Error::Inconsistent)?,
         channel_buffer_size,
     })

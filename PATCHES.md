@@ -90,3 +90,41 @@ owned peer and session must finish. The timeout is only a hang budget.
 On macOS arm64 the unchanged regression fails against d2a3313's client module
 (exit 101, handler/session still running) and passes with this adaptation
 (1 test, exit 0). The ignored lockfile is copied from the original fork clone.
+
+## Let a Handle owner stop and read its client session (#63)
+
+A completed Handle retains a clone of PendingSession's AbortHandle and exposes
+`Handle::stop(&self)`. Establishment and Handle owners therefore cancel the same
+Abortable session future; there is no second task, command-queue stop message,
+or socket-only cancellation path. This also wakes a session parked waiting for
+keyboard-interactive answers, a public-key signature, or a certificate signature.
+The Handle keeps its join, so awaiting it still reads the session's end. The
+existing wrapper reports an owner-requested stop as Ok(()); already completed
+results and the base fork's natural error/panic path are retained. The stop
+request returns immediately and repeated requests are harmless.
+
+This is cancellation: the peer sees the TCP connection close, no SSH DISCONNECT
+is sent, and channel data already queued is not guaranteed to be sent. It is
+distinct from the graceful end of an ordinary channel when that channel is let
+go of. Await the Handle after requesting stop to observe completion.
+
+Before implementing this, Tokio 1.53.3's source was read: JoinHandle::abort calls
+remote_abort, whose cancellation transition leaves join interest intact; task
+completion retains the output and wakes the join reader. Its Future still reads
+that output. The futures-util 0.3.34 AbortHandle/Abortable source supplies the same
+separation here, preserving the pre-Handle patch's existing Ok(()) stop result.
+
+Regression: `cargo test --locked -p russh --test stopped_session`.
+Three real TCP fixtures observe a keyboard-interactive prompt or a signing
+request whose signer refuses, leaving the native session waiting without an
+answer. Each calls stop twice, awaits the retained Handle successfully, checks
+it is closed, stops it again, and reads the peer's end before teardown. The peer
+receives no authentication answer. All three pass with stop and fail at their
+hang budgets when only stop's abort call is replaced by a no-op (exit 101).
+On macOS arm64 the stop/establishment regressions and 25 existing client,
+channel, certificate-authentication, natural-error, and fork regressions pass
+(29 tests total). Both CI commands, `cargo clippy -- -D warnings` and
+`cargo clippy --all-features -- -D warnings`, exit 101 with the same 44 errors
+on the base client module and on this patch: diagnostic messages, paths and
+source excerpts match after ignoring shifted line numbers. No lint is suppressed
+and no unrelated Clippy repair is included.
