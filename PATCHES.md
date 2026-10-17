@@ -197,3 +197,40 @@ for. `Encrypted::close` writes the CLOSE itself. Regressions:
 `no_request_follows_this_sides_close`, which write `[97, 96, 93, 94]` (EOF,
 window adjustment, replayed data) and `[97, 98, 99]` (exit-status, SUCCESS) on
 the previous commit instead of `[97]`.
+
+## Writers take send credit only for what the session queue took (#72)
+
+A channel's writers keep their own copy of the peer's window so they wait at
+zero without asking the engine; the engine keeps the window it sends against.
+Upstream debited the writers' copy before waiting for room in the session
+queue (`reserve_writable_chunk`, `ChannelTx::poll_writable`): a write cut short
+there kept no message and lost its credit, and a `ChannelTx` retried after
+`Pending` sent the first buffer's bytes, or replaced them with EOF on
+shutdown. On WINDOW_ADJUST the engine set the writers' copy to its own window,
+counting again the data writers had queued that it had not taken yet; it parks
+the excess in `pending_data`, and the outbound gate then stops every channel of
+the session until the peer adjusts that one.
+
+`SendCredit` replaces `WindowSizeRef`. Its value is private and moves only
+through `admit`, which debits a writer's chunk in the same synchronous step its
+queue permit sends it, `charge`, which debits data the session handles send
+outside the writers (`Handle::data`, server `Handle::extended_data`, client
+and server `Session::data` and `Session::extended_data`, possibly into debt),
+and `grant`, which adds what a WINDOW_ADJUST adds and what confirming an open
+changes the window by (a repeated confirmation replaces the window, so the
+credit moves by the difference, never by the whole window again). A write
+waits for credit, then for queue room, holding neither while it waits for the
+other, as tokio-util's
+`PollSender` reserves before it sends; qpid-proton likewise moves its
+application credit only by what a peer flow adds. Handle data reaches the
+engine as the hidden `ChannelMsg::HandleData`, so the engine charges it and
+not a writer's data. `ChannelTx::new` is crate-private.
+
+Run `cargo test -p russh --lib`:
+`a_write_cut_short_before_the_queue_takes_it_keeps_its_credit` (credit 32
+instead of 64 on the previous commit),
+`a_pending_async_write_takes_nothing_until_the_queue_takes_its_buffer` (59
+instead of 64) and `a_window_adjust_never_lets_writers_queue_past_the_window`
+(the write past the window completes) fail on the previous commit;
+`a_repeated_open_confirmation_never_lets_writers_queue_past_the_window` keeps a
+duplicate CHANNEL_OPEN_CONFIRMATION from granting the window twice.
