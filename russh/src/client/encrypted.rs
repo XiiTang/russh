@@ -476,9 +476,11 @@ impl Session {
                 let msg = map_err!(ChannelOpenConfirmation::decode(&mut reader))?;
                 map_err!(ensure_end(&reader))?;
                 let local_id = ChannelId(msg.recipient_channel);
+                let mut before = 0;
 
                 if let Some(ref mut enc) = self.common.encrypted {
                     if let Some(parameters) = enc.channels.get_mut(&local_id) {
+                        before = parameters.recipient_window_size;
                         parameters.confirm(&msg);
                     } else {
                         // We've not requested this channel, close connection.
@@ -489,6 +491,12 @@ impl Session {
                 };
 
                 if let Some(channel) = self.channels.get(&local_id) {
+                    // Writers' credit moves as the window does, here before any
+                    // WINDOW_ADJUST can add to it. A repeated confirmation
+                    // replaces the window, so it moves by the difference.
+                    let window = msg.initial_window_size;
+                    channel.window_size().grant(window.saturating_sub(before));
+                    channel.window_size().charge(before.saturating_sub(window) as usize);
                     channel
                         .send(ChannelMsg::Open {
                             id: local_id,
@@ -725,10 +733,12 @@ impl Session {
                     return Ok(());
                 }
                 let mut new_size = 0;
+                let mut granted = 0;
                 debug!("channel_window_adjust amount: {amount:?}");
                 if let Some(ref mut enc) = self.common.encrypted {
                     if let Some(ref mut channel) = enc.channels.get_mut(&channel_num) {
                         new_size = channel.recipient_window_size.saturating_add(amount);
+                        granted = new_size - channel.recipient_window_size;
                         channel.recipient_window_size = new_size;
                     } else {
                         return Ok(());
@@ -745,10 +755,13 @@ impl Session {
                     )? as u32;
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    chan.window_size().update(new_size).await;
+                    // Writers' credit grows by what the window grew by. Setting
+                    // it to the window would count again the data they already
+                    // queued and the engine has not taken yet.
+                    chan.window_size().grant(granted);
                     // Use try_send to avoid blocking the session loop when channel buffer is full.
-                    // WindowAdjusted is informational - the critical side effect (updating
-                    // WindowSizeRef and notifying ChannelTx) already happens in update().
+                    // WindowAdjusted is informational - the critical side effect (granting the
+                    // writers' credit and waking them) already happened.
                     let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
                 }
                 client.window_adjusted(channel_num, new_size, self).await

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 
 use crate::{ChannelId, ChannelOpenFailure, Error, Pty, Sig};
 
@@ -34,6 +34,13 @@ pub enum ChannelMsg {
     ExtendedData {
         data: Bytes,
         ext: u32,
+    },
+    /// Data a session handle sends outside the channel's writers, which the
+    /// engine charges to their credit when it takes it.
+    #[doc(hidden)]
+    HandleData {
+        data: Bytes,
+        ext: Option<u32>,
     },
     Eof,
     Close,
@@ -117,28 +124,83 @@ pub enum ChannelMsg {
     OpenFailure(ChannelOpenFailure),
 }
 
+/// The credit a channel's writers may still hand to the session: the peer's
+/// window, less what was admitted to the session queue and not yet sent.
+///
+/// It moves only where its owner changes: [`SendCredit::admit`] debits a
+/// writer's chunk in the same synchronous step that its queue permit sends
+/// it, [`SendCredit::charge`] debits data handed to the engine outside the
+/// writers, and [`SendCredit::grant`] credits what the peer's window grows by. A
+/// write cut short before its permit sends keeps nothing, and the engine,
+/// which sends no byte beyond the window it keeps itself, never overwrites
+/// it: credit it already debited for queued data is never counted twice.
 #[derive(Clone, Debug)]
-pub(crate) struct WindowSizeRef {
-    value: Arc<Mutex<u32>>,
+pub(crate) struct SendCredit {
+    // Below zero when the engine took data outside the writers beyond it.
+    value: Arc<std::sync::Mutex<i64>>,
     notifier: Arc<Notify>,
 }
 
-impl WindowSizeRef {
+impl SendCredit {
     pub(crate) fn new(initial: u32) -> Self {
-        let notifier = Arc::new(Notify::new());
         Self {
-            value: Arc::new(Mutex::new(initial)),
-            notifier,
+            value: Arc::new(std::sync::Mutex::new(i64::from(initial))),
+            notifier: Arc::new(Notify::new()),
         }
     }
 
-    pub(crate) async fn update(&self, value: u32) {
-        *self.value.lock().await = value;
-        self.notifier.notify_one();
+    fn value(&self) -> std::sync::MutexGuard<'_, i64> {
+        self.value.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub(crate) fn subscribe(&self) -> Arc<Notify> {
-        Arc::clone(&self.notifier)
+    /// Credits what the peer's window grew by.
+    pub(crate) fn grant(&self, amount: u32) {
+        {
+            let mut value = self.value();
+            *value = value.saturating_add(i64::from(amount)).min(i64::from(u32::MAX));
+        }
+        self.notifier.notify_waiters();
+    }
+
+    /// Debits data handed to the engine without a writer's admission. On a
+    /// channel already closing the engine discards it; that channel sends
+    /// nothing more, so its credit is never read again.
+    pub(crate) fn charge(&self, bytes: usize) {
+        let mut value = self.value();
+        *value = value.saturating_sub(i64::try_from(bytes).unwrap_or(i64::MAX));
+    }
+
+    /// Waits until there is credit to admit, taking none.
+    pub(crate) async fn ready(&self) {
+        loop {
+            let notified = self.notifier.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if *self.value() > 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Admits up to `len` bytes, at most `max_packet_size` of them: `send`
+    /// hands the admitted length to the session queue through a permit it
+    /// already holds, under the same lock that debits it. Returns 0, without
+    /// calling `send`, when another writer took the credit first.
+    pub(crate) fn admit(&self, len: usize, max_packet_size: u32, send: impl FnOnce(usize)) -> usize {
+        let mut value = self.value();
+        let available = usize::try_from((*value).max(0)).unwrap_or(usize::MAX);
+        let admitted = available.min(max_packet_size as usize).min(len);
+        if admitted > 0 {
+            *value -= admitted as i64;
+            send(admitted);
+        }
+        admitted
+    }
+
+    fn writable(&self, max_packet_size: u32) -> usize {
+        let available = usize::try_from((*self.value()).max(0)).unwrap_or(usize::MAX);
+        available.min(max_packet_size as usize)
     }
 }
 
@@ -194,7 +256,7 @@ pub struct ChannelWriteHalf<Send: From<(ChannelId, ChannelMsg)>> {
     pub(crate) id: ChannelId,
     pub(crate) sender: Sender<Send>,
     pub(crate) max_packet_size: u32,
-    pub(crate) window_size: WindowSizeRef,
+    pub(crate) window_size: SendCredit,
     pub(crate) hold: Option<Arc<handles::WriterHold>>,
 }
 
@@ -210,8 +272,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
     /// Returns the min between the maximum packet size and the
     /// remaining window size in the channel.
     pub async fn writable_packet_size(&self) -> usize {
-        self.max_packet_size
-            .min(*self.window_size.value.lock().await) as usize
+        self.window_size.writable(self.max_packet_size)
     }
 
     pub fn id(&self) -> ChannelId {
@@ -377,44 +438,30 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
         Ok(())
     }
 
-    async fn reserve_writable_chunk(&self, remaining: usize) -> Result<usize, Error> {
-        if self.max_packet_size == 0 {
-            return Err(Error::Inconsistent);
-        }
-        loop {
-            let mut window_size = self.window_size.value.lock().await;
-            let writable = (self.max_packet_size as usize)
-                .min(*window_size as usize)
-                .min(remaining);
-            if writable > 0 {
-                *window_size -= writable as u32;
-                if *window_size > 0 {
-                    self.window_size.notifier.notify_one();
-                }
-                return Ok(writable);
-            }
-            let notified = self.window_size.notifier.notified();
-            drop(window_size);
-            notified.await;
-        }
-    }
-
+    /// Sends `data` chunk by chunk. Each chunk waits for credit, then for room
+    /// in the session queue, holding neither while it waits for the other,
+    /// and takes its credit only in the step its permit sends it.
     async fn send_bytes(&self, ext: Option<u32>, data: Bytes) -> Result<(), Error> {
         if data.is_empty() {
             return Ok(());
         }
+        if self.max_packet_size == 0 {
+            return Err(Error::Inconsistent);
+        }
 
         let mut offset = 0;
         while offset < data.len() {
-            let writable = self.reserve_writable_chunk(data.len() - offset).await?;
-            let end = offset + writable;
-            let chunk = data.slice(offset..end);
-            let msg = match ext {
-                None => ChannelMsg::Data { data: chunk },
-                Some(ext) => ChannelMsg::ExtendedData { data: chunk, ext },
-            };
-            self.send_msg(msg).await?;
-            offset = end;
+            self.window_size.ready().await;
+            let permit = self.sender.reserve().await.map_err(|_| Error::SendError)?;
+            let start = offset;
+            offset += self.window_size.admit(data.len() - start, self.max_packet_size, |len| {
+                let chunk = data.slice(start..start + len);
+                let msg = match ext {
+                    None => ChannelMsg::Data { data: chunk },
+                    Some(ext) => ChannelMsg::ExtendedData { data: chunk, ext },
+                };
+                permit.send((self.id, msg).into());
+            });
         }
 
         Ok(())
@@ -452,8 +499,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
         io::ChannelTx::new(
             self.sender.clone(),
             self.id,
-            self.window_size.value.clone(),
-            self.window_size.subscribe(),
+            self.window_size.clone(),
             self.max_packet_size,
             ext,
         )
@@ -487,7 +533,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
         wake: Arc<Notify>,
     ) -> (Self, ChannelRef) {
         let (tx, rx) = tokio::sync::mpsc::channel(channel_buffer_size);
-        let window_size = WindowSizeRef::new(window_size);
+        let window_size = SendCredit::new(window_size);
         let (handles, reader, writer) = handles::Handles::new(wake);
         let read_half = ChannelReadHalf { receiver: rx, inbox: None, _hold: Some(reader) };
         let write_half = ChannelWriteHalf {
@@ -694,8 +740,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
             io::ChannelTx::new(
                 self.write_half.sender.clone(),
                 self.write_half.id,
-                self.write_half.window_size.value.clone(),
-                self.write_half.window_size.subscribe(),
+                self.write_half.window_size.clone(),
                 self.write_half.max_packet_size,
                 None,
             )
@@ -736,7 +781,7 @@ mod tests {
     use super::*;
 
     fn test_write_half(
-        window_size: WindowSizeRef,
+        window_size: SendCredit,
         max_packet_size: u32,
     ) -> (
         ChannelWriteHalf<(ChannelId, ChannelMsg)>,
@@ -758,7 +803,7 @@ mod tests {
     #[tokio::test]
     async fn data_bytes_sends_one_owned_message_when_window_permits() {
         let payload = Bytes::from_static(b"owned data");
-        let (write_half, mut receiver) = test_write_half(WindowSizeRef::new(1024), 1024);
+        let (write_half, mut receiver) = test_write_half(SendCredit::new(1024), 1024);
 
         write_half.data_bytes(payload.clone()).await.unwrap();
 
@@ -774,7 +819,7 @@ mod tests {
     #[tokio::test]
     async fn data_bytes_splits_by_max_packet_size_without_copying() {
         let payload = Bytes::from_static(b"abcdefghij");
-        let (write_half, mut receiver) = test_write_half(WindowSizeRef::new(1024), 4);
+        let (write_half, mut receiver) = test_write_half(SendCredit::new(1024), 4);
 
         write_half.data_bytes(payload.clone()).await.unwrap();
 
@@ -797,7 +842,7 @@ mod tests {
     #[tokio::test]
     async fn extended_data_bytes_preserves_extension_code() {
         let payload = Bytes::from_static(b"stderr");
-        let (write_half, mut receiver) = test_write_half(WindowSizeRef::new(1024), 1024);
+        let (write_half, mut receiver) = test_write_half(SendCredit::new(1024), 1024);
 
         write_half
             .extended_data_bytes(1, payload.clone())
@@ -816,7 +861,7 @@ mod tests {
 
     #[tokio::test]
     async fn data_bytes_empty_payload_sends_nothing() {
-        let (write_half, mut receiver) = test_write_half(WindowSizeRef::new(1024), 1024);
+        let (write_half, mut receiver) = test_write_half(SendCredit::new(1024), 1024);
 
         write_half.data_bytes(Bytes::new()).await.unwrap();
 
@@ -825,7 +870,7 @@ mod tests {
 
     #[tokio::test]
     async fn data_bytes_waits_for_window_update() {
-        let window_size = WindowSizeRef::new(0);
+        let window_size = SendCredit::new(0);
         let (write_half, mut receiver) = test_write_half(window_size.clone(), 1024);
         let send = tokio::spawn(async move {
             write_half
@@ -837,7 +882,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!send.is_finished());
 
-        window_size.update(1024).await;
+        window_size.grant(1024);
         send.await.unwrap();
 
         match receiver.recv().await.unwrap() {
@@ -850,7 +895,7 @@ mod tests {
 
     #[tokio::test]
     async fn data_bytes_rejects_zero_max_packet_size() {
-        let (write_half, mut receiver) = test_write_half(WindowSizeRef::new(1024), 0);
+        let (write_half, mut receiver) = test_write_half(SendCredit::new(1024), 0);
 
         let result = write_half.data_bytes(Bytes::from_static(b"owned")).await;
 
@@ -872,5 +917,70 @@ mod tests {
             }
             msg => panic!("unexpected message: {msg:?}"),
         }
+    }
+
+    /// A write half whose session queue holds one message, already taken by
+    /// `blocker`, so the next send waits for room.
+    fn blocked_write_half(
+        credit: u32,
+    ) -> (
+        ChannelWriteHalf<(ChannelId, ChannelMsg)>,
+        mpsc::Receiver<(ChannelId, ChannelMsg)>,
+    ) {
+        let (sender, receiver) = mpsc::channel(1);
+        sender.try_send((ChannelId(1), ChannelMsg::Eof)).unwrap();
+        let write_half = ChannelWriteHalf {
+            id: ChannelId(7),
+            sender,
+            max_packet_size: 1024,
+            window_size: SendCredit::new(credit),
+            hold: None,
+        };
+        (write_half, receiver)
+    }
+
+    #[tokio::test]
+    async fn a_write_cut_short_before_the_queue_takes_it_keeps_its_credit() {
+        let (write_half, mut receiver) = blocked_write_half(64);
+
+        let mut cut = Box::pin(write_half.data_bytes(Bytes::from(vec![1; 32])));
+        assert!(futures::poll!(cut.as_mut()).is_pending());
+        drop(cut);
+        assert_eq!(write_half.writable_packet_size().await, 64);
+
+        // A follow-up write can use the whole window.
+        receiver.recv().await.unwrap();
+        write_half.data_bytes(Bytes::from(vec![2; 64])).await.unwrap();
+        match receiver.recv().await.unwrap() {
+            (ChannelId(7), ChannelMsg::Data { data }) => assert_eq!(data.len(), 64),
+            msg => panic!("unexpected message: {msg:?}"),
+        }
+        assert_eq!(write_half.writable_packet_size().await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_pending_async_write_takes_nothing_until_the_queue_takes_its_buffer() {
+        use tokio::io::AsyncWriteExt;
+        let (write_half, mut receiver) = blocked_write_half(64);
+        let mut writer = Box::pin(write_half.make_writer());
+
+        assert!(futures::poll!(Box::pin(writer.write(b"first"))).is_pending());
+        assert_eq!(write_half.writable_packet_size().await, 64);
+        // Retried with another buffer, the write sends that buffer.
+        receiver.recv().await.unwrap();
+        assert_eq!(writer.write(b"second").await.unwrap(), 6);
+        match receiver.recv().await.unwrap() {
+            (ChannelId(7), ChannelMsg::Data { data }) => assert_eq!(data.as_ref(), b"second"),
+            msg => panic!("unexpected message: {msg:?}"),
+        }
+        assert_eq!(write_half.writable_packet_size().await, 58);
+
+        // A shutdown after a pending write sends only EOF.
+        write_half.sender.try_send((ChannelId(1), ChannelMsg::Eof)).unwrap();
+        assert!(futures::poll!(Box::pin(writer.write(b"third"))).is_pending());
+        receiver.recv().await.unwrap();
+        writer.shutdown().await.unwrap();
+        assert!(matches!(receiver.recv().await.unwrap(), (ChannelId(7), ChannelMsg::Eof)));
+        assert_eq!(write_half.writable_packet_size().await, 58);
     }
 }

@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 
-use channels::WindowSizeRef;
+use channels::SendCredit;
 use kex::ServerKex;
 use log::debug;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -130,10 +130,10 @@ impl Handle {
     ) -> Result<(), bytes::Bytes> {
         let data = data.into();
         self.sender
-            .send(Msg::Channel(id, ChannelMsg::Data { data }))
+            .send(Msg::Channel(id, ChannelMsg::HandleData { data, ext: None }))
             .await
             .map_err(|e| match e.0 {
-                Msg::Channel(_, ChannelMsg::Data { data }) => data,
+                Msg::Channel(_, ChannelMsg::HandleData { data, .. }) => data,
                 _ => unreachable!(),
             })
     }
@@ -147,10 +147,10 @@ impl Handle {
     ) -> Result<(), bytes::Bytes> {
         let data = data.into();
         self.sender
-            .send(Msg::Channel(id, ChannelMsg::ExtendedData { ext, data }))
+            .send(Msg::Channel(id, ChannelMsg::HandleData { data, ext: Some(ext) }))
             .await
             .map_err(|e| match e.0 {
-                Msg::Channel(_, ChannelMsg::ExtendedData { data, .. }) => data,
+                Msg::Channel(_, ChannelMsg::HandleData { data, .. }) => data,
                 _ => unreachable!(),
             })
     }
@@ -422,17 +422,16 @@ impl Handle {
         &self,
         mut receiver: Receiver<ChannelMsg>,
         (reader, writer): (crate::channels::handles::ReaderHold, Arc<crate::channels::handles::WriterHold>),
-        window_size_ref: WindowSizeRef,
+        window_size_ref: SendCredit,
     ) -> Result<Channel<Msg>, Error> {
         loop {
             match receiver.recv().await {
                 Some(ChannelMsg::Open {
                     id,
                     max_packet_size,
-                    window_size,
+                    // The engine granted the initial window on confirming.
+                    window_size: _,
                 }) => {
-                    window_size_ref.update(window_size).await;
-
                     return Ok(Channel {
                         write_half: ChannelWriteHalf {
                             id,
@@ -524,11 +523,16 @@ impl Session {
     /// pre-`select!` backlog drain so the two can't drift apart.
     fn dispatch_msg(&mut self, msg: Msg) -> Result<(), Error> {
         match msg {
+            // A writer's data took its credit when it was queued.
             Msg::Channel(id, ChannelMsg::Data { data }) => {
-                self.data(id, data)?;
+                self.admitted_data(id, None, data)?;
             }
             Msg::Channel(id, ChannelMsg::ExtendedData { ext, data }) => {
-                self.extended_data(id, ext, data)?;
+                self.admitted_data(id, Some(ext), data)?;
+            }
+            Msg::Channel(id, ChannelMsg::HandleData { data, ext }) => {
+                self.charge(id, data.len());
+                self.admitted_data(id, ext, data)?;
             }
             Msg::Channel(id, ChannelMsg::Eof) => {
                 self.eof(id)?;
@@ -1251,13 +1255,9 @@ impl Session {
     /// The number of bytes added to the "sending pipeline" (to be
     /// processed by the event loop) is returned.
     pub fn data(&mut self, channel: ChannelId, data: impl Into<bytes::Bytes>) -> Result<(), Error> {
-        let is_rekeying = self.kex.active();
-        let common = &mut self.common;
-        if let Some(enc) = common.encrypted.as_mut() {
-            enc.data_with_writer(&mut common.packet_writer, channel, data, is_rekeying)
-        } else {
-            unreachable!()
-        }
+        let data = data.into();
+        self.charge(channel, data.len());
+        self.admitted_data(channel, None, data)
     }
 
     /// Send data to a channel. On session channels, `extended` can be
@@ -1272,16 +1272,38 @@ impl Session {
         extended: u32,
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), Error> {
+        let data = data.into();
+        self.charge(channel, data.len());
+        self.admitted_data(channel, Some(extended), data)
+    }
+
+    /// Debits the channel writers' credit for data taken outside them.
+    pub(crate) fn charge(&self, channel: ChannelId, bytes: usize) {
+        if let Some(chan) = self.channels.get(&channel) {
+            chan.window_size().charge(bytes);
+        }
+    }
+
+    /// Sends data whose credit is already taken.
+    pub(crate) fn admitted_data(
+        &mut self,
+        channel: ChannelId,
+        ext: Option<u32>,
+        data: bytes::Bytes,
+    ) -> Result<(), Error> {
         let is_rekeying = self.kex.active();
         let common = &mut self.common;
         if let Some(enc) = common.encrypted.as_mut() {
-            enc.extended_data_with_writer(
-                &mut common.packet_writer,
-                channel,
-                extended,
-                data,
-                is_rekeying,
-            )
+            match ext {
+                None => enc.data_with_writer(&mut common.packet_writer, channel, data, is_rekeying),
+                Some(ext) => enc.extended_data_with_writer(
+                    &mut common.packet_writer,
+                    channel,
+                    ext,
+                    data,
+                    is_rekeying,
+                ),
+            }
         } else {
             unreachable!()
         }
