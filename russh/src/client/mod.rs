@@ -59,7 +59,7 @@ use tokio::sync::oneshot;
 pub use crate::auth::AuthResult;
 use crate::cert::PublicKeyOrCertificate;
 use crate::channels::{
-    Channel, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf, WindowSizeRef,
+    Channel, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf, SendCredit,
 };
 use crate::cipher::{self, OpeningKey, clear};
 use crate::kex::{KexAlgorithmImplementor, KexCause, KexProgress, SessionKexState};
@@ -852,7 +852,7 @@ impl<H: Handler> Handle<H> {
         &self,
         receiver: Receiver<ChannelMsg>,
         opening: Opening,
-        window_size_ref: WindowSizeRef,
+        window_size_ref: SendCredit,
     ) -> Result<Channel<Msg>, crate::Error> {
         let Opening { inbox, reader, writer } = opening;
         let mut read_half = ChannelReadHalf { receiver, inbox: Some(inbox), _hold: Some(reader) };
@@ -861,10 +861,9 @@ impl<H: Handler> Handle<H> {
                 Some(ChannelMsg::Open {
                     id,
                     max_packet_size,
-                    window_size,
+                    // The engine granted the initial window on confirming.
+                    window_size: _,
                 }) => {
-                    window_size_ref.grow(window_size).await;
-
                     return Ok(Channel {
                         write_half: ChannelWriteHalf {
                             id,
@@ -1191,10 +1190,10 @@ impl<H: Handler> Handle<H> {
     ) -> Result<(), bytes::Bytes> {
         let data = data.into();
         self.sender
-            .send(Msg::Channel(id, ChannelMsg::Data { data }))
+            .send(Msg::Channel(id, ChannelMsg::HandleData { data, ext: None }))
             .await
             .map_err(|e| match e.0 {
-                Msg::Channel(_, ChannelMsg::Data { data, .. }) => data,
+                Msg::Channel(_, ChannelMsg::HandleData { data, .. }) => data,
                 _ => unreachable!(),
             })
     }
@@ -1937,12 +1936,17 @@ impl Session {
                 description,
                 language_tag,
             } => self.disconnect(reason, &description, &language_tag)?,
-            Msg::Channel(id, ChannelMsg::Data { data }) => self.data(id, data)?,
+            // A writer's data took its credit when it was queued.
+            Msg::Channel(id, ChannelMsg::Data { data }) => self.admitted_data(id, None, data)?,
             Msg::Channel(id, ChannelMsg::Eof) => {
                 self.eof(id)?;
             }
             Msg::Channel(id, ChannelMsg::ExtendedData { data, ext }) => {
-                self.extended_data(id, ext, data)?;
+                self.admitted_data(id, Some(ext), data)?;
+            }
+            Msg::Channel(id, ChannelMsg::HandleData { data, ext }) => {
+                self.charge(id, data.len());
+                self.admitted_data(id, ext, data)?;
             }
             Msg::Channel(
                 id,
@@ -2940,6 +2944,56 @@ mod tests {
             assert_eq!((session.receiver.len(), session.inbound_channel_receiver.len()), (2, 2));
             assert!(!session.common.encrypted.as_ref().unwrap().channels[&id].close_sent);
         }
+    }
+
+    #[tokio::test]
+    async fn a_window_adjust_never_lets_writers_queue_past_the_window() {
+        let (mut session, sender, _replies) = keyboard_interactive_session();
+        let channel = released_test_channel(&mut session, &sender, 64);
+        let id = channel.id();
+        // The whole window is queued, not yet taken by the engine, when the
+        // peer adds 32 bytes to it.
+        channel.data_bytes(bytes::Bytes::from(vec![1; 64])).await.unwrap();
+        let mut packet = Vec::new();
+        msg::CHANNEL_WINDOW_ADJUST.encode(&mut packet).unwrap();
+        id.encode(&mut packet).unwrap();
+        32u32.encode(&mut packet).unwrap();
+        session.process_packet(&mut TestHandler, &packet).await.unwrap();
+
+        // Writers may queue the 32 bytes added, and no more.
+        let mut write = Box::pin(channel.data_bytes(bytes::Bytes::from(vec![2; 96])));
+        assert!(futures::poll!(write.as_mut()).is_pending());
+        drop(write);
+        while let Ok(queued) = session.receiver.try_recv() {
+            session.handle_app_msg(AppQueue::Outbound, queued).unwrap();
+        }
+        // Nothing waits beyond the window, so the session's outbound queue
+        // stays open to every other channel.
+        assert!(!session.common.has_any_pending_data());
+        assert_eq!(session.common.encrypted.as_ref().unwrap().channels[&id].recipient_window_size, 0);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_open_confirmation_never_lets_writers_queue_past_the_window() {
+        let (mut session, sender, _replies) = keyboard_interactive_session();
+        let channel = released_test_channel(&mut session, &sender, 64);
+        let id = channel.id();
+        // A confirmation for the established channel replaces its window.
+        let mut packet = Vec::new();
+        msg::CHANNEL_OPEN_CONFIRMATION.encode(&mut packet).unwrap();
+        id.encode(&mut packet).unwrap();
+        (id.0 + 100).encode(&mut packet).unwrap();
+        64u32.encode(&mut packet).unwrap();
+        32u32.encode(&mut packet).unwrap();
+        session.process_packet(&mut TestHandler, &packet).await.unwrap();
+
+        let mut write = Box::pin(channel.data_bytes(bytes::Bytes::from(vec![1; 128])));
+        assert!(futures::poll!(write.as_mut()).is_pending());
+        drop(write);
+        while let Ok(queued) = session.receiver.try_recv() {
+            session.handle_app_msg(AppQueue::Outbound, queued).unwrap();
+        }
+        assert!(!session.common.has_any_pending_data());
     }
 
     #[tokio::test]

@@ -515,15 +515,39 @@ impl Session {
         Ok(())
     }
 
-    pub fn data(
+    pub fn data(&mut self, channel: ChannelId, data: impl Into<bytes::Bytes>) -> Result<(), crate::Error> {
+        let data = data.into();
+        self.charge(channel, data.len());
+        self.admitted_data(channel, None, data)
+    }
+
+    /// Debits the channel writers' credit for data taken outside them.
+    pub(crate) fn charge(&self, channel: ChannelId, bytes: usize) {
+        if let Some(chan) = self.channels.get(&channel) {
+            chan.window_size().charge(bytes);
+        }
+    }
+
+    /// Sends data whose credit is already taken.
+    pub(crate) fn admitted_data(
         &mut self,
         channel: ChannelId,
-        data: impl Into<bytes::Bytes>,
+        ext: Option<u32>,
+        data: bytes::Bytes,
     ) -> Result<(), crate::Error> {
         let is_rekeying = self.kex.active();
         let common = &mut self.common;
         if let Some(enc) = common.encrypted.as_mut() {
-            enc.data_with_writer(&mut common.packet_writer, channel, data, is_rekeying)
+            match ext {
+                None => enc.data_with_writer(&mut common.packet_writer, channel, data, is_rekeying),
+                Some(ext) => enc.extended_data_with_writer(
+                    &mut common.packet_writer,
+                    channel,
+                    ext,
+                    data,
+                    is_rekeying,
+                ),
+            }
         } else {
             unreachable!()
         }
@@ -551,19 +575,9 @@ impl Session {
         ext: u32,
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), crate::Error> {
-        let is_rekeying = self.kex.active();
-        let common = &mut self.common;
-        if let Some(enc) = common.encrypted.as_mut() {
-            enc.extended_data_with_writer(
-                &mut common.packet_writer,
-                channel,
-                ext,
-                data,
-                is_rekeying,
-            )
-        } else {
-            unreachable!()
-        }
+        let data = data.into();
+        self.charge(channel, data.len());
+        self.admitted_data(channel, Some(ext), data)
     }
 
     pub fn agent_forward(
