@@ -268,3 +268,15 @@ former. Regression: `cargo test -p russh --test auth_session_end`, whose
 socket under each of the four waits and gets `Ok(Failure { [] })` from all
 four on the previous commit; `a_refusal_the_server_sends_stays_a_failure`
 keeps a real USERAUTH_FAILURE a failure.
+
+## The handler hears a channel request's reply before its reader (#75)
+
+The client engine queued CHANNEL_SUCCESS and CHANNEL_FAILURE on the
+channel's inbox before calling `Handler::channel_success` and
+`channel_failure`, so the channel's reader could read the reply before the
+handler had heard of it. Boundless answers each request from those hooks,
+because a reader blocked behind unread data never reaches the reply; the
+reader only meets the mirror and reads what the hook recorded for it. Both
+arms now call the hook first and queue the mirror after. Regression:
+`cargo test -p russh --test channel_request_reply`, whose handler holds the
+reply: on the previous commit the reader already reads it.
