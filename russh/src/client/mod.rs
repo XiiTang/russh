@@ -530,24 +530,26 @@ impl<H: Handler> Handle<H> {
         }
     }
 
+    /// The next reply to an authentication request. The session's end
+    /// closes the reply channel: that is `Disconnect`, never a failure the
+    /// server sent. A request the command queue did not take is
+    /// `SendError` instead, so a caller knows it was never sent.
+    async fn recv_auth_reply(&mut self) -> Result<Reply, crate::Error> {
+        self.receiver.recv().await.ok_or(crate::Error::Disconnect)
+    }
+
     async fn wait_recv_reply(&mut self) -> Result<AuthResult, crate::Error> {
         loop {
-            match self.receiver.recv().await {
-                Some(Reply::AuthPasswordChange {..}) => return Err(crate::Error::PasswordChangeRequired),
-                Some(Reply::AuthSuccess) => return Ok(AuthResult::Success),
-                Some(Reply::AuthFailure {
+            match self.recv_auth_reply().await? {
+                Reply::AuthPasswordChange {..} => return Err(crate::Error::PasswordChangeRequired),
+                Reply::AuthSuccess => return Ok(AuthResult::Success),
+                Reply::AuthFailure {
                     proceed_with_methods: remaining_methods,
                     partial_success,
-                }) => {
+                } => {
                     return Ok(AuthResult::Failure {
                         remaining_methods,
                         partial_success,
-                    });
-                }
-                None => {
-                    return Ok(AuthResult::Failure {
-                        remaining_methods: MethodSet::empty(),
-                        partial_success: false,
                     });
                 }
                 _ => {}
@@ -616,36 +618,29 @@ impl<H: Handler> Handle<H> {
             .await
             .is_err()
         {
-            return Err((crate::SendError {}).into());
+            return Err(crate::Error::SendError.into());
         }
         loop {
-            let reply = self.receiver.recv().await;
-            match reply {
-                Some(Reply::AuthSuccess) => return Ok(AuthResult::Success),
-                Some(Reply::AuthFailure {
+            match self.recv_auth_reply().await? {
+                Reply::AuthSuccess => return Ok(AuthResult::Success),
+                Reply::AuthFailure {
                     proceed_with_methods: remaining_methods,
                     partial_success,
-                }) => {
+                } => {
                     return Ok(AuthResult::Failure {
                         remaining_methods,
                         partial_success,
                     });
                 }
-                Some(Reply::SignRequest { key, data }) => {
+                Reply::SignRequest { key, data } => {
                     let data = signer.auth_sign(&key.into(), hash_alg, data).await;
                     let data = match data {
                         Ok(data) => data,
                         Err(e) => return Err(e),
                     };
                     if self.sender.send(Msg::Signed { data }).await.is_err() {
-                        return Err((crate::SendError {}).into());
+                        return Err(crate::Error::SendError.into());
                     }
-                }
-                None => {
-                    return Ok(AuthResult::Failure {
-                        remaining_methods: MethodSet::empty(),
-                        partial_success: false,
-                    });
                 }
                 _ => {}
             }
@@ -674,51 +669,44 @@ impl<H: Handler> Handle<H> {
             .await
             .is_err()
         {
-            return Err((crate::SendError {}).into());
+            return Err(crate::Error::SendError.into());
         }
         loop {
-            let reply = self.receiver.recv().await;
-            match reply {
-                Some(Reply::AuthSuccess) => return Ok(AuthResult::Success),
-                Some(Reply::AuthFailure {
+            match self.recv_auth_reply().await? {
+                Reply::AuthSuccess => return Ok(AuthResult::Success),
+                Reply::AuthFailure {
                     proceed_with_methods: remaining_methods,
                     partial_success,
-                }) => {
+                } => {
                     return Ok(AuthResult::Failure {
                         remaining_methods,
                         partial_success,
                     });
                 }
-                Some(Reply::AuthGssapiResponse {
+                Reply::AuthGssapiResponse {
                     selected_mechanism,
                     mic_data,
-                }) => {
+                } => {
                     let step = authenticator
                         .gssapi_step(Some(selected_mechanism), None, mic_data)
                         .await?;
                     self.send_gssapi_step(step).await?;
                 }
-                Some(Reply::AuthGssapiToken { token, mic_data }) => {
+                Reply::AuthGssapiToken { token, mic_data } => {
                     let step = authenticator
                         .gssapi_step(None, Some(token), mic_data)
                         .await?;
                     self.send_gssapi_step(step).await?;
                 }
-                Some(Reply::AuthGssapiError { error }) => {
+                Reply::AuthGssapiError { error } => {
                     authenticator.gssapi_error(error).await;
-                }
-                None => {
-                    return Ok(AuthResult::Failure {
-                        remaining_methods: MethodSet::empty(),
-                        partial_success: false,
-                    });
                 }
                 _ => {}
             }
         }
     }
 
-    async fn send_gssapi_step(&mut self, step: auth::GssapiStep) -> Result<(), crate::SendError> {
+    async fn send_gssapi_step(&mut self, step: auth::GssapiStep) -> Result<(), crate::Error> {
         let msg = match step {
             auth::GssapiStep::Continue { token } => Msg::AuthGssapiToken { token },
             auth::GssapiStep::Complete {
@@ -729,7 +717,10 @@ impl<H: Handler> Handle<H> {
                 Msg::AuthGssapiExchangeComplete { token }
             }
         };
-        self.sender.send(msg).await.map_err(|_| crate::SendError {})
+        self.sender
+            .send(msg)
+            .await
+            .map_err(|_| crate::Error::SendError)
     }
 
     /// Authenticate using a certificate with a custom signer that implements the
@@ -754,40 +745,33 @@ impl<H: Handler> Handle<H> {
             .await
             .is_err()
         {
-            return Err((crate::SendError {}).into());
+            return Err(crate::Error::SendError.into());
         }
         loop {
-            let reply = self.receiver.recv().await;
-            match reply {
-                Some(Reply::AuthSuccess) => return Ok(AuthResult::Success),
-                Some(Reply::AuthFailure {
+            match self.recv_auth_reply().await? {
+                Reply::AuthSuccess => return Ok(AuthResult::Success),
+                Reply::AuthFailure {
                     proceed_with_methods: remaining_methods,
                     partial_success,
-                }) => {
+                } => {
                     return Ok(AuthResult::Failure {
                         remaining_methods,
                         partial_success,
                     });
                 }
-                Some(Reply::SignRequestCert {
+                Reply::SignRequestCert {
                     cert,
                     hash_alg,
                     data,
-                }) => {
+                } => {
                     let data = signer.auth_sign(&cert.into(), hash_alg, data).await;
                     let data = match data {
                         Ok(data) => data,
                         Err(e) => return Err(e),
                     };
                     if self.sender.send(Msg::Signed { data }).await.is_err() {
-                        return Err((crate::SendError {}).into());
+                        return Err(crate::Error::SendError.into());
                     }
-                }
-                None => {
-                    return Ok(AuthResult::Failure {
-                        remaining_methods: MethodSet::empty(),
-                        partial_success: false,
-                    });
                 }
                 _ => {}
             }

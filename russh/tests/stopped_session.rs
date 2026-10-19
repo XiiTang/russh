@@ -131,12 +131,12 @@ impl Fixture {
 #[derive(Debug)]
 enum SignError {
     Refused,
-    Send,
+    Session,
 }
 
-impl From<russh::SendError> for SignError {
-    fn from(_: russh::SendError) -> Self {
-        Self::Send
+impl From<russh::Error> for SignError {
+    fn from(_: russh::Error) -> Self {
+        Self::Session
     }
 }
 

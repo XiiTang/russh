@@ -169,7 +169,10 @@ impl AuthResult {
 
 #[cfg_attr(feature = "async-trait", async_trait::async_trait)]
 pub trait Signer: Sized {
-    type Error: From<crate::SendError>;
+    /// Also what the authentication that asked for the signature ends with:
+    /// `Error::SendError` for a request the session never took, and
+    /// `Error::Disconnect` when the session ended while it waited.
+    type Error: From<crate::Error>;
 
     fn auth_sign(
         &mut self,
@@ -219,7 +222,10 @@ pub enum GssapiError {
 
 #[cfg_attr(feature = "async-trait", async_trait::async_trait)]
 pub trait GssapiAuthenticator: Sized {
-    type Error: From<crate::SendError>;
+    /// Also what the authentication ends with: `Error::SendError` for a
+    /// message the session never took, and `Error::Disconnect` when the
+    /// session ended while it waited.
+    type Error: From<crate::Error>;
 
     /// Advance the GSSAPI security context.
     ///
@@ -252,6 +258,19 @@ pub enum AgentAuthError {
     Send(#[from] crate::SendError),
     #[error(transparent)]
     Key(#[from] crate::keys::Error),
+    /// The session ended while the authentication waited for its reply.
+    #[error(transparent)]
+    Session(crate::Error),
+}
+/// A request the session never took stays `Send`; any other end of the
+/// session is `Session`.
+impl From<crate::Error> for AgentAuthError {
+    fn from(error: crate::Error) -> Self {
+        match error {
+            crate::Error::SendError => Self::Send(crate::SendError {}),
+            error => Self::Session(error),
+        }
+    }
 }
 
 #[cfg_attr(feature = "async-trait", async_trait::async_trait)]
