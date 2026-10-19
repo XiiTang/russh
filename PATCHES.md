@@ -234,3 +234,17 @@ instead of 64) and `a_window_adjust_never_lets_writers_queue_past_the_window`
 (the write past the window completes) fail on the previous commit;
 `a_repeated_open_confirmation_never_lets_writers_queue_past_the_window` keeps a
 duplicate CHANNEL_OPEN_CONFIRMATION from granting the window twice.
+
+## The handler hears how a session ended before its shutdown result (#22)
+
+`Session::run` shut the socket down with `?` before calling
+`Handler::disconnected`, so a shutdown that failed returned its own error and
+the handler never heard of the peer's DISCONNECT or the error that ended the
+session. Boundless publishes the connection's end from that callback, and an
+operation that meets the session's end reads it there. The shutdown's result
+is now kept and returned only after the handler was told; during key exchange,
+where no handler is told, it still comes first. Regression:
+`cargo test -p russh --test disconnect_reason`, whose
+`a_peers_disconnect_reaches_the_handler_though_shutdown_fails` and
+`a_failed_session_reaches_the_handler_though_shutdown_fails` record no
+`disconnected` call on the previous commit.
