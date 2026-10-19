@@ -3292,6 +3292,28 @@ pub trait Handler: Sized + Send {
         async { Ok(()) }
     }
 
+    /// Called when the server replies to a channel request, before the
+    /// channel's reader can read the reply: returns whether the reply still
+    /// reaches the reader as [`ChannelMsg::Success`] or
+    /// [`ChannelMsg::Failure`]. The default calls [`Self::channel_success`]
+    /// or [`Self::channel_failure`] and lets the reply through.
+    #[allow(unused_variables)]
+    fn channel_reply(
+        &mut self,
+        channel: ChannelId,
+        success: bool,
+        session: &mut Session,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+        async move {
+            if success {
+                self.channel_success(channel, session).await?;
+            } else {
+                self.channel_failure(channel, session).await?;
+            }
+            Ok(true)
+        }
+    }
+
     /// Called when the server signals success.
     #[allow(unused_variables)]
     fn channel_success(

@@ -824,31 +824,25 @@ impl Session {
                 self.common.received_data = false;
                 Ok(())
             }
-            Some((&msg::CHANNEL_SUCCESS, mut r)) => {
+            Some((&msg::CHANNEL_SUCCESS, mut r)) | Some((&msg::CHANNEL_FAILURE, mut r)) => {
+                let success = buf.first() == Some(&msg::CHANNEL_SUCCESS);
                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
                 map_err!(ensure_end(&r))?;
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
-                // The handler hears the reply before the channel's reader can
-                // read its mirror.
-                client.channel_success(channel_num, self).await?;
-                if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Success).await;
-                }
-                Ok(())
-            }
-            Some((&msg::CHANNEL_FAILURE, mut r)) => {
-                let channel_num = map_err!(ChannelId::decode(&mut r))?;
-                map_err!(ensure_end(&r))?;
-                if !self.common.is_established_channel(channel_num) {
-                    return Ok(());
-                }
-                // The handler hears the reply before the channel's reader can
-                // read its mirror.
-                client.channel_failure(channel_num, self).await?;
-                if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Failure).await;
+                // The handler takes the reply first; only one it lets through
+                // reaches the channel's reader.
+                if client.channel_reply(channel_num, success, self).await? {
+                    if let Some(chan) = self.channels.get(&channel_num) {
+                        let _ = chan
+                            .send(if success {
+                                ChannelMsg::Success
+                            } else {
+                                ChannelMsg::Failure
+                            })
+                            .await;
+                    }
                 }
                 Ok(())
             }
