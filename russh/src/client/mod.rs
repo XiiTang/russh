@@ -1463,12 +1463,15 @@ impl Session {
         self.receiver.close();
         self.priority_receiver.close();
         self.inbound_channel_receiver.close();
-        map_err!(stream_write.shutdown().await)?;
+        // The handler learns how the session ended even when the socket's
+        // shutdown fails: that failure is returned after it, never instead.
+        let shutdown = map_err!(stream_write.shutdown().await);
         match result {
             Ok(v) => {
                 handler
                     .disconnected(DisconnectReason::ReceivedDisconnect(v))
                     .await?;
+                shutdown?;
                 Ok(())
             }
             Err(e) => {
@@ -1477,6 +1480,7 @@ impl Session {
                     // so we can send return the concrete error to be propagated
                     // into the JoinHandle and returned from `connect_stream`
                     debug!("disconnected during handshake {e:?}");
+                    shutdown?;
                     Err(e)
                 } else {
                     // The kex signal has been consumed, so no one is
@@ -1484,6 +1488,7 @@ impl Session {
                     // We're better off passing the error into the Handler
                     debug!("disconnected {e:?}");
                     handler.disconnected(DisconnectReason::Error(e)).await?;
+                    shutdown?;
                     Err(H::Error::from(crate::Error::Disconnect))
                 }
             }
