@@ -248,3 +248,23 @@ where no handler is told, it still comes first. Regression:
 `a_peers_disconnect_reaches_the_handler_though_shutdown_fails` and
 `a_failed_session_reaches_the_handler_though_shutdown_fails` record no
 `disconnected` call on the previous commit.
+
+## An authentication the session's end interrupts is a Disconnect (#67)
+
+`wait_recv_reply` and the waits of `authenticate_publickey_with`,
+`authenticate_certificate_with` and `authenticate_gssapi_with_mic` answered a
+closed reply channel with `AuthResult::Failure` and an empty method set, a
+refusal the server never sent; a caller then reported its credentials
+rejected when the session had ended. Every one of them now takes its reply
+through `recv_auth_reply`, which answers the closed channel with
+`Error::Disconnect`, as the password path already did. The `Signer` and
+`GssapiAuthenticator` error bound changes from `From<SendError>` to
+`From<Error>` so these methods can return it; a request or step the command
+queue did not take is still `Error::SendError`, so a caller can tell a
+request never sent from one whose session ended while it waited.
+`AgentAuthError` gains `Session` for the latter and keeps `Send` for the
+former. Regression: `cargo test -p russh --test auth_session_end`, whose
+`an_authentication_the_sessions_end_interrupts_is_a_disconnect` cuts the
+socket under each of the four waits and gets `Ok(Failure { [] })` from all
+four on the previous commit; `a_refusal_the_server_sends_stays_a_failure`
+keeps a real USERAUTH_FAILURE a failure.
