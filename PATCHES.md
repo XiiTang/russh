@@ -269,14 +269,21 @@ socket under each of the four waits and gets `Ok(Failure { [] })` from all
 four on the previous commit; `a_refusal_the_server_sends_stays_a_failure`
 keeps a real USERAUTH_FAILURE a failure.
 
-## The handler hears a channel request's reply before its reader (#75)
+## The handler takes a channel request's reply, which then skips the reader (#75)
 
 The client engine queued CHANNEL_SUCCESS and CHANNEL_FAILURE on the
-channel's inbox before calling `Handler::channel_success` and
-`channel_failure`, so the channel's reader could read the reply before the
-handler had heard of it. Boundless answers each request from those hooks,
-because a reader blocked behind unread data never reaches the reply; the
-reader only meets the mirror and reads what the hook recorded for it. Both
-arms now call the hook first and queue the mirror after. Regression:
-`cargo test -p russh --test channel_request_reply`, whose handler holds the
-reply: on the previous commit the reader already reads it.
+channel's inbox, where the channel's reader meets them in order with the
+channel's data, and told the handler only through `channel_success` and
+`channel_failure`. Boundless answers each request as its reply arrives,
+because a reader blocked behind unread data never reaches the reply; a
+reply it has answered must then not reach the reader at all, or the
+replies the program asks for fill the inbox's control queue while the
+program does not read and the engine closes the channel. A new
+`Handler::channel_reply(channel, success, session)` takes both replies in
+one arm and answers whether the reply still reaches the reader; its
+default calls `channel_success` or `channel_failure` and lets it through,
+as upstream does. (This replaces 72492b9's reason, which called the hooks
+before queueing the reply for a reader that matched it to the hook's
+record.) Regression: `cargo test -p russh --test channel_reply`: a reply
+the handler takes never reaches the reader, and the default handler hears
+each reply, which reaches the reader as before.
