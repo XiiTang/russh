@@ -145,7 +145,7 @@ async fn a_failed_session_reaches_the_handler_though_shutdown_fails() {
         let ends = ends.lock().unwrap().clone();
         assert_eq!(ends.len(), 1, "{ends:?}");
         assert!(ends[0].starts_with("error "), "{ends:?}");
-        drop(server);
+        let _ = server.await;
     })
     .await
     .unwrap();

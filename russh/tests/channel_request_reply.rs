@@ -92,12 +92,14 @@ async fn a_request_reply_reaches_the_handler_before_the_channel_reader() {
     // Only a hang budget; the hook's entry and the test's resume order it.
     tokio::time::timeout(Duration::from_secs(30), async {
         let (client, peer) = tokio::io::duplex(65536);
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             let config = server::Config {
                 keys: vec![key()],
                 ..Default::default()
             };
-            server::run_stream(Arc::new(config), peer, Peer).await?.await
+            server::run_stream(Arc::new(config), peer, Peer)
+                .await?
+                .await
         });
         let entered = Arc::new(Notify::new());
         let resume = Arc::new(Notify::new());
@@ -137,6 +139,9 @@ async fn a_request_reply_reaches_the_handler_before_the_channel_reader() {
             );
             assert_eq!(told.load(Ordering::SeqCst), usize::from(!reply) + 1);
         }
+        // The server's session ends with the client's.
+        drop((channel, handle));
+        let _ = server.await.unwrap();
     })
     .await
     .unwrap();
