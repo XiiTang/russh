@@ -173,9 +173,15 @@ async fn authenticate(
         }
     }
 }
-async fn connect() -> (client::Handle<Trusting>, tokio::sync::oneshot::Sender<()>) {
+/// The client's handle, its cut, and the server, which ends once the
+/// client's session does.
+async fn connect() -> (
+    client::Handle<Trusting>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<(), russh::Error>>,
+) {
     let (client, peer) = tokio::io::duplex(65536);
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         let config = server::Config {
             keys: vec![key(80)],
             auth_rejection_time: Duration::ZERO,
@@ -196,7 +202,15 @@ async fn connect() -> (client::Handle<Trusting>, tokio::sync::oneshot::Sender<()
     )
     .await
     .unwrap();
-    (handle, cut)
+    (handle, cut, server)
+}
+/// Ends the client's session and waits for the server's to end with it.
+async fn finish(
+    handle: client::Handle<Trusting>,
+    server: tokio::task::JoinHandle<Result<(), russh::Error>>,
+) {
+    drop(handle);
+    let _ = server.await.unwrap();
 }
 
 #[tokio::test]
@@ -206,7 +220,7 @@ async fn an_authentication_the_sessions_end_interrupts_is_a_disconnect() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let mut wrong = Vec::new();
         for entry in ENTRIES {
-            let (mut handle, cut) = connect().await;
+            let (mut handle, cut, server) = connect().await;
             let mut waiting = Box::pin(authenticate(&mut handle, entry));
             assert!(
                 futures::poll!(&mut waiting).is_pending(),
@@ -217,6 +231,7 @@ async fn an_authentication_the_sessions_end_interrupts_is_a_disconnect() {
                 Err(Ended::Russh(russh::Error::Disconnect)) => {}
                 result => wrong.push(format!("{entry:?} ended as {result:?}")),
             }
+            finish(handle, server).await;
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
     })
@@ -228,7 +243,7 @@ async fn an_authentication_the_sessions_end_interrupts_is_a_disconnect() {
 async fn a_refusal_the_server_sends_stays_a_failure() {
     tokio::time::timeout(Duration::from_secs(30), async {
         for entry in [Entry::PublicKey, Entry::PublicKeyWith, Entry::Gssapi] {
-            let (mut handle, _cut) = connect().await;
+            let (mut handle, _cut, server) = connect().await;
             match authenticate(&mut handle, entry).await {
                 Ok(client::AuthResult::Failure {
                     remaining_methods,
@@ -236,6 +251,7 @@ async fn a_refusal_the_server_sends_stays_a_failure() {
                 }) if !remaining_methods.is_empty() => {}
                 result => panic!("{entry:?} ended as {result:?}"),
             }
+            finish(handle, server).await;
         }
     })
     .await
