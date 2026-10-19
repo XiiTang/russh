@@ -830,10 +830,13 @@ impl Session {
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
+                // The handler hears the reply before the channel's reader can
+                // read its mirror.
+                client.channel_success(channel_num, self).await?;
                 if let Some(chan) = self.channels.get(&channel_num) {
                     let _ = chan.send(ChannelMsg::Success).await;
                 }
-                client.channel_success(channel_num, self).await
+                Ok(())
             }
             Some((&msg::CHANNEL_FAILURE, mut r)) => {
                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
@@ -841,10 +844,13 @@ impl Session {
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
+                // The handler hears the reply before the channel's reader can
+                // read its mirror.
+                client.channel_failure(channel_num, self).await?;
                 if let Some(chan) = self.channels.get(&channel_num) {
                     let _ = chan.send(ChannelMsg::Failure).await;
                 }
-                client.channel_failure(channel_num, self).await
+                Ok(())
             }
             Some((&msg::CHANNEL_OPEN, mut r)) => {
                 let msg = OpenChannelMessage::parse(&mut r)?;
