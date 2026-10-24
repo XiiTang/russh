@@ -1,7 +1,9 @@
-use std::{sync::Arc,time::Duration};
+use std::{sync::Arc, time::Duration};
 fn key() -> russh::keys::PrivateKey {
-    use russh::keys::ssh_key::private::{Ed25519Keypair,Ed25519PrivateKey};
-    russh::keys::PrivateKey::from(Ed25519Keypair::from(Ed25519PrivateKey::from_bytes(&[71;32])))
+    use russh::keys::ssh_key::private::{Ed25519Keypair, Ed25519PrivateKey};
+    russh::keys::PrivateKey::from(Ed25519Keypair::from(Ed25519PrivateKey::from_bytes(
+        &[71; 32],
+    )))
 }
 use russh::server;
 
@@ -109,12 +111,19 @@ async fn cancelled_open_and_window_blocked_stream_close_in_engine_with_live_sibl
     // Exercise the native engine's pending-data queue too, then fill the
     // bounded application queue. The close notification bypasses both.
     let mut admitted = 0;
-    assert!(tokio::time::timeout(Duration::from_millis(30), async {
-        for _ in 0..64 {
-            client.data(id, bytes::Bytes::from_static(b"pending")).await.unwrap();
-            admitted += 1;
-        }
-    }).await.is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), async {
+            for _ in 0..64 {
+                client
+                    .data(id, bytes::Bytes::from_static(b"pending"))
+                    .await
+                    .unwrap();
+                admitted += 1;
+            }
+        })
+        .await
+        .is_err()
+    );
     assert!(admitted >= 10 && admitted < 64);
     drop(stream);
     assert_eq!(
@@ -187,8 +196,5 @@ async fn a_reply_after_its_session_ended_returns_the_send_failure() {
         .await
         .expect("the server session ends")
         .unwrap();
-    assert!(matches!(
-        reply.accept().await,
-        Err(russh::Error::SendError)
-    ));
+    assert!(matches!(reply.accept().await, Err(russh::Error::SendError)));
 }

@@ -1406,7 +1406,7 @@ impl Session {
                 let msg = map_err!(ChannelOpenConfirmation::decode(r))?;
                 map_err!(ensure_end(r))?;
                 let local_id = ChannelId(msg.recipient_channel);
-                let mut before = 0;
+                let before;
 
                 if let Some(ref mut enc) = self.common.encrypted {
                     if let Some(parameters) = enc.channels.get_mut(&local_id) {

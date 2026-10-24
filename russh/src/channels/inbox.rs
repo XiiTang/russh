@@ -46,7 +46,7 @@ impl Inbox {
         &self,
         message: ChannelMsg,
     ) -> Result<(), tokio::sync::mpsc::error::SendError<ChannelMsg>> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().expect("channel inbox poisoned");
         // What the inbox refuses reaches nobody and still counts as consumed:
         // an overflowed channel stays registered until the engine closes it.
         if state.reader_closed || state.overflowed || state.closed {
@@ -78,7 +78,7 @@ impl Inbox {
         Ok(())
     }
     pub(crate) fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<ChannelMsg>> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().expect("channel inbox poisoned");
         if let Some(message) = state.queue.pop_front() {
             let size = bytes(&message);
             if size == 0 {
@@ -96,17 +96,17 @@ impl Inbox {
         Poll::Pending
     }
     pub(crate) fn take_consumed(&self) -> u32 {
-        std::mem::take(&mut self.state.lock().unwrap().consumed)
+        std::mem::take(&mut self.state.lock().expect("channel inbox poisoned").consumed)
     }
     /// Whether the peer queued more controls than the reader takes; the
     /// engine then closes the channel.
     pub(crate) fn overflowed(&self) -> bool {
-        self.state.lock().unwrap().overflowed
+        self.state.lock().expect("channel inbox poisoned").overflowed
     }
     /// Ends inbound delivery: what is queued and what arrives later counts as
     /// consumed.
     pub(crate) fn close_reader(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().expect("channel inbox poisoned");
         state.reader_closed = true;
         let queued: u32 = state.queue.drain(..).map(|message| bytes(&message)).sum();
         state.consumed += queued;
@@ -114,7 +114,7 @@ impl Inbox {
         self.wake_session.notify_one();
     }
     pub(crate) fn close_sender(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().expect("channel inbox poisoned");
         state.closed = true;
         if let Some(waker) = state.waker.take() {
             waker.wake();

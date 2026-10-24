@@ -1,10 +1,53 @@
 # Boundless patches
 
-Based on upstream `v0.63.3` (`f33baf439be8c59c49cb6cb2ae5976c579495bdf`).
+Based on upstream `v0.64.1` (`e5d80a07dc554480b6ea3b2e14adfc190407b627`).
 `main` mirrors upstream; every commit Boundless pins is on `boundless`.
 Retain upstream history and licenses; keep application behavior outside this
 fork. Keep a patch only while upstream lacks the behavior, and run its
 regression and Boundless's SSH tests before moving the pin.
+
+## 0.64.1 rebuild (#277)
+
+The upstream source at the revision above was compared with every old patch.
+No required behavior is supplied by 0.64.1, so none of these patches is dropped.
+The original commit ids below identify the patches, rather than their replayed
+ids. The regression sections below retain their original before/after evidence;
+the complete russh suite is rerun on this release. Documentation-only commits
+and test-peer ownership corrections carry no additional production mechanism.
+
+| Original patch | Decision and source evidence in upstream 0.64.1 | Regression retained |
+| --- | --- | --- |
+| `1ee788d` password change | Keep: `client/mod.rs:345-360` sends only the old password; `client/encrypted.rs:163-195` has no password-change reply. | password wire encoding and explicit change prompt; Boundless independent password-change peer |
+| `90505bb` managed channels | Keep: `channels/io/mod.rs:30-43` spawns an unowned close task. | `managed_channels` |
+| `585dd71` receive credit | Adapt to upstream's let-chain formatting: `client/encrypted.rs:578-620` still replenishes on arrival and awaits application delivery. | `client_receive_window` |
+| `2d5830f` close state | Keep: `session.rs:287-301` has no sent/received CLOSE state. | session close-state unit tests |
+| `a019216` open reply result | Keep: `lib_inner.rs:596-607` discards the native send result. New upstream peer tests must handle the returned Result. | `managed_channels::a_reply_after_its_session_ended_returns_the_send_failure` |
+| `589b786` malformed forward reply | Keep: `client/encrypted.rs:958-984` converts a malformed success to the same None as rejection. | `raw_no_crypto::an_undecodable_forward_success_ends_the_session` |
+| `d2a3313` patch record | Keep as maintenance history; this inventory supersedes its release baseline. | no runtime change |
+| `2e24684` establishment owner | Keep: `client/mod.rs:1219` spawns before establishment completes without an abort owner. | `cancelled_establishment` |
+| `ac22f3b` Handle stop | Keep: `client/mod.rs:309-325` retains only the join, without a stop handle. | `stopped_session` |
+| `401162f` graceful release | Adapt the event-loop insertion beside the new upstream rekey timer; preserve that timer. Upstream `channels/io/mod.rs:30-43` still uses the detached task. | `channel_release` |
+| `697406c` release edges | Adapt test insertion beside upstream's new rekey tests; retain both sets. Same upstream release path as above. | release edge unit tests |
+| `eba0af1` queue fence | Keep: the upstream detached close queues behind accepted data; the fork must preserve this ordering without a detached task. | fixed-fence and blocked-sibling unit tests |
+| `3163ece` post-CLOSE exclusion | Adapt to upstream's let chains in client/server session writers; `session.rs:278-301` otherwise allows EOF after CLOSE. | `nothing_follows_this_sides_close`, `no_request_follows_this_sides_close` |
+| `14ea6dd` send credit | Adapt next to the new hostkeys-prove method, keeping it intact. `channels/mod.rs:362-391` still debits before queue admission; `client/encrypted.rs:727-759` resets rather than adds credit. | send-credit unit tests |
+| `3646703` disconnect observation | Keep: `client/mod.rs:1313-1333` returns a shutdown error before calling the handler. | `disconnect_reason` |
+| `a8e430b` interrupted auth | Adapt formatting; `client/mod.rs:435-461` still synthesizes refusal on a closed reply stream. | `auth_session_end` |
+| `72492b9` request-reply ordering | Keep as history under the later `7596d8a` replacement: `client/encrypted.rs:794-816` still queues before calling the handler. | `channel_reply` |
+| `123b6be` owned regression peers | Keep fixture ownership corrections when replaying the tests. | regressions join their own peers |
+| `7596d8a` request-reply consumption | Keep: those upstream arms still always deliver replies to the reader. | `channel_reply` |
+
+The replay also adapts its own existing lint sites: the receive-inbox locks
+use an explicit poisoned-lock message and the channel-reply hook uses the
+upstream let-chain style. The same six unwraps and nested hook were present
+on the old boundless branch. No lint is disabled and neither failure behavior
+nor queue policy changes. Upstream's new open-reply fixture handles the fork's
+existing Result-returning accept method. Stable rustfmt formats the replayed
+integration tests; it does not recursively format the library's include file.
+
+The upgrade retains upstream's agent lifetime-constraint admission fix and the
+server signature-algorithm check, rather than copying either into a Boundless
+patch. Their advisory exceptions are removed with Boundless's pin update.
 
 ## Explicit password-change authentication (`1ee788d`)
 
