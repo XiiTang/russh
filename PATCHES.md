@@ -49,6 +49,17 @@ The upgrade retains upstream's agent lifetime-constraint admission fix and the
 server signature-algorithm check, rather than copying either into a Boundless
 patch. Their advisory exceptions are removed with Boundless's pin update.
 
+Validation of the rebuilt native code at `3dfd52f` on macOS arm64:
+`cargo test -p russh` and `cargo test --locked -p russh --all-features`
+exit 0; `cargo fmt --all --check` exits 0. Both strict Clippy feature variants
+exit 101 at the six pre-existing `channels/inbox.rs` lock unwraps described above.
+The additional fork regression
+`client::encrypted::tests::password_change_encodes_only_an_explicit_replacement`
+exits 101 when the replacement-present wire flag is disabled, and 0 with the
+carried password patch restored. Its upstream baseline has neither the replacement
+field nor the password-change reply API. The existing per-patch regression
+sections below name their checkpoints and original before/after evidence.
+
 ## Explicit password-change authentication (`1ee788d`)
 
 RFC 4252 section 8 lets a server answer password authentication with
