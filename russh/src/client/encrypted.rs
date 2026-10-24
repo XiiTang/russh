@@ -248,7 +248,12 @@ impl Session {
                                 // wait for response from handler
                                 let responses = loop {
                                     match self.receiver.recv().await {
-                                        Some(Msg::AuthInfoResponse { responses }) => {
+                                        Some(Msg::AuthInfoResponse {
+                                            responses,
+                                            mut reply_channel,
+                                        }) => {
+                                            reply_channel.admit();
+                                            self.sender = reply_channel;
                                             break responses;
                                         }
                                         None => return Err(crate::Error::RecvError.into()),
@@ -490,21 +495,27 @@ impl Session {
                     return Err(crate::Error::Inconsistent.into());
                 };
 
-                if let Some(channel) = self.channels.get(&local_id) {
+                if let Some(channel) = self.channels.get_mut(&local_id) {
                     // Writers' credit moves as the window does, here before any
                     // WINDOW_ADJUST can add to it. A repeated confirmation
                     // replaces the window, so it moves by the difference.
                     let window = msg.initial_window_size;
                     channel.window_size().grant(window.saturating_sub(before));
-                    channel.window_size().charge(before.saturating_sub(window) as usize);
                     channel
-                        .send(ChannelMsg::Open {
-                            id: local_id,
-                            max_packet_size: msg.maximum_packet_size,
-                            window_size: msg.initial_window_size,
-                        })
-                        .await
-                        .unwrap_or(());
+                        .window_size()
+                        .charge(before.saturating_sub(window) as usize);
+                    if let Some(opening) = channel.client_open.take() {
+                        opening.confirm(local_id, msg.maximum_packet_size);
+                    } else {
+                        channel
+                            .send(ChannelMsg::Open {
+                                id: local_id,
+                                max_packet_size: msg.maximum_packet_size,
+                                window_size: msg.initial_window_size,
+                            })
+                            .await
+                            .unwrap_or(());
+                    }
                 } else {
                     error!("no channel for id {local_id:?}");
                 }
@@ -571,13 +582,15 @@ impl Session {
                     return Ok(());
                 }
 
-                if let Some(sender) = self.channels.remove(&channel_num) {
-                    let _ = sender
-                        .send(ChannelMsg::OpenFailure(reason_code.clone()))
-                        .await;
+                if let Some(mut sender) = self.channels.remove(&channel_num) {
+                    if let Some(opening) = sender.client_open.take() {
+                        opening.reject(reason_code.clone());
+                    } else {
+                        let _ = sender
+                            .send(ChannelMsg::OpenFailure(reason_code.clone()))
+                            .await;
+                    }
                 }
-
-                let _ = self.sender.send(Reply::ChannelOpenFailure);
 
                 client
                     .channel_open_failure(channel_num, reason_code, &descr, &language, self)
@@ -695,7 +708,9 @@ impl Session {
                             if let Some(ref mut enc) = self.common.encrypted {
                                 trace!("Received channel keep alive message: {req:?}",);
                                 self.common.wants_reply = false;
-                                if let Some(ch) = crate::session::sendable(&enc.channels, channel_num) {
+                                if let Some(ch) =
+                                    crate::session::sendable(&enc.channels, channel_num)
+                                {
                                     push_packet!(enc.write, {
                                         map_err!(msg::CHANNEL_SUCCESS.encode(&mut enc.write))?;
                                         map_err!(ch.recipient_channel.encode(&mut enc.write))?;
@@ -1427,7 +1442,10 @@ mod tests {
                 password: "old".into(),
                 new_password: replacement.map(str::to_owned),
             };
-            assert!(matches!(AuthRequest::new(&method).current, Some(auth::CurrentRequest::Password)));
+            assert!(matches!(
+                AuthRequest::new(&method).current,
+                Some(auth::CurrentRequest::Password)
+            ));
             assert!(encrypted.write_auth_request("alice", &method).unwrap());
             let packets = payloads(&encrypted.write);
             assert_eq!(packets.len(), 1);

@@ -1353,7 +1353,7 @@ impl Session {
         let want_reply = u8::from(true);
         if let Some(ref mut enc) = self.common.encrypted {
             self.open_global_requests
-                .push_back(GlobalRequestResponse::Ping(reply_channel));
+                .push_back(GlobalRequestResponse::Ping(reply_channel.into()));
             push_packet!(enc.write, {
                 msg::GLOBAL_REQUEST.encode(&mut enc.write)?;
                 "keepalive@openssh.com".encode(&mut enc.write)?;
@@ -1559,7 +1559,7 @@ impl Session {
             let want_reply = reply_channel.is_some();
             if let Some(reply_channel) = reply_channel {
                 self.open_global_requests.push_back(
-                    crate::session::GlobalRequestResponse::TcpIpForward(reply_channel),
+                    crate::session::GlobalRequestResponse::TcpIpForward(reply_channel.into()),
                 );
             }
             push_packet!(enc.write, {
@@ -1584,7 +1584,7 @@ impl Session {
             let want_reply = reply_channel.is_some();
             if let Some(reply_channel) = reply_channel {
                 self.open_global_requests.push_back(
-                    crate::session::GlobalRequestResponse::CancelTcpIpForward(reply_channel),
+                    crate::session::GlobalRequestResponse::CancelTcpIpForward(reply_channel.into()),
                 );
             }
             push_packet!(enc.write, {

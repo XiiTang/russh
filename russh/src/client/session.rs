@@ -1,10 +1,26 @@
+use std::collections::VecDeque;
+
 use log::error;
 use ssh_encoding::Encode;
 use tokio::sync::oneshot;
 
-use crate::client::Session;
-use crate::session::EncryptedState;
+use crate::client::{CompletionSender, Session};
+use crate::session::{EncryptedState, GlobalRequestResponse};
 use crate::{ChannelId, CryptoVec, Disconnect, Pty, Sig, map_err, msg};
+
+// A request has exactly one FIFO position when its wire flag asks for a
+// reply. Leaving a waiter never removes that position.
+fn queue_reply(
+    queue: &mut VecDeque<GlobalRequestResponse>,
+    reply: Option<GlobalRequestResponse>,
+) -> bool {
+    if let Some(reply) = reply {
+        queue.push_back(reply);
+        true
+    } else {
+        false
+    }
+}
 
 impl Session {
     fn channel_open_generic<F>(
@@ -314,13 +330,21 @@ impl Session {
         address: &str,
         port: u32,
     ) -> Result<(), crate::Error> {
+        self.tcpip_forward_reply(reply_channel.map(Into::into), address, port)
+    }
+
+    pub(crate) fn tcpip_forward_reply(
+        &mut self,
+        reply_channel: Option<CompletionSender<Option<u32>>>,
+        address: &str,
+        port: u32,
+    ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            let want_reply = reply_channel.is_some();
-            if let Some(reply_channel) = reply_channel {
-                self.open_global_requests.push_back(
-                    crate::session::GlobalRequestResponse::TcpIpForward(reply_channel),
-                );
-            }
+            let want_reply = queue_reply(
+                &mut self.open_global_requests,
+                reply_channel.map(GlobalRequestResponse::TcpIpForward),
+            );
+
             push_packet!(enc.write, {
                 msg::GLOBAL_REQUEST.encode(&mut enc.write)?;
                 "tcpip-forward".encode(&mut enc.write)?;
@@ -342,13 +366,21 @@ impl Session {
         address: &str,
         port: u32,
     ) -> Result<(), crate::Error> {
+        self.cancel_tcpip_forward_reply(reply_channel.map(Into::into), address, port)
+    }
+
+    pub(crate) fn cancel_tcpip_forward_reply(
+        &mut self,
+        reply_channel: Option<CompletionSender<bool>>,
+        address: &str,
+        port: u32,
+    ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            let want_reply = reply_channel.is_some();
-            if let Some(reply_channel) = reply_channel {
-                self.open_global_requests.push_back(
-                    crate::session::GlobalRequestResponse::CancelTcpIpForward(reply_channel),
-                );
-            }
+            let want_reply = queue_reply(
+                &mut self.open_global_requests,
+                reply_channel.map(GlobalRequestResponse::CancelTcpIpForward),
+            );
+
             push_packet!(enc.write, {
                 msg::GLOBAL_REQUEST.encode(&mut enc.write)?;
                 "cancel-tcpip-forward".encode(&mut enc.write)?;
@@ -369,13 +401,20 @@ impl Session {
         reply_channel: Option<oneshot::Sender<bool>>,
         socket_path: &str,
     ) -> Result<(), crate::Error> {
+        self.streamlocal_forward_reply(reply_channel.map(Into::into), socket_path)
+    }
+
+    pub(crate) fn streamlocal_forward_reply(
+        &mut self,
+        reply_channel: Option<CompletionSender<bool>>,
+        socket_path: &str,
+    ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            let want_reply = reply_channel.is_some();
-            if let Some(reply_channel) = reply_channel {
-                self.open_global_requests.push_back(
-                    crate::session::GlobalRequestResponse::StreamLocalForward(reply_channel),
-                );
-            }
+            let want_reply = queue_reply(
+                &mut self.open_global_requests,
+                reply_channel.map(GlobalRequestResponse::StreamLocalForward),
+            );
+
             push_packet!(enc.write, {
                 msg::GLOBAL_REQUEST.encode(&mut enc.write)?;
                 "streamlocal-forward@openssh.com".encode(&mut enc.write)?;
@@ -395,13 +434,20 @@ impl Session {
         reply_channel: Option<oneshot::Sender<bool>>,
         socket_path: &str,
     ) -> Result<(), crate::Error> {
+        self.cancel_streamlocal_forward_reply(reply_channel.map(Into::into), socket_path)
+    }
+
+    pub(crate) fn cancel_streamlocal_forward_reply(
+        &mut self,
+        reply_channel: Option<CompletionSender<bool>>,
+        socket_path: &str,
+    ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            let want_reply = reply_channel.is_some();
-            if let Some(reply_channel) = reply_channel {
-                self.open_global_requests.push_back(
-                    crate::session::GlobalRequestResponse::CancelStreamLocalForward(reply_channel),
-                );
-            }
+            let want_reply = queue_reply(
+                &mut self.open_global_requests,
+                reply_channel.map(GlobalRequestResponse::CancelStreamLocalForward),
+            );
+
             push_packet!(enc.write, {
                 msg::GLOBAL_REQUEST.encode(&mut enc.write)?;
                 "cancel-streamlocal-forward@openssh.com".encode(&mut enc.write)?;
@@ -424,12 +470,21 @@ impl Session {
         name: &str,
         data: &[u8],
     ) -> Result<(), crate::Error> {
+        self.send_global_request_reply(reply_channel.map(Into::into), name, data)
+    }
+
+    pub(crate) fn send_global_request_reply(
+        &mut self,
+        reply_channel: Option<CompletionSender<Option<CryptoVec>>>,
+        name: &str,
+        data: &[u8],
+    ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            let want_reply = reply_channel.is_some();
-            if let Some(reply_channel) = reply_channel {
-                self.open_global_requests
-                    .push_back(crate::session::GlobalRequestResponse::Other(reply_channel));
-            }
+            let want_reply = queue_reply(
+                &mut self.open_global_requests,
+                reply_channel.map(GlobalRequestResponse::Other),
+            );
+
             push_packet!(enc.write, {
                 msg::GLOBAL_REQUEST.encode(&mut enc.write)?;
                 name.encode(&mut enc.write)?;
@@ -441,8 +496,10 @@ impl Session {
     }
 
     pub fn send_keepalive(&mut self, want_reply: bool) -> Result<(), crate::Error> {
-        self.open_global_requests
-            .push_back(crate::session::GlobalRequestResponse::Keepalive);
+        let want_reply = queue_reply(
+            &mut self.open_global_requests,
+            want_reply.then_some(GlobalRequestResponse::Keepalive),
+        );
         if let Some(ref mut enc) = self.common.encrypted {
             push_packet!(enc.write, {
                 msg::GLOBAL_REQUEST.encode(&mut enc.write)?;
@@ -454,8 +511,17 @@ impl Session {
     }
 
     pub fn send_ping(&mut self, reply_channel: oneshot::Sender<()>) -> Result<(), crate::Error> {
-        self.open_global_requests
-            .push_back(crate::session::GlobalRequestResponse::Ping(reply_channel));
+        self.send_ping_reply(reply_channel.into())
+    }
+
+    pub(crate) fn send_ping_reply(
+        &mut self,
+        reply_channel: CompletionSender<()>,
+    ) -> Result<(), crate::Error> {
+        queue_reply(
+            &mut self.open_global_requests,
+            Some(GlobalRequestResponse::Ping(reply_channel)),
+        );
         if let Some(ref mut enc) = self.common.encrypted {
             push_packet!(enc.write, {
                 msg::GLOBAL_REQUEST.encode(&mut enc.write)?;
@@ -467,8 +533,10 @@ impl Session {
     }
 
     pub fn no_more_sessions(&mut self, want_reply: bool) -> Result<(), crate::Error> {
-        self.open_global_requests
-            .push_back(crate::session::GlobalRequestResponse::NoMoreSessions);
+        let want_reply = queue_reply(
+            &mut self.open_global_requests,
+            want_reply.then_some(GlobalRequestResponse::NoMoreSessions),
+        );
         if let Some(ref mut enc) = self.common.encrypted {
             push_packet!(enc.write, {
                 msg::GLOBAL_REQUEST.encode(&mut enc.write)?;
@@ -484,7 +552,7 @@ impl Session {
     /// DANGER: reply channel may not be awaited while the Session is borrowed, as it will deadlock.
     pub(crate) fn request_hostkeys_prove(
         &mut self,
-        reply_channel: oneshot::Sender<Result<(), crate::Error>>,
+        reply_channel: CompletionSender<Result<(), crate::Error>>,
         keys: Vec<crate::keys::PublicKey>,
     ) -> Result<(), crate::Error> {
         if keys.is_empty() {
@@ -499,11 +567,13 @@ impl Session {
         let Some(ref mut enc) = self.common.encrypted else {
             return Ok(());
         };
-        self.open_global_requests
-            .push_back(crate::session::GlobalRequestResponse::HostKeysProve {
+        queue_reply(
+            &mut self.open_global_requests,
+            Some(GlobalRequestResponse::HostKeysProve {
                 return_channel: reply_channel,
                 keys,
-            });
+            }),
+        );
         push_packet!(enc.write, {
             msg::GLOBAL_REQUEST.encode(&mut enc.write)?;
             "hostkeys-prove-00@openssh.com".encode(&mut enc.write)?;
@@ -515,7 +585,11 @@ impl Session {
         Ok(())
     }
 
-    pub fn data(&mut self, channel: ChannelId, data: impl Into<bytes::Bytes>) -> Result<(), crate::Error> {
+    pub fn data(
+        &mut self,
+        channel: ChannelId,
+        data: impl Into<bytes::Bytes>,
+    ) -> Result<(), crate::Error> {
         let data = data.into();
         self.charge(channel, data.len());
         self.admitted_data(channel, None, data)

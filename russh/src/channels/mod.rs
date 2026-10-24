@@ -550,6 +550,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
                 read_half,
             },
             ChannelRef {
+                client_open: None,
                 sender: tx,
                 window_size,
                 managed_close: None,

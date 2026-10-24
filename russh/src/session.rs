@@ -946,24 +946,24 @@ pub(crate) enum GlobalRequestResponse {
     /// request was for Keepalive, ignore result
     Keepalive,
     /// request was for Keepalive but with notification of the result
-    Ping(oneshot::Sender<()>),
+    Ping(crate::client::CompletionSender<()>),
     /// request was for NoMoreSessions, disallow additional sessions
     NoMoreSessions,
     /// request was for TcpIpForward, sends Some(port) for success or None for failure
-    TcpIpForward(oneshot::Sender<Option<u32>>),
+    TcpIpForward(crate::client::CompletionSender<Option<u32>>),
     /// request was for CancelTcpIpForward, sends true for success or false for failure
-    CancelTcpIpForward(oneshot::Sender<bool>),
+    CancelTcpIpForward(crate::client::CompletionSender<bool>),
     /// request was for StreamLocalForward, sends true for success or false for failure
-    StreamLocalForward(oneshot::Sender<bool>),
-    CancelStreamLocalForward(oneshot::Sender<bool>),
+    StreamLocalForward(crate::client::CompletionSender<bool>),
+    CancelStreamLocalForward(crate::client::CompletionSender<bool>),
     /// OpenSSH host-key ownership proof
     HostKeysProve {
-        return_channel: oneshot::Sender<Result<(), crate::Error>>,
+        return_channel: crate::client::CompletionSender<Result<(), crate::Error>>,
         keys: Vec<crate::keys::PublicKey>,
     },
     /// request had a custom name; sends `Some` with the response-specific
     /// payload on success or `None` on failure
-    Other(oneshot::Sender<Option<CryptoVec>>),
+    Other(crate::client::CompletionSender<Option<CryptoVec>>),
 }
 
 #[cfg(test)]

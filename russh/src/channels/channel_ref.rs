@@ -7,6 +7,7 @@ use crate::ChannelMsg;
 /// to it and update it's `window_size`.
 #[derive(Debug)]
 pub struct ChannelRef {
+    pub(crate) client_open: Option<crate::client::PendingChannel>,
     pub(crate) inbox: Option<std::sync::Arc<super::inbox::Inbox>>,
     pub(super) sender: Sender<ChannelMsg>,
     pub(super) window_size: SendCredit,
@@ -23,6 +24,7 @@ impl ChannelRef {
     }
     pub fn new(sender: Sender<ChannelMsg>) -> Self {
         Self {
+            client_open: None,
             sender,
             window_size: SendCredit::new(0),
             managed_close: None,

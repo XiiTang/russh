@@ -184,6 +184,147 @@ carried password patch restored. Its upstream baseline has neither the replaceme
 field nor the password-change reply API. The existing per-patch regression
 sections below name their checkpoints and original before/after evidence.
 
+## Native completion ownership (protocol-driver W4b)
+
+Rule 7 requires an untaken native answer to reach its recovery owner exactly
+once. Upstream 0.64.1 still sends global results into private oneshots
+(`client/mod.rs:897-907`, `client/encrypted.rs:962-984`) and auth replies into
+the Handle's shared stream (`client/mod.rs:311`, `client/encrypted.rs:129-159`). The carried
+#277 tree `067136d` has the same loss at `client/mod.rs:1012-1022` and
+`client/encrypted.rs:984-995`; its channel is assembled only by the open waiter
+(`client/mod.rs:799-825`). Dropping that waiter loses either a late native
+answer or an answer already sent but not yet polled. Reusing the shared auth
+stream can also give the next attempt the earlier attempt's answer.
+
+The API is `client::CompletionSink<T>` (`Arc<dyn Fn(T) + Send + Sync>`),
+`client::AuthenticationReply`, and optional-sink counterparts on `client::Handle`:
+
+- `channel_open_{session,session_managed,x11,direct_tcpip,direct_streamlocal}_with_sink`
+  hands over `Result<Channel<Msg>, Error>`, including a refused open. A managed
+  open retains its existing guard's cancellation; its sink does not undo it.
+- `{tcpip_forward,cancel_tcpip_forward,streamlocal_forward,cancel_streamlocal_forward,
+  send_ping,hostkeys_prove,send_global_request}_with_sink` hands over the native
+  FIFO value (`Option<u32>`, `bool`, `()`, `Result<(), Error>`, or
+  `Option<CryptoVec>`). A no-reply global request has no completion. Fixed-port
+  forwarding still returns native port 0; recovery retains the request's port.
+- `authenticate_{none,password,password_start,password_change,
+  keyboard_interactive_start,keyboard_interactive_respond,publickey,
+  openssh_cert}_with_sink`, `authenticate_gssapi_with_mic_with_sink`,
+  `authenticate_publickey_with_signer_and_sink`, and
+  `authenticate_certificate_with_signer_and_sink` hand over native
+  `AuthenticationReply` values, including continuations. A continuation still
+  requires its ordinary response; the sink does not invent one.
+
+Existing Handle methods delegate with no sink; public Session methods retain
+raw reply-sender signatures. The hidden sender wrappers' `From` implementations
+also preserve direct raw-sender use. Sink callbacks run synchronously, must not
+block or panic, and transfer asynchronous recovery to a longer-lived owner.
+
+`client/completion.rs::OwnedReply::drop` is the disposition checkpoint. Its
+private envelope retains the callback until `take`; both receivers close then
+take on drop. The native sender disposes a failed send through that same
+checkpoint. This also covers an mpsc message admitted before close but pushed
+later. This follows Tokio's oneshot close/take idiom and its unbounded mpsc
+source (1.54.1 `sync/mpsc/unbounded.rs:559-565` admits before pushing;
+`sync/mpsc/chan.rs:551-557`, :576-589 owns discarded messages). Private channel
+constructors prevent Handle paths from bypassing the envelope. Channel
+confirmation assembles the entire channel before sending it to this checkpoint;
+its existing handle-release and managed-close engine remain the close owners.
+
+Auth has a per-call stream and per-attempt watch state: a new auth call waits
+for the earlier native completion/continuation or session end, then submits its
+own call. The admitted sender owns that state until its terminal/step reply or
+drop. Session end answers a waiting new call with `Error::Disconnect`. A
+cancelled queue admission leaves no native attempt behind. There is no pending
+error and no new timer; the caller owns its operation deadline. Final/step
+completion releases the native sender's sink instead of retaining it for the
+whole authenticated session.
+
+`client/session.rs::queue_reply` owns every client global FIFO insertion and
+its wire want-reply flag. The carried tree unconditionally reserved slots for
+`send_keepalive(false)` and `no_more_sessions(false)` (:443-475); those phantom
+positions can consume a late listener grant or the next call's reply. Only
+reply-bearing requests reserve a slot, and dropping a waiter never removes it.
+Server shared-enum sites only convert their existing raw senders; server queue
+policy, W17c control limits and W5-D3 failure projections are unchanged.
+
+Regression evidence:
+
+- `completion::tests::both_completion_races_dispose_once_and_a_taken_reply_never_does`
+  checks both ownership races and a taken reply. Disabling only the disposition
+  callback fails with count 0 instead of 1 (exit 101).
+- `completion::tests::auth_stream_closes_then_takes_before_late_sends_use_its_sink`
+  and `attempt_tests::only_a_native_end_ends_the_wait_and_a_final_reply_releases_its_sink`
+  cover stream handoff, queue admission, native end, and callback release.
+- `native_auth_replies_reach_the_sink_before_and_after_waiter_close` exercises
+  the native auth parser in both races.
+- `tests/completion_sink.rs` drives encrypted in-memory peers. The late-listener
+  acceptance test covers both races, a following live FIFO request and no-reply
+  controls. Its recovery owner calls `cancel_tcpip_forward`, verifies the peer
+  removed the actual listener, and records "resource released" only after the
+  native cancellation succeeds. Disabling the disposition also fails this
+  acceptance test (exit 101).
+- `a_dropped_auth_waiter_without_a_sink_cannot_give_its_reply_to_the_next_call`
+  uses only the existing auth API. The identical test and peer fixture, isolated
+  from sink-only tests, fail on the unmodified `067136d` native source because
+  the second attempt receives the first rejection (exit 101), then pass after
+  restoring W4b (exit 0). The original fork base is never changed.
+- The same integration suite covers channel grant/refusal in both races, managed
+  cancellation, an auth waiter leaving before its reply followed by a new call
+  with its own distinct reply, and session end while that new call waits. Every
+  successful fixture joins its native peer; no cleanup task is spawned by sinks.
+
+W4b was reconciled from the unmodified `drv-w4b` commit `3de392a` onto
+`23b2dfd37548da5f55f86cab70fd5b6b2b242878` (#340 and its reviewed
+assertion follow-up on `daac975`). The original rebased candidate `7deefd6`
+is retained on `drv-w4b-2-before-340-review`. The Handle
+construction conflict retains the public owned `PendingSession`, its stop/join
+and establishment transfer, and initializes W4b's `auth_pending` to `None`.
+The new-auth decision remains native completion/continuation or session end:
+there is no pending error and no timer. Rustfmt formats the carried touched code.
+
+The first strict check on this rebase reproduces 11 fixture diagnostics (101):
+ten deliberate assertion/trap warnings and one identity Vec conversion.
+`completion.rs` permits `unwrap_used` and `panic` only in its `cfg(test)` `tests`
+module, and `unwrap_used` only in `attempt_tests`. Each exception has its reason
+beside it: failed fixture channels/assertions and the taken-reply trap must fail
+the test. These restriction warnings are false positives for test assertions,
+following #340's test-only policy; production restrictions are unchanged.
+The success-packet fixture no longer converts its Vec to the identical Vec type.
+
+Rebase verification on macOS arm64, Rust 1.97.0, through `build-slot` with
+`CARGO_INCREMENTAL=0`:
+
+- `cargo clippy --all-targets -- -D warnings`: 0 after the fixture repairs.
+- `cargo clippy --all-targets --all-features -- -D warnings`: 0.
+- `cargo fmt --all --check`: 0; explicit `rustfmt --edition 2024` formats the
+  include-file modules too. Stable rustfmt prints the upstream nightly-option notices.
+- The identical old-API auth-reuse fixture on unchanged #340 production source
+  exits 101 on `23b2dfd`: "second attempt took the first reply". The rebased
+  `completion_sink` suite exits 0, seven tests, including that regression and
+  the late-listener acceptance case. `cancelled_establishment` also exits 0. Both `owned_establishment` tests exit 0,
+  retaining successful transfer and pre-Handle cancellation/panic completion.
+- Disabling only `OwnedReply::drop`'s callback exits 101 in both
+  `both_completion_races_dispose_once_and_a_taken_reply_never_does` (count 0
+  instead of 1) and `a_late_listener_grant_is_cancelled_and_records_resource_released`
+  (native recovery owner ended). The callback source is then restored byte for
+  byte. Four completion/native-auth-parser unit tests and all seven peer tests
+  exit 0 after restoration. No fault injection remains in the patch.
+- `cargo +1.97.0 test --workspace --locked`: exit 0, 322 passed, 8 ignored,
+  including doctests.
+- `cargo +1.97.0 test --workspace --locked --all-features`: exit 0, 323 passed,
+  8 ignored, including doctests. Both complete runs start with both lane
+  markers absent. Earlier interrupted runs (143) are not counted as passes.
+- Boundless compatibility uses `cargo check -p boundless --locked` against
+  this branch's local Git commit in a disposable prepared Boundless worktree.
+  Its exact revision and exit are recorded in the review ledger. The scratch
+  worktree is removed after the check; the W4b Boundless adapter remains a
+  phase-3 task.
+
+The successful strict and complete-suite results replace the original W4b
+run's historical strict-Clippy blocker; the original `drv-w4b` branch and
+the retained pre-review candidate are not changed.
+
 ## Explicit password-change authentication (`1ee788d`)
 
 RFC 4252 section 8 lets a server answer password authentication with

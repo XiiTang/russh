@@ -73,7 +73,10 @@ use crate::{
     map_err, msg, negotiation,
 };
 
+mod completion;
 mod encrypted;
+use completion::{AuthReplyReceiver, CompletionReceiver};
+pub use completion::{AuthReplySender, CompletionSender, CompletionSink};
 mod kex;
 mod session;
 
@@ -90,7 +93,7 @@ pub struct Session {
     kex: SessionKexState<ClientKex>,
     common: CommonSession<Arc<Config>>,
     receiver: Receiver<Msg>,
-    sender: UnboundedSender<Reply>,
+    sender: AuthReplySender<Reply>,
     channels: HashMap<ChannelId, ChannelRef>,
     pending_reads: Vec<Vec<u8>>,
     pending_len: u32,
@@ -140,16 +143,64 @@ struct Opening {
     writer: Arc<crate::channels::handles::WriterHold>,
 }
 
+pub(crate) struct PendingChannel {
+    reply: CompletionSender<Result<Channel<Msg>, crate::Error>>,
+    receiver: Receiver<ChannelMsg>,
+    opening: Opening,
+    sender: Sender<Msg>,
+    window_size: SendCredit,
+}
+impl std::fmt::Debug for PendingChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingChannel").finish_non_exhaustive()
+    }
+}
+impl PendingChannel {
+    fn confirm(self, id: ChannelId, max_packet_size: u32) {
+        let Opening {
+            inbox,
+            reader,
+            writer,
+        } = self.opening;
+        let channel = Channel {
+            write_half: ChannelWriteHalf {
+                id,
+                sender: self.sender,
+                max_packet_size,
+                window_size: self.window_size,
+                hold: Some(writer),
+            },
+            read_half: ChannelReadHalf {
+                receiver: self.receiver,
+                inbox: Some(inbox),
+                _hold: Some(reader),
+            },
+        };
+        let _ = self.reply.send(Ok(channel));
+    }
+    fn reject(self, reason: ChannelOpenFailure) {
+        let _ = self
+            .reply
+            .send(Err(crate::Error::ChannelOpenFailure(reason)));
+    }
+}
+
+type Reply = AuthenticationReply;
+
+/// A native authentication result or continuation. An abandoned continuation
+/// is handed to its owner; the sink does not resume authentication.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-enum Reply {
+pub enum AuthenticationReply {
     AuthSuccess,
-    AuthPasswordChange { prompt: String, language: String },
+    AuthPasswordChange {
+        prompt: String,
+        language: String,
+    },
     AuthFailure {
         proceed_with_methods: MethodSet,
         partial_success: bool,
     },
-    ChannelOpenFailure,
     SignRequest {
         key: ssh_key::PublicKey,
         data: Vec<u8>,
@@ -183,9 +234,11 @@ pub enum Msg {
     Authenticate {
         user: String,
         method: auth::Method,
+        reply_channel: AuthReplySender<AuthenticationReply>,
     },
     AuthInfoResponse {
         responses: Vec<String>,
+        reply_channel: AuthReplySender<AuthenticationReply>,
     },
     AuthGssapiToken {
         token: Vec<u8>,
@@ -221,24 +274,24 @@ pub enum Msg {
     },
     TcpIpForward {
         /// Provide a channel for the reply result to request a reply from the server
-        reply_channel: Option<oneshot::Sender<Option<u32>>>,
+        reply_channel: Option<CompletionSender<Option<u32>>>,
         address: String,
         port: u32,
     },
     CancelTcpIpForward {
         /// Provide a channel for the reply result to request a reply from the server
-        reply_channel: Option<oneshot::Sender<bool>>,
+        reply_channel: Option<CompletionSender<bool>>,
         address: String,
         port: u32,
     },
     StreamLocalForward {
         /// Provide a channel for the reply result to request a reply from the server
-        reply_channel: Option<oneshot::Sender<bool>>,
+        reply_channel: Option<CompletionSender<bool>>,
         socket_path: String,
     },
     CancelStreamLocalForward {
         /// Provide a channel for the reply result to request a reply from the server
-        reply_channel: Option<oneshot::Sender<bool>>,
+        reply_channel: Option<CompletionSender<bool>>,
         socket_path: String,
     },
     Close {
@@ -267,13 +320,13 @@ pub enum Msg {
         want_reply: bool,
     },
     Ping {
-        reply_channel: oneshot::Sender<()>,
+        reply_channel: CompletionSender<()>,
     },
     NoMoreSessions {
         want_reply: bool,
     },
     HostKeysProve {
-        reply_channel: oneshot::Sender<Result<(), crate::Error>>,
+        reply_channel: CompletionSender<Result<(), crate::Error>>,
         keys: Vec<PublicKey>,
     },
     /// Send a global request with a custom name to the remote
@@ -281,7 +334,7 @@ pub enum Msg {
         name: String,
         data: CryptoVec,
         /// Provide a channel for the reply result to request a reply from the server
-        reply_channel: Option<oneshot::Sender<Option<CryptoVec>>>,
+        reply_channel: Option<CompletionSender<Option<CryptoVec>>>,
     },
 }
 
@@ -304,8 +357,14 @@ pub type ChannelOpenHandle = crate::ChannelOpenHandleInner<Msg>;
 #[derive(Debug)]
 pub enum PasswordAuthResponse {
     Success,
-    Failure { remaining_methods: MethodSet, partial_success: bool },
-    ChangeRequired { prompt: String, language: String },
+    Failure {
+        remaining_methods: MethodSet,
+        partial_success: bool,
+    },
+    ChangeRequired {
+        prompt: String,
+        language: String,
+    },
 }
 
 #[derive(Debug)]
@@ -439,9 +498,11 @@ impl<H: Handler> Drop for PendingSession<H> {
 /// Handle to a session, used to send messages to a client outside of
 /// the request/response cycle.
 pub struct Handle<H: Handler> {
+    // A cancelled authentication keeps its native reply position until that
+    // reply (or the session's end); a new attempt must not take its answer.
+    auth_pending: Option<tokio::sync::watch::Receiver<completion::AuthState>>,
     managed_close: Arc<tokio::sync::Notify>,
     sender: Sender<Msg>,
-    receiver: UnboundedReceiver<Reply>,
     join: russh_util::runtime::JoinHandle<Result<(), H::Error>>,
     abort: futures::future::AbortHandle,
     channel_buffer_size: usize,
@@ -454,6 +515,44 @@ impl<H: Handler> Drop for Handle<H> {
 }
 
 impl<H: Handler> Handle<H> {
+    async fn auth_reply(
+        &mut self,
+        sink: Option<CompletionSink<AuthenticationReply>>,
+    ) -> Result<(AuthReplySender<Reply>, AuthReplyReceiver<Reply>), crate::Error> {
+        use completion::AuthState;
+        if let Some(pending) = &mut self.auth_pending {
+            loop {
+                let state = *pending.borrow_and_update();
+                match state {
+                    AuthState::Complete => break,
+                    AuthState::Ended => return Err(crate::Error::Disconnect),
+                    AuthState::Pending => {}
+                }
+                if pending.changed().await.is_err() {
+                    return Err(crate::Error::Disconnect);
+                }
+            }
+            if self.sender.is_closed() {
+                return Err(crate::Error::Disconnect);
+            }
+        }
+        let (pending, state) = tokio::sync::watch::channel(AuthState::Pending);
+        self.auth_pending = Some(state);
+        let (sender, receiver) = completion::auth_channel(sink);
+        Ok((
+            sender.track(pending, |reply| {
+                matches!(
+                    reply,
+                    Reply::AuthSuccess
+                        | Reply::AuthFailure { .. }
+                        | Reply::AuthPasswordChange { .. }
+                        | Reply::AuthInfoRequest { .. }
+                )
+            }),
+            receiver,
+        ))
+    }
+
     /// Request cancellation of this session, including authentication waits.
     ///
     /// This wakes the session task and drops its future. The peer sees the TCP
@@ -478,15 +577,26 @@ impl<H: Handler> Handle<H> {
         &mut self,
         user: U,
     ) -> Result<AuthResult, crate::Error> {
+        self.authenticate_none_with_sink(user, None).await
+    }
+
+    /// Like [`Self::authenticate_none`], disposing untaken native replies through `sink`.
+    pub async fn authenticate_none_with_sink<U: Into<String>>(
+        &mut self,
+        user: U,
+        sink: Option<CompletionSink<AuthenticationReply>>,
+    ) -> Result<AuthResult, crate::Error> {
+        let (reply_channel, mut receiver) = self.auth_reply(sink).await?;
         let user = user.into();
         self.sender
             .send(Msg::Authenticate {
+                reply_channel,
                 user,
                 method: auth::Method::None,
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_recv_reply().await
+        Self::wait_recv_reply(&mut receiver).await
     }
 
     /// Perform password-based SSH authentication.
@@ -495,9 +605,22 @@ impl<H: Handler> Handle<H> {
         user: U,
         password: P,
     ) -> Result<AuthResult, crate::Error> {
+        self.authenticate_password_with_sink(user, password, None)
+            .await
+    }
+
+    /// Like [`Self::authenticate_password`], disposing untaken native replies through `sink`.
+    pub async fn authenticate_password_with_sink<U: Into<String>, P: Into<String>>(
+        &mut self,
+        user: U,
+        password: P,
+        sink: Option<CompletionSink<AuthenticationReply>>,
+    ) -> Result<AuthResult, crate::Error> {
+        let (reply_channel, mut receiver) = self.auth_reply(sink).await?;
         let user = user.into();
         self.sender
             .send(Msg::Authenticate {
+                reply_channel,
                 user,
                 method: auth::Method::Password {
                     password: password.into(),
@@ -506,28 +629,98 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_recv_reply().await
+        Self::wait_recv_reply(&mut receiver).await
     }
 
     /// Begin password authentication, returning RFC 4252 password-change prompts.
-    pub async fn authenticate_password_start<U: Into<String>, P: Into<String>>(&mut self, user: U, password: P) -> Result<PasswordAuthResponse, crate::Error> {
-        self.sender.send(Msg::Authenticate { user: user.into(), method: auth::Method::Password { password: password.into(), new_password: None } }).await.map_err(|_| crate::Error::SendError)?;
-        self.wait_password_reply().await
+    pub async fn authenticate_password_start<U: Into<String>, P: Into<String>>(
+        &mut self,
+        user: U,
+        password: P,
+    ) -> Result<PasswordAuthResponse, crate::Error> {
+        self.authenticate_password_start_with_sink(user, password, None)
+            .await
+    }
+
+    /// Like [`Self::authenticate_password_start`], disposing untaken native replies through `sink`.
+    pub async fn authenticate_password_start_with_sink<U: Into<String>, P: Into<String>>(
+        &mut self,
+        user: U,
+        password: P,
+        sink: Option<CompletionSink<AuthenticationReply>>,
+    ) -> Result<PasswordAuthResponse, crate::Error> {
+        let (reply_channel, mut receiver) = self.auth_reply(sink).await?;
+        self.sender
+            .send(Msg::Authenticate {
+                reply_channel,
+                user: user.into(),
+                method: auth::Method::Password {
+                    password: password.into(),
+                    new_password: None,
+                },
+            })
+            .await
+            .map_err(|_| crate::Error::SendError)?;
+        Self::wait_password_reply(&mut receiver).await
     }
 
     /// Submit an explicitly supplied replacement password. No retry or storage occurs.
-    pub async fn authenticate_password_change<U: Into<String>, P: Into<String>, N: Into<String>>(&mut self, user: U, old_password: P, new_password: N) -> Result<PasswordAuthResponse, crate::Error> {
-        self.sender.send(Msg::Authenticate { user: user.into(), method: auth::Method::Password { password: old_password.into(), new_password: Some(new_password.into()) } }).await.map_err(|_| crate::Error::SendError)?;
-        self.wait_password_reply().await
+    pub async fn authenticate_password_change<U: Into<String>, P: Into<String>, N: Into<String>>(
+        &mut self,
+        user: U,
+        old_password: P,
+        new_password: N,
+    ) -> Result<PasswordAuthResponse, crate::Error> {
+        self.authenticate_password_change_with_sink(user, old_password, new_password, None)
+            .await
     }
-    async fn wait_password_reply(&mut self) -> Result<PasswordAuthResponse, crate::Error> {
+
+    /// Like [`Self::authenticate_password_change`], disposing untaken native replies through `sink`.
+    pub async fn authenticate_password_change_with_sink<
+        U: Into<String>,
+        P: Into<String>,
+        N: Into<String>,
+    >(
+        &mut self,
+        user: U,
+        old_password: P,
+        new_password: N,
+        sink: Option<CompletionSink<AuthenticationReply>>,
+    ) -> Result<PasswordAuthResponse, crate::Error> {
+        let (reply_channel, mut receiver) = self.auth_reply(sink).await?;
+        self.sender
+            .send(Msg::Authenticate {
+                reply_channel,
+                user: user.into(),
+                method: auth::Method::Password {
+                    password: old_password.into(),
+                    new_password: Some(new_password.into()),
+                },
+            })
+            .await
+            .map_err(|_| crate::Error::SendError)?;
+        Self::wait_password_reply(&mut receiver).await
+    }
+    async fn wait_password_reply(
+        receiver: &mut AuthReplyReceiver<Reply>,
+    ) -> Result<PasswordAuthResponse, crate::Error> {
         loop {
-            match self.receiver.recv().await {
+            match receiver.recv().await {
                 Some(Reply::AuthSuccess) => return Ok(PasswordAuthResponse::Success),
-                Some(Reply::AuthFailure {proceed_with_methods:remaining_methods,partial_success}) => return Ok(PasswordAuthResponse::Failure {remaining_methods,partial_success}),
-                Some(Reply::AuthPasswordChange {prompt,language}) => return Ok(PasswordAuthResponse::ChangeRequired {prompt,language}),
+                Some(Reply::AuthFailure {
+                    proceed_with_methods: remaining_methods,
+                    partial_success,
+                }) => {
+                    return Ok(PasswordAuthResponse::Failure {
+                        remaining_methods,
+                        partial_success,
+                    });
+                }
+                Some(Reply::AuthPasswordChange { prompt, language }) => {
+                    return Ok(PasswordAuthResponse::ChangeRequired { prompt, language });
+                }
                 None => return Err(crate::Error::Disconnect),
-                _ => {},
+                _ => {}
             }
         }
     }
@@ -543,8 +736,24 @@ impl<H: Handler> Handle<H> {
         user: U,
         submethods: S,
     ) -> Result<KeyboardInteractiveAuthResponse, crate::Error> {
+        self.authenticate_keyboard_interactive_start_with_sink(user, submethods, None)
+            .await
+    }
+
+    /// Like [`Self::authenticate_keyboard_interactive_start`], disposing untaken native replies through `sink`.
+    pub async fn authenticate_keyboard_interactive_start_with_sink<
+        U: Into<String>,
+        S: Into<Option<String>>,
+    >(
+        &mut self,
+        user: U,
+        submethods: S,
+        sink: Option<CompletionSink<AuthenticationReply>>,
+    ) -> Result<KeyboardInteractiveAuthResponse, crate::Error> {
+        let (reply_channel, mut receiver) = self.auth_reply(sink).await?;
         self.sender
             .send(Msg::Authenticate {
+                reply_channel,
                 user: user.into(),
                 method: auth::Method::KeyboardInteractive {
                     submethods: submethods.into().unwrap_or_else(|| "".to_owned()),
@@ -552,7 +761,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_recv_keyboard_interactive_reply().await
+        Self::wait_recv_keyboard_interactive_reply(&mut receiver).await
     }
 
     /// Respond to AuthInfoRequests from the server. A server can send any number of these Requests
@@ -565,18 +774,32 @@ impl<H: Handler> Handle<H> {
         &mut self,
         responses: Vec<String>,
     ) -> Result<KeyboardInteractiveAuthResponse, crate::Error> {
+        self.authenticate_keyboard_interactive_respond_with_sink(responses, None)
+            .await
+    }
+
+    /// Like [`Self::authenticate_keyboard_interactive_respond`], disposing untaken native replies through `sink`.
+    pub async fn authenticate_keyboard_interactive_respond_with_sink(
+        &mut self,
+        responses: Vec<String>,
+        sink: Option<CompletionSink<AuthenticationReply>>,
+    ) -> Result<KeyboardInteractiveAuthResponse, crate::Error> {
+        let (reply_channel, mut receiver) = self.auth_reply(sink).await?;
         self.sender
-            .send(Msg::AuthInfoResponse { responses })
+            .send(Msg::AuthInfoResponse {
+                responses,
+                reply_channel,
+            })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_recv_keyboard_interactive_reply().await
+        Self::wait_recv_keyboard_interactive_reply(&mut receiver).await
     }
 
     async fn wait_recv_keyboard_interactive_reply(
-        &mut self,
+        receiver: &mut AuthReplyReceiver<Reply>,
     ) -> Result<KeyboardInteractiveAuthResponse, crate::Error> {
         loop {
-            match self.receiver.recv().await {
+            match receiver.recv().await {
                 Some(Reply::AuthSuccess) => return Ok(KeyboardInteractiveAuthResponse::Success),
                 Some(Reply::AuthFailure {
                     proceed_with_methods: remaining_methods,
@@ -608,14 +831,20 @@ impl<H: Handler> Handle<H> {
     /// closes the reply channel: that is `Disconnect`, never a failure the
     /// server sent. A request the command queue did not take is
     /// `SendError` instead, so a caller knows it was never sent.
-    async fn recv_auth_reply(&mut self) -> Result<Reply, crate::Error> {
-        self.receiver.recv().await.ok_or(crate::Error::Disconnect)
+    async fn recv_auth_reply(
+        receiver: &mut AuthReplyReceiver<Reply>,
+    ) -> Result<Reply, crate::Error> {
+        receiver.recv().await.ok_or(crate::Error::Disconnect)
     }
 
-    async fn wait_recv_reply(&mut self) -> Result<AuthResult, crate::Error> {
+    async fn wait_recv_reply(
+        receiver: &mut AuthReplyReceiver<Reply>,
+    ) -> Result<AuthResult, crate::Error> {
         loop {
-            match self.recv_auth_reply().await? {
-                Reply::AuthPasswordChange {..} => return Err(crate::Error::PasswordChangeRequired),
+            match Self::recv_auth_reply(receiver).await? {
+                Reply::AuthPasswordChange { .. } => {
+                    return Err(crate::Error::PasswordChangeRequired);
+                }
                 Reply::AuthSuccess => return Ok(AuthResult::Success),
                 Reply::AuthFailure {
                     proceed_with_methods: remaining_methods,
@@ -643,15 +872,27 @@ impl<H: Handler> Handle<H> {
         user: U,
         key: PrivateKeyWithHashAlg,
     ) -> Result<AuthResult, crate::Error> {
+        self.authenticate_publickey_with_sink(user, key, None).await
+    }
+
+    /// Like [`Self::authenticate_publickey`], disposing untaken native replies through `sink`.
+    pub async fn authenticate_publickey_with_sink<U: Into<String>>(
+        &mut self,
+        user: U,
+        key: PrivateKeyWithHashAlg,
+        sink: Option<CompletionSink<AuthenticationReply>>,
+    ) -> Result<AuthResult, crate::Error> {
+        let (reply_channel, mut receiver) = self.auth_reply(sink).await?;
         let user = user.into();
         self.sender
             .send(Msg::Authenticate {
+                reply_channel,
                 user,
                 method: auth::Method::PublicKey { key },
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_recv_reply().await
+        Self::wait_recv_reply(&mut receiver).await
     }
 
     /// Perform public OpenSSH Certificate-based SSH authentication
@@ -661,15 +902,29 @@ impl<H: Handler> Handle<H> {
         key: Arc<PrivateKey>,
         cert: Certificate,
     ) -> Result<AuthResult, crate::Error> {
+        self.authenticate_openssh_cert_with_sink(user, key, cert, None)
+            .await
+    }
+
+    /// Like [`Self::authenticate_openssh_cert`], disposing untaken native replies through `sink`.
+    pub async fn authenticate_openssh_cert_with_sink<U: Into<String>>(
+        &mut self,
+        user: U,
+        key: Arc<PrivateKey>,
+        cert: Certificate,
+        sink: Option<CompletionSink<AuthenticationReply>>,
+    ) -> Result<AuthResult, crate::Error> {
+        let (reply_channel, mut receiver) = self.auth_reply(sink).await?;
         let user = user.into();
         self.sender
             .send(Msg::Authenticate {
+                reply_channel,
                 user,
                 method: auth::Method::OpenSshCertificate { key, cert },
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_recv_reply().await
+        Self::wait_recv_reply(&mut receiver).await
     }
 
     /// Authenticate using a custom method that implements the
@@ -682,10 +937,25 @@ impl<H: Handler> Handle<H> {
         hash_alg: Option<HashAlg>,
         signer: &mut S,
     ) -> Result<AuthResult, S::Error> {
+        self.authenticate_publickey_with_signer_and_sink(user, key, hash_alg, signer, None)
+            .await
+    }
+
+    /// Like [`Self::authenticate_publickey_with`], disposing untaken native replies through `sink`.
+    pub async fn authenticate_publickey_with_signer_and_sink<U: Into<String>, S: auth::Signer>(
+        &mut self,
+        user: U,
+        key: ssh_key::PublicKey,
+        hash_alg: Option<HashAlg>,
+        signer: &mut S,
+        sink: Option<CompletionSink<AuthenticationReply>>,
+    ) -> Result<AuthResult, S::Error> {
+        let (reply_channel, mut receiver) = self.auth_reply(sink).await?;
         let user = user.into();
         if self
             .sender
             .send(Msg::Authenticate {
+                reply_channel,
                 user,
                 method: auth::Method::FuturePublicKey { key, hash_alg },
             })
@@ -695,7 +965,7 @@ impl<H: Handler> Handle<H> {
             return Err(crate::Error::SendError.into());
         }
         loop {
-            match self.recv_auth_reply().await? {
+            match Self::recv_auth_reply(&mut receiver).await? {
                 Reply::AuthSuccess => return Ok(AuthResult::Success),
                 Reply::AuthFailure {
                     proceed_with_methods: remaining_methods,
@@ -733,10 +1003,27 @@ impl<H: Handler> Handle<H> {
         mechanism_oids: Vec<Vec<u8>>,
         authenticator: &mut G,
     ) -> Result<AuthResult, G::Error> {
+        self.authenticate_gssapi_with_mic_with_sink(user, mechanism_oids, authenticator, None)
+            .await
+    }
+
+    /// Like [`Self::authenticate_gssapi_with_mic`], disposing untaken native replies through `sink`.
+    pub async fn authenticate_gssapi_with_mic_with_sink<
+        U: Into<String>,
+        G: auth::GssapiAuthenticator,
+    >(
+        &mut self,
+        user: U,
+        mechanism_oids: Vec<Vec<u8>>,
+        authenticator: &mut G,
+        sink: Option<CompletionSink<AuthenticationReply>>,
+    ) -> Result<AuthResult, G::Error> {
+        let (reply_channel, mut receiver) = self.auth_reply(sink).await?;
         let user = user.into();
         if self
             .sender
             .send(Msg::Authenticate {
+                reply_channel,
                 user,
                 method: auth::Method::GssapiWithMic { mechanism_oids },
             })
@@ -746,7 +1033,7 @@ impl<H: Handler> Handle<H> {
             return Err(crate::Error::SendError.into());
         }
         loop {
-            match self.recv_auth_reply().await? {
+            match Self::recv_auth_reply(&mut receiver).await? {
                 Reply::AuthSuccess => return Ok(AuthResult::Success),
                 Reply::AuthFailure {
                     proceed_with_methods: remaining_methods,
@@ -809,10 +1096,25 @@ impl<H: Handler> Handle<H> {
         hash_alg: Option<HashAlg>,
         signer: &mut S,
     ) -> Result<AuthResult, S::Error> {
+        self.authenticate_certificate_with_signer_and_sink(user, cert, hash_alg, signer, None)
+            .await
+    }
+
+    /// Like [`Self::authenticate_certificate_with`], disposing untaken native replies through `sink`.
+    pub async fn authenticate_certificate_with_signer_and_sink<U: Into<String>, S: auth::Signer>(
+        &mut self,
+        user: U,
+        cert: Certificate,
+        hash_alg: Option<HashAlg>,
+        signer: &mut S,
+        sink: Option<CompletionSink<AuthenticationReply>>,
+    ) -> Result<AuthResult, S::Error> {
+        let (reply_channel, mut receiver) = self.auth_reply(sink).await?;
         let user = user.into();
         if self
             .sender
             .send(Msg::Authenticate {
+                reply_channel,
                 user,
                 method: auth::Method::FutureCertificate { cert, hash_alg },
             })
@@ -822,7 +1124,7 @@ impl<H: Handler> Handle<H> {
             return Err(crate::Error::SendError.into());
         }
         loop {
-            match self.recv_auth_reply().await? {
+            match Self::recv_auth_reply(&mut receiver).await? {
                 Reply::AuthSuccess => return Ok(AuthResult::Success),
                 Reply::AuthFailure {
                     proceed_with_methods: remaining_methods,
@@ -854,55 +1156,50 @@ impl<H: Handler> Handle<H> {
 
     /// Wait for confirmation that a channel is open
     /// A channel's receive queue and its handles' holds, attached to its
-    /// engine reference before the OPEN is sent. Dropping the open before its
-    /// confirmation lets both holds go, and the engine closes the channel.
+    /// engine reference before the OPEN is sent. The native open retains both
+    /// holds until confirmation. An untaken channel goes to its sink, or lets
+    /// both holds go so the engine closes it.
     fn opening(&self, channel_ref: &mut ChannelRef) -> Opening {
-        let inbox = crate::channels::inbox::Inbox::new(self.managed_close.clone(), self.channel_buffer_size);
-        let (handles, reader, writer) = crate::channels::handles::Handles::new(self.managed_close.clone());
+        let inbox = crate::channels::inbox::Inbox::new(
+            self.managed_close.clone(),
+            self.channel_buffer_size,
+        );
+        let (handles, reader, writer) =
+            crate::channels::handles::Handles::new(self.managed_close.clone());
         channel_ref.inbox = Some(inbox.clone());
         channel_ref.handles = Some(handles);
-        Opening { inbox, reader, writer }
+        Opening {
+            inbox,
+            reader,
+            writer,
+        }
+    }
+
+    fn open_reply(
+        &self,
+        channel_ref: &mut ChannelRef,
+        receiver: Receiver<ChannelMsg>,
+        sink: Option<CompletionSink<Result<Channel<Msg>, crate::Error>>>,
+    ) -> CompletionReceiver<Result<Channel<Msg>, crate::Error>> {
+        let opening = self.opening(channel_ref);
+        let (reply, waiter) = completion::channel(sink);
+        channel_ref.client_open = Some(PendingChannel {
+            reply,
+            receiver,
+            opening,
+            sender: self.sender.clone(),
+            window_size: channel_ref.window_size().clone(),
+        });
+        waiter
     }
 
     async fn wait_channel_confirmation(
-        &self,
-        receiver: Receiver<ChannelMsg>,
-        opening: Opening,
-        window_size_ref: SendCredit,
+        mut receiver: CompletionReceiver<Result<Channel<Msg>, crate::Error>>,
     ) -> Result<Channel<Msg>, crate::Error> {
-        let Opening { inbox, reader, writer } = opening;
-        let mut read_half = ChannelReadHalf { receiver, inbox: Some(inbox), _hold: Some(reader) };
-        loop {
-            match read_half.wait().await {
-                Some(ChannelMsg::Open {
-                    id,
-                    max_packet_size,
-                    // The engine granted the initial window on confirming.
-                    window_size: _,
-                }) => {
-                    return Ok(Channel {
-                        write_half: ChannelWriteHalf {
-                            id,
-                            sender: self.sender.clone(),
-                            max_packet_size,
-                            window_size: window_size_ref,
-                            hold: Some(writer),
-                        },
-                        read_half,
-                    });
-                }
-                Some(ChannelMsg::OpenFailure(reason)) => {
-                    return Err(crate::Error::ChannelOpenFailure(reason));
-                }
-                None => {
-                    debug!("channel confirmation sender was dropped");
-                    return Err(crate::Error::Disconnect);
-                }
-                msg => {
-                    debug!("msg = {msg:?}");
-                }
-            }
-        }
+        receiver
+            .recv()
+            .await
+            .unwrap_or(Err(crate::Error::Disconnect))
     }
 
     /// See [`Handle::best_supported_rsa_hash`].
@@ -972,30 +1269,50 @@ impl<H: Handler> Handle<H> {
     /// `confirmed` field of the corresponding `Channel`.
     /// Open a cancellation-owned session channel. An abandoned OPEN is closed
     /// on confirmation; cancellation never waits behind window-blocked data.
-    pub async fn channel_open_session_managed(&self) -> Result<crate::channels::ManagedChannel<Msg>, crate::Error> {
+    pub async fn channel_open_session_managed(
+        &self,
+    ) -> Result<crate::channels::ManagedChannel<Msg>, crate::Error> {
+        self.channel_open_session_managed_with_sink(None).await
+    }
+
+    /// Like [`Self::channel_open_session_managed`], handing an untaken channel or refusal to `sink`.
+    /// The managed guard still requests native cancellation when the waiter
+    /// leaves; handing the channel to the sink does not reverse that request.
+    pub async fn channel_open_session_managed_with_sink(
+        &self,
+        sink: Option<CompletionSink<Result<Channel<Msg>, crate::Error>>>,
+    ) -> Result<crate::channels::ManagedChannel<Msg>, crate::Error> {
         let guard = crate::channels::managed::CloseGuard::new(self.managed_close.clone());
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
-        let opening = self.opening(&mut channel_ref);
+        let reply = self.open_reply(&mut channel_ref, receiver, sink);
         channel_ref.managed_close = Some(guard.flag.clone());
-        let window_size_ref = channel_ref.window_size().clone();
-        self.sender.send(Msg::ChannelOpenSession { channel_ref }).await.map_err(|_|crate::Error::SendError)?;
-        let channel = self.wait_channel_confirmation(receiver, opening, window_size_ref).await?;
+        self.sender
+            .send(Msg::ChannelOpenSession { channel_ref })
+            .await
+            .map_err(|_| crate::Error::SendError)?;
+        let channel = Self::wait_channel_confirmation(reply).await?;
         Ok(crate::channels::ManagedChannel { channel, guard })
     }
 
     pub async fn channel_open_session(&self) -> Result<Channel<Msg>, crate::Error> {
+        self.channel_open_session_with_sink(None).await
+    }
+
+    /// Like [`Self::channel_open_session`], handing an untaken channel or refusal to `sink`.
+    pub async fn channel_open_session_with_sink(
+        &self,
+        sink: Option<CompletionSink<Result<Channel<Msg>, crate::Error>>>,
+    ) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
-        let opening = self.opening(&mut channel_ref);
-        let window_size_ref = channel_ref.window_size().clone();
+        let reply = self.open_reply(&mut channel_ref, receiver, sink);
 
         self.sender
             .send(Msg::ChannelOpenSession { channel_ref })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, opening, window_size_ref)
-            .await
+        Self::wait_channel_confirmation(reply).await
     }
 
     /// Request an X11 channel, on which the X11 protocol may be tunneled.
@@ -1004,10 +1321,20 @@ impl<H: Handler> Handle<H> {
         originator_address: A,
         originator_port: u32,
     ) -> Result<Channel<Msg>, crate::Error> {
+        self.channel_open_x11_with_sink(originator_address, originator_port, None)
+            .await
+    }
+
+    /// Like [`Self::channel_open_x11`], handing an untaken channel or refusal to `sink`.
+    pub async fn channel_open_x11_with_sink<A: Into<String>>(
+        &self,
+        originator_address: A,
+        originator_port: u32,
+        sink: Option<CompletionSink<Result<Channel<Msg>, crate::Error>>>,
+    ) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
-        let opening = self.opening(&mut channel_ref);
-        let window_size_ref = channel_ref.window_size().clone();
+        let reply = self.open_reply(&mut channel_ref, receiver, sink);
 
         self.sender
             .send(Msg::ChannelOpenX11 {
@@ -1017,8 +1344,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, opening, window_size_ref)
-            .await
+        Self::wait_channel_confirmation(reply).await
     }
 
     /// Open a TCP/IP forwarding channel. This is usually done when a
@@ -1036,10 +1362,28 @@ impl<H: Handler> Handle<H> {
         originator_address: B,
         originator_port: u32,
     ) -> Result<Channel<Msg>, crate::Error> {
+        self.channel_open_direct_tcpip_with_sink(
+            host_to_connect,
+            port_to_connect,
+            originator_address,
+            originator_port,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::channel_open_direct_tcpip`], handing an untaken channel or refusal to `sink`.
+    pub async fn channel_open_direct_tcpip_with_sink<A: Into<String>, B: Into<String>>(
+        &self,
+        host_to_connect: A,
+        port_to_connect: u32,
+        originator_address: B,
+        originator_port: u32,
+        sink: Option<CompletionSink<Result<Channel<Msg>, crate::Error>>>,
+    ) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
-        let opening = self.opening(&mut channel_ref);
-        let window_size_ref = channel_ref.window_size().clone();
+        let reply = self.open_reply(&mut channel_ref, receiver, sink);
 
         self.sender
             .send(Msg::ChannelOpenDirectTcpIp {
@@ -1051,18 +1395,26 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, opening, window_size_ref)
-            .await
+        Self::wait_channel_confirmation(reply).await
     }
 
     pub async fn channel_open_direct_streamlocal<S: Into<String>>(
         &self,
         socket_path: S,
     ) -> Result<Channel<Msg>, crate::Error> {
+        self.channel_open_direct_streamlocal_with_sink(socket_path, None)
+            .await
+    }
+
+    /// Like [`Self::channel_open_direct_streamlocal`], handing an untaken channel or refusal to `sink`.
+    pub async fn channel_open_direct_streamlocal_with_sink<S: Into<String>>(
+        &self,
+        socket_path: S,
+        sink: Option<CompletionSink<Result<Channel<Msg>, crate::Error>>>,
+    ) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
-        let opening = self.opening(&mut channel_ref);
-        let window_size_ref = channel_ref.window_size().clone();
+        let reply = self.open_reply(&mut channel_ref, receiver, sink);
 
         self.sender
             .send(Msg::ChannelOpenDirectStreamLocal {
@@ -1071,8 +1423,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, opening, window_size_ref)
-            .await
+        Self::wait_channel_confirmation(reply).await
     }
 
     /// Requests the server to open a TCP/IP forward channel
@@ -1083,7 +1434,17 @@ impl<H: Handler> Handle<H> {
         address: A,
         port: u32,
     ) -> Result<u32, crate::Error> {
-        let (reply_send, reply_recv) = oneshot::channel();
+        self.tcpip_forward_with_sink(address, port, None).await
+    }
+
+    /// Like [`Self::tcpip_forward`], disposing an untaken native reply through `sink`.
+    pub async fn tcpip_forward_with_sink<A: Into<String>>(
+        &self,
+        address: A,
+        port: u32,
+        sink: Option<CompletionSink<Option<u32>>>,
+    ) -> Result<u32, crate::Error> {
+        let (reply_send, mut reply_recv) = completion::channel(sink);
         self.sender
             .send(Msg::TcpIpForward {
                 reply_channel: Some(reply_send),
@@ -1093,7 +1454,7 @@ impl<H: Handler> Handle<H> {
             .await
             .map_err(|_| crate::Error::SendError)?;
 
-        match reply_recv.await {
+        match reply_recv.recv().await {
             Ok(Some(port)) => Ok(port),
             Ok(None) => Err(crate::Error::RequestDenied),
             Err(e) => {
@@ -1109,7 +1470,18 @@ impl<H: Handler> Handle<H> {
         address: A,
         port: u32,
     ) -> Result<(), crate::Error> {
-        let (reply_send, reply_recv) = oneshot::channel();
+        self.cancel_tcpip_forward_with_sink(address, port, None)
+            .await
+    }
+
+    /// Like [`Self::cancel_tcpip_forward`], disposing an untaken native reply through `sink`.
+    pub async fn cancel_tcpip_forward_with_sink<A: Into<String>>(
+        &self,
+        address: A,
+        port: u32,
+        sink: Option<CompletionSink<bool>>,
+    ) -> Result<(), crate::Error> {
+        let (reply_send, mut reply_recv) = completion::channel(sink);
         self.sender
             .send(Msg::CancelTcpIpForward {
                 reply_channel: Some(reply_send),
@@ -1119,7 +1491,7 @@ impl<H: Handler> Handle<H> {
             .await
             .map_err(|_| crate::Error::SendError)?;
 
-        match reply_recv.await {
+        match reply_recv.recv().await {
             Ok(true) => Ok(()),
             Ok(false) => Err(crate::Error::RequestDenied),
             Err(e) => {
@@ -1134,7 +1506,16 @@ impl<H: Handler> Handle<H> {
         &self,
         socket_path: A,
     ) -> Result<(), crate::Error> {
-        let (reply_send, reply_recv) = oneshot::channel();
+        self.streamlocal_forward_with_sink(socket_path, None).await
+    }
+
+    /// Like [`Self::streamlocal_forward`], disposing an untaken native reply through `sink`.
+    pub async fn streamlocal_forward_with_sink<A: Into<String>>(
+        &self,
+        socket_path: A,
+        sink: Option<CompletionSink<bool>>,
+    ) -> Result<(), crate::Error> {
+        let (reply_send, mut reply_recv) = completion::channel(sink);
         self.sender
             .send(Msg::StreamLocalForward {
                 reply_channel: Some(reply_send),
@@ -1143,7 +1524,7 @@ impl<H: Handler> Handle<H> {
             .await
             .map_err(|_| crate::Error::SendError)?;
 
-        match reply_recv.await {
+        match reply_recv.recv().await {
             Ok(true) => Ok(()),
             Ok(false) => Err(crate::Error::RequestDenied),
             Err(e) => {
@@ -1158,7 +1539,17 @@ impl<H: Handler> Handle<H> {
         &self,
         socket_path: A,
     ) -> Result<(), crate::Error> {
-        let (reply_send, reply_recv) = oneshot::channel();
+        self.cancel_streamlocal_forward_with_sink(socket_path, None)
+            .await
+    }
+
+    /// Like [`Self::cancel_streamlocal_forward`], disposing an untaken native reply through `sink`.
+    pub async fn cancel_streamlocal_forward_with_sink<A: Into<String>>(
+        &self,
+        socket_path: A,
+        sink: Option<CompletionSink<bool>>,
+    ) -> Result<(), crate::Error> {
+        let (reply_send, mut reply_recv) = completion::channel(sink);
         self.sender
             .send(Msg::CancelStreamLocalForward {
                 reply_channel: Some(reply_send),
@@ -1167,7 +1558,7 @@ impl<H: Handler> Handle<H> {
             .await
             .map_err(|_| crate::Error::SendError)?;
 
-        match reply_recv.await {
+        match reply_recv.recv().await {
             Ok(true) => Ok(()),
             Ok(false) => Err(crate::Error::RequestDenied),
             Err(e) => {
@@ -1234,14 +1625,19 @@ impl<H: Handler> Handle<H> {
 
     /// Send a keepalive/ping package to the remote peer, and wait for the reply/pong.
     pub async fn send_ping(&self) -> Result<(), Error> {
-        let (sender, receiver) = oneshot::channel();
+        self.send_ping_with_sink(None).await
+    }
+
+    /// Like [`Self::send_ping`], disposing an untaken native reply through `sink`.
+    pub async fn send_ping_with_sink(&self, sink: Option<CompletionSink<()>>) -> Result<(), Error> {
+        let (sender, mut receiver) = completion::channel(sink);
         self.sender
             .send(Msg::Ping {
                 reply_channel: sender,
             })
             .await
             .map_err(|_| Error::SendError)?;
-        let _ = receiver.await;
+        let _ = receiver.recv().await;
         Ok(())
     }
 
@@ -1257,7 +1653,16 @@ impl<H: Handler> Handle<H> {
     ///
     /// Succeeds only if the server successfully proves ownereship of all keys announced. [`Error::RequestDenied`] means the server refused and [`Error::WrongServerSig`] means at least one signature did not verify.
     pub async fn hostkeys_prove(&self, keys: Vec<PublicKey>) -> Result<(), Error> {
-        let (reply_channel, reply_recv) = oneshot::channel();
+        self.hostkeys_prove_with_sink(keys, None).await
+    }
+
+    /// Like [`Self::hostkeys_prove`], disposing an untaken native reply through `sink`.
+    pub async fn hostkeys_prove_with_sink(
+        &self,
+        keys: Vec<PublicKey>,
+        sink: Option<CompletionSink<Result<(), crate::Error>>>,
+    ) -> Result<(), Error> {
+        let (reply_channel, mut reply_recv) = completion::channel(sink);
         self.sender
             .send(Msg::HostKeysProve {
                 reply_channel,
@@ -1265,7 +1670,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| Error::SendError)?;
-        reply_recv.await.unwrap_or(Err(Error::Disconnect))
+        reply_recv.recv().await.unwrap_or(Err(Error::Disconnect))
     }
 
     /// Send a global request with a custom, non-standard name to the remote peer.
@@ -1281,8 +1686,20 @@ impl<H: Handler> Handle<H> {
         data: &[u8],
         want_reply: bool,
     ) -> Result<Option<CryptoVec>, Error> {
+        self.send_global_request_with_sink(name, data, want_reply, None)
+            .await
+    }
+
+    /// Like [`Self::send_global_request`], disposing an untaken native reply through `sink`.
+    pub async fn send_global_request_with_sink<A: Into<String>>(
+        &self,
+        name: A,
+        data: &[u8],
+        want_reply: bool,
+        sink: Option<CompletionSink<Option<CryptoVec>>>,
+    ) -> Result<Option<CryptoVec>, Error> {
         let (reply_channel, reply_recv) = if want_reply {
-            let (send, recv) = oneshot::channel();
+            let (send, recv) = completion::channel(sink);
             (Some(send), Some(recv))
         } else {
             (None, None)
@@ -1297,7 +1714,7 @@ impl<H: Handler> Handle<H> {
             .map_err(|_| Error::SendError)?;
 
         match reply_recv {
-            Some(reply_recv) => match reply_recv.await {
+            Some(mut reply_recv) => match reply_recv.recv().await {
                 Ok(Some(data)) => Ok(Some(data)),
                 Ok(None) => Err(Error::RequestDenied),
                 Err(e) => {
@@ -1392,7 +1809,7 @@ where
     let sshid = stream.read_ssh_id().await?;
 
     let (handle_sender, session_receiver) = channel(10);
-    let (session_sender, handle_receiver) = unbounded_channel();
+    let (session_sender, _handle_receiver) = unbounded_channel();
     if config.maximum_packet_size > 65535 {
         error!(
             "Maximum packet size ({:?}) should not larger than a TCP packet (65535)",
@@ -1437,7 +1854,7 @@ where
         handle: Some(Handle {
             managed_close,
             sender: handle_sender,
-            receiver: handle_receiver,
+            auth_pending: None,
             abort,
             join,
             channel_buffer_size,
@@ -1490,7 +1907,7 @@ impl Session {
         Self {
             common,
             receiver,
-            sender,
+            sender: sender.into(),
             kex: SessionKexState::Idle,
             managed_close: Arc::new(tokio::sync::Notify::new()),
             priority_sender,
@@ -1786,10 +2203,14 @@ impl Session {
     /// release, and CLOSE then waits behind its pending data. A sibling the
     /// peer's window holds back holds that close back too, as upstream.
     fn close_released_channels(&mut self) -> Result<(), crate::Error> {
-        if self.kex.active() { return Ok(()); }
+        if self.kex.active() {
+            return Ok(());
+        }
         if let Some(enc) = self.common.encrypted.as_mut() {
             for (id, channel) in &self.channels {
-                if let Some(inbox) = &channel.inbox { enc.replenish_window(*id, inbox.take_consumed())?; }
+                if let Some(inbox) = &channel.inbox {
+                    enc.replenish_window(*id, inbox.take_consumed())?;
+                }
             }
         }
         let mut cancelled = Vec::new();
@@ -1798,7 +2219,11 @@ impl Session {
             if !self.common.is_established_channel(*id) {
                 continue;
             }
-            if channel.managed_close.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            if channel
+                .managed_close
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+            {
                 cancelled.push(*id);
             } else if channel.inbox.as_ref().is_some_and(|inbox| inbox.overflowed())
                 // A managed channel let go of is cancelled by its guard, which
@@ -1832,7 +2257,8 @@ impl Session {
             self.channels.remove(&id);
         }
         let channels = &self.channels;
-        self.release_fences.retain(|id, _| channels.contains_key(id));
+        self.release_fences
+            .retain(|id, _| channels.contains_key(id));
         Ok(())
     }
 
@@ -1849,7 +2275,11 @@ impl Session {
 
     /// Data for an open channel no reader holds any more, such as one closing
     /// behind its pending data, still counts as consumed.
-    pub(crate) fn credit_unread(&mut self, channel: ChannelId, bytes: usize) -> Result<(), crate::Error> {
+    pub(crate) fn credit_unread(
+        &mut self,
+        channel: ChannelId,
+        bytes: usize,
+    ) -> Result<(), crate::Error> {
         if let Some(enc) = self.common.encrypted.as_mut() {
             let bytes = u32::try_from(bytes).map_err(|_| crate::Error::Inconsistent)?;
             enc.replenish_window(channel, bytes)?;
@@ -1874,7 +2304,13 @@ impl Session {
 
     fn handle_msg(&mut self, msg: Msg) -> Result<(), crate::Error> {
         match msg {
-            Msg::Authenticate { user, method } => {
+            Msg::Authenticate {
+                user,
+                method,
+                mut reply_channel,
+            } => {
+                reply_channel.admit();
+                self.sender = reply_channel;
                 self.write_auth_request_if_needed(&user, method)?;
             }
             Msg::Signed { .. } => {}
@@ -1932,20 +2368,20 @@ impl Session {
                 reply_channel,
                 address,
                 port,
-            } => self.tcpip_forward(reply_channel, &address, port)?,
+            } => self.tcpip_forward_reply(reply_channel, &address, port)?,
             Msg::CancelTcpIpForward {
                 reply_channel,
                 address,
                 port,
-            } => self.cancel_tcpip_forward(reply_channel, &address, port)?,
+            } => self.cancel_tcpip_forward_reply(reply_channel, &address, port)?,
             Msg::StreamLocalForward {
                 reply_channel,
                 socket_path,
-            } => self.streamlocal_forward(reply_channel, &socket_path)?,
+            } => self.streamlocal_forward_reply(reply_channel, &socket_path)?,
             Msg::CancelStreamLocalForward {
                 reply_channel,
                 socket_path,
-            } => self.cancel_streamlocal_forward(reply_channel, &socket_path)?,
+            } => self.cancel_streamlocal_forward_reply(reply_channel, &socket_path)?,
             Msg::Disconnect {
                 reason,
                 description,
@@ -2062,7 +2498,7 @@ impl Session {
                 let _ = self.send_keepalive(want_reply);
             }
             Msg::Ping { reply_channel } => {
-                let _ = self.send_ping(reply_channel);
+                let _ = self.send_ping_reply(reply_channel);
             }
             Msg::NoMoreSessions { want_reply } => {
                 let _ = self.no_more_sessions(want_reply);
@@ -2078,7 +2514,7 @@ impl Session {
                 data,
                 reply_channel,
             } => {
-                let _ = self.send_global_request(reply_channel, &name, &data);
+                let _ = self.send_global_request_reply(reply_channel, &name, &data);
             }
             Msg::ServerChannelOpenReply { pending, result } => {
                 self.finalize_server_channel_open_reply(pending, result)?;
@@ -2361,11 +2797,7 @@ async fn reply<H: Handler>(
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::indexing_slicing,
-    )] // Test assertions on fixture replies and bytes must fail on unexpected values.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use std::collections::{HashMap, VecDeque};
     #[cfg(feature = "flate2")]
     use std::io::Write;
@@ -2394,6 +2826,33 @@ mod tests {
             _: &PublicKeyOrCertificate,
         ) -> Result<bool, Self::Error> {
             Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn native_auth_replies_reach_the_sink_before_and_after_waiter_close() {
+        for sent_first in [false, true] {
+            let (mut session, _, _) = keyboard_interactive_session();
+            let (sink, mut disposed) = unbounded_channel();
+            let (sender, receiver) = completion::auth_channel(Some(Arc::new(move |reply| {
+                sink.send(reply).unwrap();
+            })));
+            session.sender = sender;
+            let mut receiver = Some(receiver);
+            if !sent_first {
+                drop(receiver.take());
+            }
+            let mut packet = IncomingSshPacket {
+                buffer: vec![crate::msg::USERAUTH_SUCCESS],
+                seqn: Wrapping(0),
+            };
+            session
+                .client_read_encrypted(&mut TestHandler, &mut packet)
+                .await
+                .unwrap();
+            drop(receiver.take());
+            assert!(matches!(disposed.recv().await, Some(Reply::AuthSuccess)));
+            assert!(disposed.try_recv().is_err());
         }
     }
 
@@ -2469,7 +2928,7 @@ mod tests {
         let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let (reply_channel, reply) = oneshot::channel();
         session
-            .request_hostkeys_prove(reply_channel, vec![host_key.public_key().clone()])
+            .request_hostkeys_prove(reply_channel.into(), vec![host_key.public_key().clone()])
             .unwrap();
         (session, sender, reply, host_key)
     }
@@ -2530,7 +2989,7 @@ mod tests {
         let (mut session, _sender, _replies) = keyboard_interactive_session();
         let (reply_channel, mut reply) = oneshot::channel();
         session
-            .request_hostkeys_prove(reply_channel, vec![])
+            .request_hostkeys_prove(reply_channel.into(), vec![])
             .unwrap();
 
         assert!(matches!(reply.try_recv(), Ok(Ok(()))));
@@ -2602,10 +3061,16 @@ mod tests {
     #[test]
     fn limit_triggered_rekey_waits_for_authentication() {
         let (mut session, _sender, _replies) = keyboard_interactive_session();
-        allow_rekey(&mut session, crate::Limits::new(0, 0, Duration::from_secs(3600)));
+        allow_rekey(
+            &mut session,
+            crate::Limits::new(0, 0, Duration::from_secs(3600)),
+        );
 
         session.flush().unwrap();
-        assert!(!session.kex.active(), "write limit hit before authentication");
+        assert!(
+            !session.kex.active(),
+            "write limit hit before authentication"
+        );
         assert_eq!(session.rekey_time_remaining(), None);
 
         session.common.encrypted.as_mut().unwrap().state = EncryptedState::Authenticated;
@@ -2830,8 +3295,14 @@ mod tests {
         params.recipient_channel = id.0 + 100;
         params.recipient_maximum_packet_size = 32;
         params.recipient_window_size = outbound_window;
-        let (mut channel, mut reference) =
-            Channel::new(id, sender.clone(), 32, outbound_window, 2, session.managed_close.clone());
+        let (mut channel, mut reference) = Channel::new(
+            id,
+            sender.clone(),
+            32,
+            outbound_window,
+            2,
+            session.managed_close.clone(),
+        );
         let inbox = crate::channels::inbox::Inbox::new(session.managed_close.clone(), 2);
         channel.read_half.inbox = Some(inbox.clone());
         reference.inbox = Some(inbox);
@@ -2845,7 +3316,12 @@ mod tests {
         let channel = released_test_channel(&mut session, &sender, 0);
         let id = channel.id();
         session
-            .handle_msg(Msg::Channel(id, ChannelMsg::Data { data: bytes::Bytes::from_static(b"unsent output") }))
+            .handle_msg(Msg::Channel(
+                id,
+                ChannelMsg::Data {
+                    data: bytes::Bytes::from_static(b"unsent output"),
+                },
+            ))
             .unwrap();
         drop(channel);
         session.close_released_channels().unwrap();
@@ -2855,8 +3331,14 @@ mod tests {
         msg::CHANNEL_DATA.encode(&mut packet).unwrap();
         id.encode(&mut packet).unwrap();
         [7u8; 64][..].encode(&mut packet).unwrap();
-        session.process_packet(&mut TestHandler, &packet).await.unwrap();
-        assert_eq!(session.common.encrypted.as_ref().unwrap().channels[&id].sender_window_size, 64);
+        session
+            .process_packet(&mut TestHandler, &packet)
+            .await
+            .unwrap();
+        assert_eq!(
+            session.common.encrypted.as_ref().unwrap().channels[&id].sender_window_size,
+            64
+        );
     }
 
     #[tokio::test]
@@ -2869,7 +3351,9 @@ mod tests {
         sender.try_send(Msg::Channel(id, ChannelMsg::Eof)).unwrap();
         let inbox = session.channels[&id].inbox.clone().unwrap();
         while !inbox.overflowed() {
-            let _ = inbox.send(ChannelMsg::XonXoff { client_can_do: false });
+            let _ = inbox.send(ChannelMsg::XonXoff {
+                client_can_do: false,
+            });
         }
         session.close_released_channels().unwrap();
         assert!(session.channels.contains_key(&id));
@@ -2877,9 +3361,15 @@ mod tests {
         msg::CHANNEL_DATA.encode(&mut packet).unwrap();
         id.encode(&mut packet).unwrap();
         [7u8; 64][..].encode(&mut packet).unwrap();
-        session.process_packet(&mut TestHandler, &packet).await.unwrap();
+        session
+            .process_packet(&mut TestHandler, &packet)
+            .await
+            .unwrap();
         session.close_released_channels().unwrap();
-        assert_eq!(session.common.encrypted.as_ref().unwrap().channels[&id].sender_window_size, 64);
+        assert_eq!(
+            session.common.encrypted.as_ref().unwrap().channels[&id].sender_window_size,
+            64
+        );
         drop(channel);
     }
 
@@ -2891,7 +3381,12 @@ mod tests {
         let guard = crate::channels::managed::CloseGuard::new(session.managed_close.clone());
         session.channels.get_mut(&id).unwrap().managed_close = Some(guard.flag.clone());
         session
-            .handle_msg(Msg::Channel(id, ChannelMsg::Data { data: bytes::Bytes::from_static(b"managed output") }))
+            .handle_msg(Msg::Channel(
+                id,
+                ChannelMsg::Data {
+                    data: bytes::Bytes::from_static(b"managed output"),
+                },
+            ))
             .unwrap();
         // A managed channel drops its channel before its guard; the engine may
         // run between the two.
@@ -2904,7 +3399,9 @@ mod tests {
     }
 
     fn pending_messages(session: &Session, id: ChannelId) -> usize {
-        session.common.encrypted.as_ref().unwrap().channels[&id].pending_data.len()
+        session.common.encrypted.as_ref().unwrap().channels[&id]
+            .pending_data
+            .len()
     }
 
     #[tokio::test]
@@ -2920,10 +3417,20 @@ mod tests {
         let held_inbound = released_test_channel(&mut session, &inbound, 0);
         for (id, queue) in [(held.id(), &outbound), (held_inbound.id(), &inbound)] {
             session
-                .handle_msg(Msg::Channel(id, ChannelMsg::Data { data: bytes::Bytes::from(vec![1; 64]) }))
+                .handle_msg(Msg::Channel(
+                    id,
+                    ChannelMsg::Data {
+                        data: bytes::Bytes::from(vec![1; 64]),
+                    },
+                ))
                 .unwrap();
             while queue
-                .try_send(Msg::Channel(id, ChannelMsg::Data { data: bytes::Bytes::from(vec![2; 64]) }))
+                .try_send(Msg::Channel(
+                    id,
+                    ChannelMsg::Data {
+                        data: bytes::Bytes::from(vec![2; 64]),
+                    },
+                ))
                 .is_ok()
             {}
         }
@@ -2934,7 +3441,13 @@ mod tests {
             session.close_released_channels().unwrap();
             assert_eq!(pending_messages(&session, held.id()), 1);
             assert_eq!(pending_messages(&session, held_inbound.id()), 1);
-            assert_eq!((session.receiver.len(), session.inbound_channel_receiver.len()), (2, 2));
+            assert_eq!(
+                (
+                    session.receiver.len(),
+                    session.inbound_channel_receiver.len()
+                ),
+                (2, 2)
+            );
             assert!(!session.common.encrypted.as_ref().unwrap().channels[&id].close_sent);
         }
     }
@@ -2946,12 +3459,18 @@ mod tests {
         let id = channel.id();
         // The whole window is queued, not yet taken by the engine, when the
         // peer adds 32 bytes to it.
-        channel.data_bytes(bytes::Bytes::from(vec![1; 64])).await.unwrap();
+        channel
+            .data_bytes(bytes::Bytes::from(vec![1; 64]))
+            .await
+            .unwrap();
         let mut packet = Vec::new();
         msg::CHANNEL_WINDOW_ADJUST.encode(&mut packet).unwrap();
         id.encode(&mut packet).unwrap();
         32u32.encode(&mut packet).unwrap();
-        session.process_packet(&mut TestHandler, &packet).await.unwrap();
+        session
+            .process_packet(&mut TestHandler, &packet)
+            .await
+            .unwrap();
 
         // Writers may queue the 32 bytes added, and no more.
         let mut write = Box::pin(channel.data_bytes(bytes::Bytes::from(vec![2; 96])));
@@ -2963,7 +3482,10 @@ mod tests {
         // Nothing waits beyond the window, so the session's outbound queue
         // stays open to every other channel.
         assert!(!session.common.has_any_pending_data());
-        assert_eq!(session.common.encrypted.as_ref().unwrap().channels[&id].recipient_window_size, 0);
+        assert_eq!(
+            session.common.encrypted.as_ref().unwrap().channels[&id].recipient_window_size,
+            0
+        );
     }
 
     #[tokio::test]
@@ -2978,7 +3500,10 @@ mod tests {
         (id.0 + 100).encode(&mut packet).unwrap();
         64u32.encode(&mut packet).unwrap();
         32u32.encode(&mut packet).unwrap();
-        session.process_packet(&mut TestHandler, &packet).await.unwrap();
+        session
+            .process_packet(&mut TestHandler, &packet)
+            .await
+            .unwrap();
 
         let mut write = Box::pin(channel.data_bytes(bytes::Bytes::from(vec![1; 128])));
         assert!(futures::poll!(write.as_mut()).is_pending());
@@ -2994,7 +3519,8 @@ mod tests {
         let (mut session, sender, _replies) = keyboard_interactive_session();
         let channel = released_test_channel(&mut session, &sender, 64);
         let id = channel.id();
-        session.common.encrypted.as_mut().unwrap().kex = KEXES.get(&crate::kex::CURVE25519).unwrap().make();
+        session.common.encrypted.as_mut().unwrap().kex =
+            KEXES.get(&crate::kex::CURVE25519).unwrap().make();
         sender.try_send(Msg::Channel(id, ChannelMsg::Eof)).unwrap();
         drop(channel);
         session.handle_msg(Msg::Rekey).unwrap();
@@ -3006,7 +3532,9 @@ mod tests {
         session.close_released_channels().unwrap();
         assert!(session.channels.contains_key(&id));
         // A message queued after the release does not move the fence.
-        sender.try_send(Msg::Channel(ChannelId(999), ChannelMsg::Eof)).unwrap();
+        sender
+            .try_send(Msg::Channel(ChannelId(999), ChannelMsg::Eof))
+            .unwrap();
         let eof = session.receiver.try_recv().unwrap();
         session.handle_app_msg(AppQueue::Outbound, eof).unwrap();
         session.close_released_channels().unwrap();
@@ -3016,7 +3544,8 @@ mod tests {
         let mut types = Vec::new();
         let mut cursor = 0;
         while cursor < enc.write.len() {
-            let len = u32::from_be_bytes(enc.write[cursor..cursor + 4].try_into().unwrap()) as usize;
+            let len =
+                u32::from_be_bytes(enc.write[cursor..cursor + 4].try_into().unwrap()) as usize;
             types.push(enc.write[cursor + 4]);
             cursor += 4 + len;
         }
