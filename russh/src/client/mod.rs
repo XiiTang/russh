@@ -344,20 +344,94 @@ pub enum DisconnectReason<E: From<crate::Error> + Send> {
     Error(E),
 }
 
-// Own the session through every await before a completed Handle can own it.
-struct PendingSession<T: Send> {
-    join: Option<russh_util::runtime::JoinHandle<T>>,
-    abort: futures::future::AbortHandle,
+/// Owns a client session while its initial key exchange is in progress.
+///
+/// Register this owner before awaiting [`Self::establish`]. A cancelled
+/// establishment waiter leaves the native task here: call [`Self::stop`] and
+/// await this value to read its completion, including a task panic. A successful
+/// exchange transfers ownership through [`Self::into_handle`]. Dropping the
+/// owner requests a stop, as dropping `connect_stream` has always done, but
+/// observing completion requires awaiting it.
+#[must_use = "stop and await an abandoned session, or transfer it into a Handle"]
+pub struct PendingSession<H: Handler> {
+    handle: Option<Handle<H>>,
+    kex_done: Option<oneshot::Receiver<()>>,
+    established: bool,
+    joined: bool,
 }
-impl<T: Send> PendingSession<T> {
-    fn into_join(mut self) -> Option<russh_util::runtime::JoinHandle<T>> {
-        self.join.take()
+impl<H: Handler> PendingSession<H> {
+    /// Request cancellation without discarding the native task's completion.
+    pub fn stop(&self) {
+        if let Some(handle) = &self.handle {
+            handle.stop();
+        }
+    }
+
+    /// Wait for the initial key exchange. Cancelling this wait retains the
+    /// native owner, which can still be stopped and awaited.
+    pub async fn establish(&mut self) -> Result<(), H::Error> {
+        if self.established {
+            return Ok(());
+        }
+        let result = self
+            .kex_done
+            .as_mut()
+            .ok_or(crate::Error::Inconsistent)?
+            .await;
+        self.kex_done.take();
+        if let Err(err) = result {
+            debug!("kex_done_signal sender was dropped {err:?}");
+            let result = self
+                .handle
+                .as_mut()
+                .ok_or(crate::Error::Inconsistent)?
+                .await;
+            self.joined = true;
+            result?;
+            return Err(H::Error::from(crate::Error::Disconnect));
+        }
+        self.established = true;
+        Ok(())
+    }
+
+    /// Whether establishment already read the native completion. Its error,
+    /// if any, was returned by `establish`; cleanup must not read it twice.
+    pub fn is_joined(&self) -> bool {
+        self.joined
+    }
+
+    /// Transfer a successfully established session, retaining the same stop
+    /// capability and native task result. Call `establish` first.
+    pub fn into_handle(mut self) -> Result<Handle<H>, H::Error> {
+        if !self.established {
+            return Err(crate::Error::Inconsistent.into());
+        }
+        self.handle
+            .take()
+            .ok_or_else(|| crate::Error::Inconsistent.into())
     }
 }
-impl<T: Send> Drop for PendingSession<T> {
+impl<H: Handler> Future for PendingSession<H> {
+    type Output = Result<(), H::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        if self.joined {
+            return Poll::Ready(Err(crate::Error::Inconsistent.into()));
+        }
+        let result = match self.handle.as_mut() {
+            Some(handle) => Pin::new(handle).poll(cx),
+            _ => Poll::Ready(Err(crate::Error::Inconsistent.into())),
+        };
+        if result.is_ready() {
+            self.joined = true;
+        }
+        result
+    }
+}
+impl<H: Handler> Drop for PendingSession<H> {
     fn drop(&mut self) {
-        if self.join.is_some() {
-            self.abort.abort();
+        if let Some(handle) = &self.handle {
+            handle.stop();
         }
     }
 }
@@ -1280,9 +1354,27 @@ pub async fn connect<H: Handler + Send + 'static, A: tokio::net::ToSocketAddrs>(
 /// [`tokio::net::TcpStream`] and then calls this function under the hood.
 pub async fn connect_stream<H, R>(
     config: Arc<Config>,
-    mut stream: R,
+    stream: R,
     handler: H,
 ) -> Result<Handle<H>, H::Error>
+where
+    H: Handler + Send + 'static,
+    R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut pending = connect_stream_owned(config, stream, handler).await?;
+    pending.establish().await?;
+    pending.into_handle()
+}
+
+/// Begin a stream connection with an owned native session available before
+/// key exchange completes. Identification I/O precedes task creation; on
+/// return, register the owner synchronously before awaiting its establishment.
+/// Callers that do not need this handoff should use [`connect_stream`].
+pub async fn connect_stream_owned<H, R>(
+    config: Arc<Config>,
+    mut stream: R,
+    handler: H,
+) -> Result<PendingSession<H>, H::Error>
 where
     H: Handler + Send + 'static,
     R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1341,31 +1433,18 @@ where
         .await
         .unwrap_or(Ok(())) // An owner-requested stop is not a session failure.
     });
-    let mut pending = PendingSession {
-        join: Some(join),
-        abort,
-    };
-
-    if let Err(err) = kex_done_signal_rx.await {
-        // kex_done_signal Sender is dropped when the session
-        // fails before a succesful key exchange
-        debug!("kex_done_signal sender was dropped {err:?}");
-        pending
-            .join
-            .as_mut()
-            .ok_or(crate::Error::Inconsistent)?
-            .await
-            .map_err(crate::Error::Join)??;
-        return Err(H::Error::from(crate::Error::Disconnect));
-    }
-
-    Ok(Handle {
-        managed_close,
-        sender: handle_sender,
-        receiver: handle_receiver,
-        abort: pending.abort.clone(),
-        join: pending.into_join().ok_or(crate::Error::Inconsistent)?,
-        channel_buffer_size,
+    Ok(PendingSession {
+        handle: Some(Handle {
+            managed_close,
+            sender: handle_sender,
+            receiver: handle_receiver,
+            abort,
+            join,
+            channel_buffer_size,
+        }),
+        kex_done: Some(kex_done_signal_rx),
+        established: false,
+        joined: false,
     })
 }
 
