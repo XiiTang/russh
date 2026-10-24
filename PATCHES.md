@@ -341,3 +341,35 @@ before queueing the reply for a reader that matched it to the hook's
 record.) Regression: `cargo test -p russh --test channel_reply`: a reply
 the handler takes never reaches the reader, and the default handler hears
 each reply, which reaches the reader as before.
+
+## Own a client session before its key exchange completes (#292)
+
+`connect_stream` created a native session task and suspended for key exchange
+while its stop and join were held only by private `PendingSession`. Dropping
+establishment requested abort and discarded the join receiver. A caller could
+not join the native work before releasing its own opening lifetime.
+
+`connect_stream_owned` returns `PendingSession` immediately after task creation,
+before the next suspension. Its `establish` wait borrows the owner, `stop`
+requests the same native cancellation, and awaiting the owner reads that task's
+completion and result, including a panic. Successful key exchange transfers the
+same Handle through `into_handle`. `is_joined` identifies a native result already
+read by `establish`, so a cleanup owner does not poll that join twice. The ordinary `connect_stream` delegates to
+these steps and retains its existing result and cancellation behavior. No new
+task or completion observer is introduced.
+
+Before implementing this, the existing PendingSession, russh-util's oneshot
+join, Handle stop/Future and futures Abortable ownership paths were inspected.
+The new `owned_establishment` tests hold key exchange at a handler gate, leave
+the borrowed establishment wait, and read cancelled or panicked native
+completion before checking destruction. A successful exchange transfers and
+joins the same task through Handle. On the unmodified pinned baseline the test
+command exits 101 because the required owned API does not exist; this is an API
+capability regression, not a passing runtime reproduction on the old API.
+
+On macOS arm64, the owned-establishment, cancelled-establishment and
+stopped-session tests pass (6 tests). The complete default russh library and
+integration tests pass (269 tests). Strict library/test Clippy remains blocked on the
+unchanged baseline's six library lock unwraps and 760 library-test diagnostics;
+the same command fails on both revisions. No lint policy or unrelated code is
+changed. Detailed commands and results belong to the consuming change's report.
