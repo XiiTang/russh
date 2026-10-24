@@ -497,7 +497,7 @@ impl Session {
                 let msg = ChannelOpenConfirmation::parse(&mut reader)?;
                 map_err!(ensure_end(&reader))?;
                 let local_id = ChannelId(msg.recipient_channel);
-                let mut before = 0;
+                let before;
 
                 if let Some(ref mut enc) = self.common.encrypted {
                     if let Some(parameters) = enc.channels.get_mut(&local_id) {
@@ -833,16 +833,16 @@ impl Session {
                 }
                 // The handler takes the reply first; only one it lets through
                 // reaches the channel's reader.
-                if client.channel_reply(channel_num, success, self).await? {
-                    if let Some(chan) = self.channels.get(&channel_num) {
-                        let _ = chan
-                            .send(if success {
-                                ChannelMsg::Success
-                            } else {
-                                ChannelMsg::Failure
-                            })
-                            .await;
-                    }
+                if client.channel_reply(channel_num, success, self).await?
+                    && let Some(chan) = self.channels.get(&channel_num)
+                {
+                    let _ = chan
+                        .send(if success {
+                            ChannelMsg::Success
+                        } else {
+                            ChannelMsg::Failure
+                        })
+                        .await;
                 }
                 Ok(())
             }
@@ -1190,6 +1190,32 @@ mod tests {
             Ok(MethodKind::GssapiWithMic)
         );
         assert_eq!(<&str>::from(&MethodKind::GssapiWithMic), "gssapi-with-mic");
+    }
+
+    #[test]
+    fn password_change_encodes_only_an_explicit_replacement() {
+        for replacement in [None, Some("replacement")] {
+            let mut encrypted = test_encrypted();
+            let method = auth::Method::Password {
+                password: "old".into(),
+                new_password: replacement.map(str::to_owned),
+            };
+            assert!(matches!(AuthRequest::new(&method).current, Some(auth::CurrentRequest::Password)));
+            assert!(encrypted.write_auth_request("alice", &method).unwrap());
+            let packets = payloads(&encrypted.write);
+            assert_eq!(packets.len(), 1);
+            let mut r = packets[0];
+            assert_eq!(u8::decode(&mut r).unwrap(), msg::USERAUTH_REQUEST);
+            assert_eq!(String::decode(&mut r).unwrap(), "alice");
+            assert_eq!(String::decode(&mut r).unwrap(), "ssh-connection");
+            assert_eq!(String::decode(&mut r).unwrap(), "password");
+            assert_eq!(u8::decode(&mut r).unwrap(), u8::from(replacement.is_some()));
+            assert_eq!(String::decode(&mut r).unwrap(), "old");
+            if let Some(replacement) = replacement {
+                assert_eq!(String::decode(&mut r).unwrap(), replacement);
+            }
+            ensure_end(&r).unwrap();
+        }
     }
 
     #[test]
