@@ -37,13 +37,13 @@ and test-peer ownership corrections carry no additional production mechanism.
 | `123b6be` owned regression peers | Keep fixture ownership corrections when replaying the tests. | regressions join their own peers |
 | `7596d8a` request-reply consumption | Keep: those upstream arms still always deliver replies to the reader. | `channel_reply` |
 
-The replay also adapts its own existing lint sites: the receive-inbox locks
-use an explicit poisoned-lock message and the channel-reply hook uses the
-upstream let-chain style. The same six unwraps and nested hook were present
-on the old boundless branch. No lint is disabled and neither failure behavior
-nor queue policy changes. Upstream's new open-reply fixture handles the fork's
-existing Result-returning accept method. Stable rustfmt formats the replayed
-integration tests; it does not recursively format the library's include file.
+The channel-reply hook follows upstream's let-chain style. The six receive-inbox
+lock unwraps already present on the old boundless branch still fail upstream's
+strict Clippy policy. Changing their poisoned-lock behavior is a separate repair;
+this rebuild neither suppresses the lint nor changes that behavior. Upstream's
+new open-reply fixture handles the fork's existing Result-returning accept method.
+Stable rustfmt formats the replayed integration tests; it does not recursively
+format the library's include file.
 
 The upgrade retains upstream's agent lifetime-constraint admission fix and the
 server signature-algorithm check, rather than copying either into a Boundless
