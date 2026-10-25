@@ -29,13 +29,14 @@ pub(crate) struct Inbox {
 impl Inbox {
     #[track_caller]
     fn state(&self) -> MutexGuard<'_, State> {
-        match self.state.lock() {
-            Ok(state) => state,
-            // A poisoned inbox can be inconsistent. This deliberate panic
-            // preserves unwrap's payload and unwind instead of recovering it.
-            #[allow(clippy::panic)] // False positive: this is the existing poisoned-lock invariant.
-            Err(error) => panic!("called `Result::unwrap()` on an `Err` value: {error:?}"),
+        let state = self.state.lock();
+        if let Err(error) = &state {
+            assert!(
+                state.is_ok(),
+                "called `Result::unwrap()` on an `Err` value: {error:?}"
+            );
         }
+        state.unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(crate) fn new(wake_session: Arc<Notify>, control_limit: usize) -> Arc<Self> {

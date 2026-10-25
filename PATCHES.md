@@ -9,13 +9,15 @@ regression and Boundless's SSH tests before moving the pin.
 ## Strict Rust 1.97 Clippy and receive-inbox lock invariants (#340)
 
 The six receive-inbox locks now use the private `Inbox::state` accessor.
-It matches poisoning explicitly and preserves the former `Result::unwrap`
+It asserts against poisoning explicitly and preserves the former `Result::unwrap`
 panic, its String payload, and normal unwind. Recovering the guard would
 expose potentially inconsistent queue state and change callers' observations.
 Healthy queue behavior, public APIs, and SSH flow control are unchanged.
-The error arm has a targeted `clippy::panic` exception: failing this poisoned
-invariant is required behavior, so this restriction lint is a false positive.
-The reason is also beside the exception.
+The review follow-up uses an assertion on the original lock result and then
+`unwrap_or_else(PoisonError::into_inner)` on the success path. The assertion
+unwinds before a poisoned guard can be recovered. `#[track_caller]` retains
+the caller location, and no production lint exception is needed. The initial
+repair used an avoidable `clippy::panic` exception; the follow-up removes it.
 
 Upstream main at `e5d80a07dc554480b6ea3b2e14adfc190407b627` has no fork inbox
 and uses an async mutex for channel windows. The fork's `SendCredit::value`
@@ -109,10 +111,24 @@ The nine selected integration targets (`auth_partial_success`, `auth_state_reset
 `test_max_channel_packet_size`, `test_mlkem_kex`, `test_rekey_strict_kex`,
 `test_server_cert`) also exit 0 after their fixture repairs.
 
-Full per-command logs and the per-finding location/resolution inventory are
-retained in Boundless's `fix-340/.scratch/impl/` review artifacts. The strict
-command's 101-to-0 transition is the lint regression; the poison regression's
-0-to-0 result demonstrates preservation of the existing failure behavior.
+The strict command's 101-to-0 transition is the lint regression; the poison
+regression's 0-to-0 result demonstrates preservation of the existing failure
+behavior.
+
+Review follow-up on `b0298e3` (macOS arm64, Rust 1.97.0): replace the avoidable
+production `clippy::panic` exception with the assertion above, without amending
+the original repair. Both strict modes and the two preservation tests passed
+before and after (exit 0). `cargo +1.97.0 fmt --all --check` and the explicit
+inbox rustfmt check also exit 0. Complete workspace verification, through
+`build-slot` with `CARGO_INCREMENTAL=0`, now includes:
+
+- `cargo +1.97.0 test --workspace --locked`: exit 0, 311 passed, 8 ignored,
+  including doctests.
+- `cargo +1.97.0 test --workspace --locked --all-features`: exit 0, 312 passed,
+  8 ignored, including doctests.
+
+Those complete suites had not run before review because a lane held the markers;
+the earlier selected-target runs were not complete-suite evidence.
 
 ## 0.64.1 rebuild (#277)
 
