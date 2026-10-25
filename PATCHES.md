@@ -207,6 +207,54 @@ No lint exception is added. The W4b Boundless adapter and W17 coordinated
 cutover remain separate; compatibility uses a disposable prepared Boundless
 worktree with the GitHub URL and this local commit as its rev.
 
+### W17c review follow-up: WindowAdjusted admission
+
+On `223f73a`, `ChannelRef` dereferenced to its raw Tokio Sender. The client
+parser's `chan.try_send(WindowAdjusted)` therefore bypassed `Inbox::send`.
+With zero entries selected it retained one raw mpsc entry, had no typed inbox
+failure or native CLOSE, and suspended in `Handler::window_adjusted`. A full
+inbox had the same bypass. This violates Rule 11 at the inbox push checkpoint.
+
+`ChannelRef::send` and `ChannelRef::try_send` now both route inbox-backed
+messages through private `Inbox::send`. `ChannelRef::sender` is private to its
+module and `Deref<Target = Sender<ChannelMsg>>` is removed. This type/visibility
+boundary prevents callers from obtaining a raw sender, clone or enqueue permit;
+the constructor for the channel's shared window exposes no sender accessor.
+Public checked send methods retain ordinary mpsc behavior for references
+without a client inbox. An exhausted client inbox returns Closed from try_send;
+the reader retains its typed terminal cause.
+
+The WindowAdjusted branch checks `close_inbox_overflow` immediately after
+admission, before awaiting `window_adjusted`. Cancellation therefore cannot
+wait in that callback. Its accepted prefix drains before the reserved typed
+terminal message, and no later message can follow it. Window-credit updates
+retain their existing ordering. No lint exception is added.
+
+Evidence on macOS arm64, Rust 1.97.0, CARGO_INCREMENTAL=0, through build-slot:
+
+- `cargo +1.97.0 test -p russh --lib --locked -- w17c_window_adjust_ --nocapture`:
+  before 101, all three regressions fail on unchanged production; zero/full
+  limits show one raw entry, no failure/CLOSE, and a pending callback. The
+  positive case also proves accepted messages never reach the old receiver.
+  After: exit 0, all three pass. The zero/full cases check the typed terminal tail,
+  exactly one native CLOSE, no raw retention and no callback entry. The positive
+  case checks normal delivery and entry reuse after dequeue.
+- `cargo +1.97.0 test --workspace --locked`: exit 0, 335 passed, 8 ignored.
+- `cargo +1.97.0 test --workspace --locked --all-features`: exit 0, 336 passed,
+  8 ignored. Both complete suites ran after both landing markers cleared.
+- `cargo +1.97.0 clippy --all-targets --locked -- -D warnings`: exit 0.
+- `cargo +1.97.0 clippy --all-targets --all-features --locked -- -D warnings`:
+  exit 0.
+- `cargo +1.97.0 fmt --all --check`: exit 0; explicit Rust 2024 rustfmt check
+  of the four touched Rust files, including the included client sources: exit 0.
+
+The review's earlier boundary-lint waiter did not execute the check and is not
+counted as a pass. Integration validation uses this follow-up's committed rev
+in a disposable Boundless worktree, after both landing markers clear, with
+`build-slot python3 scripts/build python3 tooling/lints/check.py`. The exact
+pin, command and exit are retained in the local integration report under
+`w17c-russh-fix/.scratch/impl/`; no Boundless adapter change is part of this patch.
+
 ## 0.64.1 rebuild (#277)
 
 The upstream source at the revision above was compared with every old patch.

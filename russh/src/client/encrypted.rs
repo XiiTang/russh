@@ -795,10 +795,12 @@ impl Session {
                     // it to the window would count again the data they already
                     // queued and the engine has not taken yet.
                     chan.window_size().grant(granted);
-                    // Use try_send to avoid blocking the session loop when channel buffer is full.
-                    // WindowAdjusted is informational - the critical side effect (granting the
-                    // writers' credit and waking them) already happened.
+                    // Admission is nonblocking and inbox-aware, including this
+                    // informational message's structural queue entry.
                     let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
+                }
+                if self.close_inbox_overflow(channel_num)? {
+                    return Ok(());
                 }
                 client.window_adjusted(channel_num, new_size, self).await
             }

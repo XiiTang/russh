@@ -606,19 +606,14 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
             hold: Some(writer),
         };
 
+        let mut channel_ref = ChannelRef::with_window_size(tx, window_size);
+        channel_ref.handles = Some(handles);
         (
             Self {
                 write_half,
                 read_half,
             },
-            ChannelRef {
-                client_open: None,
-                sender: tx,
-                window_size,
-                managed_close: None,
-                inbox: None,
-                handles: Some(handles),
-            },
+            channel_ref,
         )
     }
 

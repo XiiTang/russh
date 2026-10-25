@@ -3379,6 +3379,147 @@ mod tests {
         );
     }
 
+    async fn window_adjust_exhaustion_before_pending_callback(limit: usize) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct BlockWindow(Arc<AtomicBool>);
+        impl Handler for BlockWindow {
+            type Error = crate::Error;
+            async fn window_adjusted(
+                &mut self,
+                _: ChannelId,
+                _: u32,
+                _: &mut Session,
+            ) -> Result<(), Self::Error> {
+                self.0.store(true, Ordering::SeqCst);
+                std::future::pending().await
+            }
+        }
+        let (mut session, sender, _replies) = keyboard_interactive_session();
+        let mut channel = released_test_channel(&mut session, &sender, 64);
+        let id = channel.id();
+        let inbox = crate::channels::inbox::Inbox::with_limits(
+            session.managed_close.clone(),
+            crate::ChannelInboxLimits {
+                max_control_bytes: 0,
+                max_entries: limit,
+            },
+        );
+        channel.read_half.inbox = Some(inbox.clone());
+        session.channels.get_mut(&id).unwrap().inbox = Some(inbox.clone());
+        for _ in 0..limit {
+            assert!(
+                inbox
+                    .send(ChannelMsg::XonXoff {
+                        client_can_do: false
+                    })
+                    .is_ok()
+            );
+        }
+        let entered = Arc::new(AtomicBool::new(false));
+        let mut handler = BlockWindow(entered.clone());
+        let mut packet = Vec::new();
+        msg::CHANNEL_WINDOW_ADJUST.encode(&mut packet).unwrap();
+        id.encode(&mut packet).unwrap();
+        1u32.encode(&mut packet).unwrap();
+        let mut processing = Box::pin(session.process_packet(&mut handler, &packet));
+        let result = futures::poll!(processing.as_mut());
+        drop(processing);
+        eprintln!(
+            "window-adjust limit={limit}: pending={}, failure={:?}, raw_entries={}, close_sent={}, callback_entered={}",
+            result.is_pending(),
+            inbox.failure(),
+            channel.read_half.receiver.len(),
+            session.common.encrypted.as_ref().unwrap().channels[&id].close_sent,
+            entered.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            inbox.failure(),
+            Some(crate::InboxLimitExceeded::Entries { limit })
+        );
+        assert!(matches!(result, std::task::Poll::Ready(Ok(()))));
+        assert!(
+            !entered.load(Ordering::SeqCst),
+            "refused message entered a pending callback"
+        );
+        assert_eq!(
+            channel.read_half.receiver.len(),
+            0,
+            "a message bypassed the inbox"
+        );
+        assert!(!session.channels.contains_key(&id));
+        let enc = session.common.encrypted.as_ref().unwrap();
+        assert!(enc.channels[&id].close_sent);
+        assert_eq!(
+            enc.write.len(),
+            9,
+            "cancellation must enqueue exactly one CLOSE"
+        );
+        assert_eq!(enc.write[4], msg::CHANNEL_CLOSE);
+        for _ in 0..limit {
+            assert!(matches!(
+                channel.wait().await,
+                Some(ChannelMsg::XonXoff {
+                    client_can_do: false
+                })
+            ));
+        }
+        assert!(
+            matches!(channel.wait().await, Some(ChannelMsg::InboxLimitExceeded(crate::InboxLimitExceeded::Entries { limit: actual })) if actual == limit)
+        );
+        assert!(channel.wait().await.is_none());
+        assert!(
+            inbox
+                .send(ChannelMsg::WindowAdjusted { new_size: 99 })
+                .is_err()
+        );
+        assert!(channel.wait().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn w17c_window_adjust_zero_limit_ends_before_pending_callback() {
+        window_adjust_exhaustion_before_pending_callback(0).await;
+    }
+
+    #[tokio::test]
+    async fn w17c_window_adjust_full_limit_keeps_typed_tail_before_pending_callback() {
+        window_adjust_exhaustion_before_pending_callback(1).await;
+    }
+
+    #[tokio::test]
+    async fn w17c_window_adjust_is_delivered_and_dequeue_reopens_entry() {
+        let (mut session, sender, _replies) = keyboard_interactive_session();
+        let mut channel = released_test_channel(&mut session, &sender, 64);
+        let id = channel.id();
+        let inbox = crate::channels::inbox::Inbox::with_limits(
+            session.managed_close.clone(),
+            crate::ChannelInboxLimits {
+                max_control_bytes: 0,
+                max_entries: 1,
+            },
+        );
+        channel.read_half.inbox = Some(inbox.clone());
+        session.channels.get_mut(&id).unwrap().inbox = Some(inbox.clone());
+        let mut packet = Vec::new();
+        msg::CHANNEL_WINDOW_ADJUST.encode(&mut packet).unwrap();
+        id.encode(&mut packet).unwrap();
+        1u32.encode(&mut packet).unwrap();
+        for expected in [65, 66] {
+            session
+                .process_packet(&mut TestHandler, &packet)
+                .await
+                .unwrap();
+            assert_eq!(channel.read_half.receiver.len(), 0);
+            assert_eq!(inbox.failure(), None);
+            let mut waiting = Box::pin(channel.wait());
+            let result = futures::poll!(waiting.as_mut());
+            drop(waiting);
+            assert!(
+                matches!(result, std::task::Poll::Ready(Some(ChannelMsg::WindowAdjusted { new_size })) if new_size == expected)
+            );
+            assert!(!session.common.encrypted.as_ref().unwrap().channels[&id].close_sent);
+        }
+    }
+
     #[tokio::test]
     async fn w17c_exhaustion_cancels_window_blocked_output_before_queued_commands() {
         let (mut session, sender, _replies) = keyboard_interactive_session();
