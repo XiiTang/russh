@@ -2361,6 +2361,11 @@ async fn reply<H: Handler>(
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+    )] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use std::collections::{HashMap, VecDeque};
     #[cfg(feature = "flate2")]
     use std::io::Write;
@@ -2849,7 +2854,7 @@ mod tests {
         let mut packet = Vec::new();
         msg::CHANNEL_DATA.encode(&mut packet).unwrap();
         id.encode(&mut packet).unwrap();
-        (&[7u8; 64][..]).encode(&mut packet).unwrap();
+        [7u8; 64][..].encode(&mut packet).unwrap();
         session.process_packet(&mut TestHandler, &packet).await.unwrap();
         assert_eq!(session.common.encrypted.as_ref().unwrap().channels[&id].sender_window_size, 64);
     }
@@ -2871,7 +2876,7 @@ mod tests {
         let mut packet = Vec::new();
         msg::CHANNEL_DATA.encode(&mut packet).unwrap();
         id.encode(&mut packet).unwrap();
-        (&[7u8; 64][..]).encode(&mut packet).unwrap();
+        [7u8; 64][..].encode(&mut packet).unwrap();
         session.process_packet(&mut TestHandler, &packet).await.unwrap();
         session.close_released_channels().unwrap();
         assert_eq!(session.common.encrypted.as_ref().unwrap().channels[&id].sender_window_size, 64);

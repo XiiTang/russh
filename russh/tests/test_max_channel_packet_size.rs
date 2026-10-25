@@ -30,17 +30,21 @@ async fn run_max_channel_packet_size_test(compression: Option<&'static [compress
 
     let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
 
-    let mut server_config = server::Config::default();
-    server_config.inactivity_timeout = None;
-    server_config.auth_rejection_time = std::time::Duration::from_secs(3);
-    server_config.maximum_packet_size = MAX_CHANNEL_PACKET_SIZE;
-    server_config.window_size = MAX_CHANNEL_PACKET_SIZE * 4;
+    let mut server_config = server::Config {
+        inactivity_timeout: None,
+        auth_rejection_time: std::time::Duration::from_secs(3),
+        maximum_packet_size: MAX_CHANNEL_PACKET_SIZE,
+        window_size: MAX_CHANNEL_PACKET_SIZE * 4,
+        ..Default::default()
+    };
     server_config
         .keys
         .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
     server_config.preferred = {
-        let mut preferred = Preferred::default();
-        preferred.cipher = Cow::Borrowed(&[cipher::AES_256_GCM]);
+        let mut preferred = Preferred {
+            cipher: Cow::Borrowed(&[cipher::AES_256_GCM]),
+            ..Default::default()
+        };
         if let Some(compression) = compression {
             preferred.compression = Cow::Borrowed(compression);
         }
@@ -58,16 +62,20 @@ async fn run_max_channel_packet_size_test(compression: Option<&'static [compress
             .unwrap();
     });
 
-    let mut client_config = client::Config::default();
-    client_config.maximum_packet_size = MAX_CHANNEL_PACKET_SIZE;
-    client_config.window_size = MAX_CHANNEL_PACKET_SIZE * 4;
-    client_config.preferred = {
-        let mut preferred = Preferred::default();
-        preferred.cipher = Cow::Borrowed(&[cipher::AES_256_GCM]);
-        if let Some(compression) = compression {
-            preferred.compression = Cow::Borrowed(compression);
-        }
-        preferred
+    let client_config = client::Config {
+        maximum_packet_size: MAX_CHANNEL_PACKET_SIZE,
+        window_size: MAX_CHANNEL_PACKET_SIZE * 4,
+        preferred: {
+            let mut preferred = Preferred {
+                cipher: Cow::Borrowed(&[cipher::AES_256_GCM]),
+                ..Default::default()
+            };
+            if let Some(compression) = compression {
+                preferred.compression = Cow::Borrowed(compression);
+            }
+            preferred
+        },
+        ..Default::default()
     };
 
     let mut session = client::connect(Arc::new(client_config), addr, TestClient {})

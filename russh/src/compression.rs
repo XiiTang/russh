@@ -170,6 +170,7 @@ impl Decompress {
 
 #[cfg(all(test, feature = "flate2"))]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use std::io::Write;
 
     use flate2::write::ZlibEncoder;

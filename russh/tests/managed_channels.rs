@@ -124,7 +124,7 @@ async fn cancelled_open_and_window_blocked_stream_close_in_engine_with_live_sibl
         .await
         .is_err()
     );
-    assert!(admitted >= 10 && admitted < 64);
+    assert!((10..64).contains(&admitted));
     drop(stream);
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(2), closed.recv())

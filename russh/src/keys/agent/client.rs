@@ -592,6 +592,7 @@ impl<S: AgentStream + Unpin> AgentClient<S> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use byteorder::{BigEndian, ByteOrder};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

@@ -165,6 +165,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use std::borrow::Cow;
     use std::num::Wrapping;
     use std::sync::Arc;
@@ -465,16 +466,16 @@ mod tests {
         };
 
         let probe = publickey_probe_packet("alice", &pk_ok_key);
-        let mut probe = BytesMut::from(probe.as_slice());
+        let probe = BytesMut::from(probe.as_slice());
         session
-            .process_packet(&mut handler, &mut probe)
+            .process_packet(&mut handler, &probe)
             .await
             .unwrap();
 
         let signed = publickey_signed_packet("alice", Arc::new(signed_private), &signed_key);
-        let mut signed = BytesMut::from(signed.as_slice());
+        let signed = BytesMut::from(signed.as_slice());
         session
-            .process_packet(&mut handler, &mut signed)
+            .process_packet(&mut handler, &signed)
             .await
             .unwrap();
 
@@ -680,14 +681,16 @@ mod tests {
     }
 
     fn test_auth_session() -> Session {
-        let mut config = Config::default();
-        config.preferred = Preferred {
-            host_key_certificates: Cow::Borrowed(&[]),
-            kex: Cow::Owned(vec![KEX_NONE]),
-            key: Cow::Owned(vec![ssh_key::Algorithm::Ed25519]),
-            cipher: Cow::Owned(vec![cipher::NONE]),
-            mac: Cow::Owned(vec![mac::NONE]),
-            compression: Cow::Owned(vec![compression::NONE]),
+        let config = Config {
+            preferred: Preferred {
+                host_key_certificates: Cow::Borrowed(&[]),
+                kex: Cow::Owned(vec![KEX_NONE]),
+                key: Cow::Owned(vec![ssh_key::Algorithm::Ed25519]),
+                cipher: Cow::Owned(vec![cipher::NONE]),
+                mac: Cow::Owned(vec![mac::NONE]),
+                compression: Cow::Owned(vec![compression::NONE]),
+            },
+            ..Default::default()
         };
         let config = Arc::new(config);
         let (priority_sender, priority_receiver) = tokio::sync::mpsc::unbounded_channel();

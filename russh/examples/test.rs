@@ -9,8 +9,10 @@ use russh::*;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let mut config = russh::server::Config::default();
-    config.auth_rejection_time = std::time::Duration::from_secs(3);
+    let mut config = russh::server::Config {
+        auth_rejection_time: std::time::Duration::from_secs(3),
+        ..Default::default()
+    };
     config.keys.push(
         russh::keys::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap(),
     );
@@ -29,9 +31,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+type Clients = Arc<Mutex<HashMap<(usize, ChannelId), Channel<Msg>>>>;
+
 #[derive(Clone)]
 struct Server {
-    clients: Arc<Mutex<HashMap<(usize, ChannelId), Channel<Msg>>>>,
+    clients: Clients,
     id: usize,
 }
 

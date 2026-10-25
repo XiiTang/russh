@@ -16,17 +16,18 @@ async fn test_mlkem768x25519_handshake() {
 
     let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
 
-    let mut server_config = server::Config::default();
-    server_config.inactivity_timeout = None;
-    server_config.auth_rejection_time = std::time::Duration::from_secs(3);
+    let mut server_config = server::Config {
+        inactivity_timeout: None,
+        auth_rejection_time: std::time::Duration::from_secs(3),
+        ..Default::default()
+    };
     server_config
         .keys
         .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
 
-    server_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::MLKEM768X25519_SHA256]);
-        p
+    server_config.preferred = Preferred {
+        kex: Cow::Borrowed(&[kex::MLKEM768X25519_SHA256]),
+        ..Default::default()
     };
 
     let server_config = Arc::new(server_config);
@@ -41,11 +42,12 @@ async fn test_mlkem768x25519_handshake() {
             .unwrap();
     });
 
-    let mut client_config = client::Config::default();
-    client_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::MLKEM768X25519_SHA256]);
-        p
+    let client_config = client::Config {
+        preferred: Preferred {
+            kex: Cow::Borrowed(&[kex::MLKEM768X25519_SHA256]),
+            ..Default::default()
+        },
+        ..Default::default()
     };
     let client_config = Arc::new(client_config);
 
@@ -90,17 +92,18 @@ async fn test_mlkem768x25519_with_fallback() {
 
     let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
 
-    let mut server_config = server::Config::default();
-    server_config.inactivity_timeout = None;
-    server_config.auth_rejection_time = std::time::Duration::from_secs(3);
+    let mut server_config = server::Config {
+        inactivity_timeout: None,
+        auth_rejection_time: std::time::Duration::from_secs(3),
+        ..Default::default()
+    };
     server_config
         .keys
         .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
 
-    server_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::MLKEM768X25519_SHA256, kex::CURVE25519]);
-        p
+    server_config.preferred = Preferred {
+        kex: Cow::Borrowed(&[kex::MLKEM768X25519_SHA256, kex::CURVE25519]),
+        ..Default::default()
     };
 
     let server_config = Arc::new(server_config);
@@ -115,11 +118,12 @@ async fn test_mlkem768x25519_with_fallback() {
             .unwrap();
     });
 
-    let mut client_config = client::Config::default();
-    client_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::MLKEM768X25519_SHA256, kex::CURVE25519]);
-        p
+    let client_config = client::Config {
+        preferred: Preferred {
+            kex: Cow::Borrowed(&[kex::MLKEM768X25519_SHA256, kex::CURVE25519]),
+            ..Default::default()
+        },
+        ..Default::default()
     };
     let client_config = Arc::new(client_config);
 
@@ -164,17 +168,18 @@ async fn test_mlkem768x25519_rekey() {
 
     let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
 
-    let mut server_config = server::Config::default();
-    server_config.inactivity_timeout = None;
-    server_config.auth_rejection_time = std::time::Duration::from_secs(3);
+    let mut server_config = server::Config {
+        inactivity_timeout: None,
+        auth_rejection_time: std::time::Duration::from_secs(3),
+        ..Default::default()
+    };
     server_config
         .keys
         .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
 
-    server_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::MLKEM768X25519_SHA256]);
-        p
+    server_config.preferred = Preferred {
+        kex: Cow::Borrowed(&[kex::MLKEM768X25519_SHA256]),
+        ..Default::default()
     };
 
     let server_config = Arc::new(server_config);
@@ -189,11 +194,12 @@ async fn test_mlkem768x25519_rekey() {
             .unwrap();
     });
 
-    let mut client_config = client::Config::default();
-    client_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::MLKEM768X25519_SHA256]);
-        p
+    let client_config = client::Config {
+        preferred: Preferred {
+            kex: Cow::Borrowed(&[kex::MLKEM768X25519_SHA256]),
+            ..Default::default()
+        },
+        ..Default::default()
     };
     let client_config = Arc::new(client_config);
 
@@ -248,17 +254,18 @@ async fn test_mlkem768x25519_multiple_channels() {
 
     let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
 
-    let mut server_config = server::Config::default();
-    server_config.inactivity_timeout = None;
-    server_config.auth_rejection_time = std::time::Duration::from_secs(3);
+    let mut server_config = server::Config {
+        inactivity_timeout: None,
+        auth_rejection_time: std::time::Duration::from_secs(3),
+        ..Default::default()
+    };
     server_config
         .keys
         .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
 
-    server_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::MLKEM768X25519_SHA256]);
-        p
+    server_config.preferred = Preferred {
+        kex: Cow::Borrowed(&[kex::MLKEM768X25519_SHA256]),
+        ..Default::default()
     };
 
     let server_config = Arc::new(server_config);
@@ -273,11 +280,12 @@ async fn test_mlkem768x25519_multiple_channels() {
             .unwrap();
     });
 
-    let mut client_config = client::Config::default();
-    client_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::MLKEM768X25519_SHA256]);
-        p
+    let client_config = client::Config {
+        preferred: Preferred {
+            kex: Cow::Borrowed(&[kex::MLKEM768X25519_SHA256]),
+            ..Default::default()
+        },
+        ..Default::default()
     };
     let client_config = Arc::new(client_config);
 

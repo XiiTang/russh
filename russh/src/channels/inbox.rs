@@ -5,7 +5,7 @@
 use crate::ChannelMsg;
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     task::{Context, Poll, Waker},
 };
 use tokio::sync::Notify;
@@ -27,6 +27,17 @@ pub(crate) struct Inbox {
     control_limit: usize,
 }
 impl Inbox {
+    #[track_caller]
+    fn state(&self) -> MutexGuard<'_, State> {
+        match self.state.lock() {
+            Ok(state) => state,
+            // A poisoned inbox can be inconsistent. This deliberate panic
+            // preserves unwrap's payload and unwind instead of recovering it.
+            #[allow(clippy::panic)] // False positive: this is the existing poisoned-lock invariant.
+            Err(error) => panic!("called `Result::unwrap()` on an `Err` value: {error:?}"),
+        }
+    }
+
     pub(crate) fn new(wake_session: Arc<Notify>, control_limit: usize) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {
@@ -46,7 +57,7 @@ impl Inbox {
         &self,
         message: ChannelMsg,
     ) -> Result<(), tokio::sync::mpsc::error::SendError<ChannelMsg>> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         // What the inbox refuses reaches nobody and still counts as consumed:
         // an overflowed channel stays registered until the engine closes it.
         if state.reader_closed || state.overflowed || state.closed {
@@ -78,7 +89,7 @@ impl Inbox {
         Ok(())
     }
     pub(crate) fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<ChannelMsg>> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         if let Some(message) = state.queue.pop_front() {
             let size = bytes(&message);
             if size == 0 {
@@ -96,17 +107,17 @@ impl Inbox {
         Poll::Pending
     }
     pub(crate) fn take_consumed(&self) -> u32 {
-        std::mem::take(&mut self.state.lock().unwrap().consumed)
+        std::mem::take(&mut self.state().consumed)
     }
     /// Whether the peer queued more controls than the reader takes; the
     /// engine then closes the channel.
     pub(crate) fn overflowed(&self) -> bool {
-        self.state.lock().unwrap().overflowed
+        self.state().overflowed
     }
     /// Ends inbound delivery: what is queued and what arrives later counts as
     /// consumed.
     pub(crate) fn close_reader(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.reader_closed = true;
         let queued: u32 = state.queue.drain(..).map(|message| bytes(&message)).sum();
         state.consumed += queued;
@@ -114,7 +125,7 @@ impl Inbox {
         self.wake_session.notify_one();
     }
     pub(crate) fn close_sender(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.closed = true;
         if let Some(waker) = state.waker.take() {
             waker.wake();
@@ -125,5 +136,84 @@ fn bytes(message: &ChannelMsg) -> u32 {
     match message {
         ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => data.len() as u32,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+    use std::task::Wake;
+
+    struct PanickingWake;
+
+    impl Wake for PanickingWake {
+        fn wake(self: Arc<Self>) {
+            // Inject a caller's panic while send holds the inbox lock.
+            resume_unwind(Box::new("reader waker panicked"));
+        }
+    }
+
+    #[test]
+    fn every_inbox_operation_preserves_the_poisoned_lock_panic() {
+        // The raw-packet fixture temporarily captures every process-wide panic.
+        // Keep these deliberate panics out of its observation window.
+        let _panic_hook_guard = crate::tests::raw_no_crypto::PANIC_HOOK_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inbox = Inbox::new(Arc::new(Notify::new()), 128);
+        let waker = Waker::from(Arc::new(PanickingWake));
+        let mut cx = Context::from_waker(&waker);
+        assert!(inbox.poll_recv(&mut cx).is_pending());
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _ = inbox.send(ChannelMsg::Data {
+                    data: bytes::Bytes::from_static(b"queued"),
+                });
+            }))
+            .is_err()
+        );
+        assert!(inbox.state.is_poisoned());
+
+        let operations: [fn(&Inbox); 6] = [
+            |inbox| {
+                let _ = inbox.send(ChannelMsg::Eof);
+            },
+            |inbox| {
+                let mut cx = Context::from_waker(Waker::noop());
+                let _ = inbox.poll_recv(&mut cx);
+            },
+            |inbox| {
+                let _ = inbox.take_consumed();
+            },
+            |inbox| {
+                let _ = inbox.overflowed();
+            },
+            Inbox::close_reader,
+            Inbox::close_sender,
+        ];
+        for operation in operations {
+            let result = catch_unwind(AssertUnwindSafe(|| operation(&inbox)));
+            assert!(result.is_err(), "an operation recovered a poisoned inbox");
+            if let Err(payload) = result {
+                assert_eq!(
+                    payload.downcast_ref::<String>().map(String::as_str),
+                    Some("called `Result::unwrap()` on an `Err` value: PoisonError { .. }")
+                );
+            }
+        }
+
+        // No operation may observe or mutate the potentially damaged state.
+        let state = inbox
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.queue.len(), 1);
+        assert_eq!(state.controls, 0);
+        assert_eq!(state.consumed, 0);
+        assert!(!state.closed);
+        assert!(!state.reader_closed);
+        assert!(!state.overflowed);
     }
 }

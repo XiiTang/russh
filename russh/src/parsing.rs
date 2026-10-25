@@ -208,6 +208,7 @@ impl Decode for ChannelOpenConfirmation {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use super::{ChannelType, OpenChannelMessage};
     use crate::tests::raw_no_crypto::{channel_open_payload, encode_string, push_u32};
 

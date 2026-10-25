@@ -44,9 +44,11 @@ async fn serve_and_connect(
 
     tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
-        let _ = server::run_stream(config, socket, TestServer {})
-            .await
-            .unwrap();
+        drop(
+            server::run_stream(config, socket, TestServer {})
+                .await
+                .unwrap(),
+        );
     });
 
     let mut client_config = client::Config::default();

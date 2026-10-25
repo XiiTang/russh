@@ -6,6 +6,114 @@ Retain upstream history and licenses; keep application behavior outside this
 fork. Keep a patch only while upstream lacks the behavior, and run its
 regression and Boundless's SSH tests before moving the pin.
 
+## Strict Rust 1.97 Clippy and receive-inbox lock invariants (#340)
+
+The six receive-inbox locks now use the private `Inbox::state` accessor.
+It matches poisoning explicitly and preserves the former `Result::unwrap`
+panic, its String payload, and normal unwind. Recovering the guard would
+expose potentially inconsistent queue state and change callers' observations.
+Healthy queue behavior, public APIs, and SSH flow control are unchanged.
+The error arm has a targeted `clippy::panic` exception: failing this poisoned
+invariant is required behavior, so this restriction lint is a false positive.
+The reason is also beside the exception.
+
+Upstream main at `e5d80a07dc554480b6ea3b2e14adfc190407b627` has no fork inbox
+and uses an async mutex for channel windows. The fork's `SendCredit::value`
+supplies its private accessor idiom; its poison recovery is deliberately not
+copied. Rust 1.97's `Result::unwrap` supplies the retained panic behavior.
+
+The exact workspace-root strict commands initially exit 101 on pristine
+`daac975`: a `russh-config` test unwrap stops the build before the inbox.
+Running them from the `russh` crate also exits 101, reproducing the six inbox
+sites, map-key iteration, and 761 library-test diagnostics. Removing those
+initial blockers exposes further integration/example warnings; all reproduced
+findings are covered by this repair. `russh-config` follows its existing
+`expect("to_str")` test idiom. Production agent key traversal uses `keys()`
+with identical order. True test/example warnings use explicit initializers,
+borrow cleanup, a tuple alias, `repeat_n`, Option/Result matches, and map-value
+iteration. KEX test mutex guards end before disconnect awaits. Explicitly
+dropping already-running server handles retains the former `let _` behavior;
+it does not newly await session termination. The encrypted-client test module
+moves after production items without changing those items.
+
+Restriction warnings on deliberate fixture assertions are false positives:
+a failed assertion must fail the test, including an unexpected variant or
+invalid fixed packet offset. Exceptions name only reproduced restriction
+lints, inside `cfg(test)` modules or individual test functions. Production
+lint policy is unchanged. The table lists all newly excepted assertion scopes;
+each has its reason beside it. Paths below are relative to the workspace root.
+
+| Test-only scope | Restriction lints excepted (`clippy::`) |
+| --- | --- |
+| `cryptovec/src/cryptovec.rs` (cfg(test) module at original line 485) | `unwrap_used`, `indexing_slicing` |
+| `russh/src/channels/mod.rs` (cfg(test) module at original line 778) | `unwrap_used`, `panic` |
+| `russh/src/client/encrypted.rs` (cfg(test) module at original line 1116) | `unwrap_used`, `indexing_slicing` |
+| `russh/src/client/mod.rs` (cfg(test) module at original line 2363) | `unwrap_used`, `expect_used`, `indexing_slicing` |
+| `russh/src/client/test.rs` (cfg(test) module at original line 2) | `unwrap_used`, `panic` |
+| `russh/src/compression.rs` (cfg(test) module at original line 172) | `unwrap_used`, `indexing_slicing` |
+| `russh/src/helpers.rs` (cfg(test) module at original line 140) | `unwrap_used` |
+| `russh/src/kex/curve25519.rs` (cfg(test) module at original line 189) | `unwrap_used` |
+| `russh/src/kex/ecdh_nistp.rs` (cfg(test) module at original line 211) | `unwrap_used` |
+| `russh/src/kex/hybrid_mlkem.rs` (cfg(test) module at original line 250) | `unwrap_used`, `indexing_slicing` |
+| `russh/src/kex/mod.rs` (cfg(test) module at original line 505) | `unwrap_used` |
+| `russh/src/keys/agent/client.rs` (cfg(test) module at original line 594) | `unwrap_used`, `expect_used` |
+| `russh/src/keys/agent/mod.rs` (cfg(test) module at original line 84) | `unwrap_used` |
+| `russh/src/keys/agent/server.rs` (cfg(test) module at original line 374) | `unwrap_used`, `expect_used` |
+| `russh/src/keys/format/tests.rs` (cfg(test) format::tests file) | `unwrap_used` |
+| `russh/src/keys/known_hosts.rs` (cfg(test) module at original line 177) | `unwrap_used` |
+| `russh/src/keys/mod.rs` (cfg(test) module at original line 269) | `unwrap_used`, `expect_used`, `indexing_slicing`, `panic` |
+| `russh/src/negotiation.rs` (cfg(test) module at original line 638) | `unwrap_used` |
+| `russh/src/parsing.rs` (cfg(test) module at original line 210) | `expect_used` |
+| `russh/src/server/encrypted.rs` (cfg(test) module at original line 167) | `unwrap_used`, `expect_used` |
+| `russh/src/server/session.rs` (cfg(test) module at original line 1681) | `unwrap_used`, `indexing_slicing` |
+| `russh/src/session.rs` (cfg(test) module at original line 970) | `unwrap_used`, `indexing_slicing` |
+| `russh/src/ssh_read.rs` (cfg(test) module at original line 217) | `unwrap_used` |
+| `russh/src/sshbuffer.rs` (packet_bytes_compressed_matches_packet_output; test_packet_retains_plaintext_for_compressed_packets; test_write_packet_compressed_matches_clear_cipher_output; test_write_packet_restores_output_buffer_on_error; automatic_rekey_read_counter_tracks_payload_bytes; installing_a_cipher_starts_a_new_write_key_epoch; test_write_packet_matches_clear_cipher_write_output; packet_bytes_matches_packet_output; packet_bytes_returns_retained_bytes; test_packet_returns_retained_bytes; test_write_packet_leaves_reusable_buffer_for_cold_path_packets) | `unwrap_used` |
+| `russh/src/tests.rs` (cfg(test) tests file) | `indexing_slicing` |
+
+The inbox poison regression needs no test-only lint exception.
+In `russh/src/tests.rs`, `async_yields_async` is scoped to `test_session`,
+`test_server_channels`, `test_channel_streams`, `test_channel_objects`,
+`test_server_receives_close_on_client_close`, `test_channel_window_size`,
+`send_pty_req`, and `test_future_certificate_auth_full_flow`: their returned
+Future-valued session handles transfer live ownership to the fixture; awaiting
+them to termination would block the fixture. `capture_panics` alone permits
+`await_holding_lock`, because its global panic-hook observation must cover
+native completion. Its sole async caller owns its runtime; the competing
+synchronous poison test runs on another test thread. Both tests share the same
+hook lock so intentional unwinds cannot taint the raw-packet panic assertion.
+These exceptions are false positives and preserve existing fixture lifecycles.
+
+Validation on macOS arm64, Rust 1.97.0, through `build-slot`, with
+`CARGO_INCREMENTAL=0`:
+
+- `cargo clippy --all-targets -- -D warnings`: before 101; after 0.
+- `cargo clippy --all-targets --all-features -- -D warnings`: before 101;
+  after 0. Nine cryptovec assertion warnings were separately reproduced
+  before adding its test-only restriction exceptions.
+- `cargo test -p russh --lib --locked --
+  channels::inbox::tests::every_inbox_operation_preserves_the_poisoned_lock_panic
+  --exact`: before 0 (same test on unchanged production); after 0, one test.
+  The test poisons the actual inbox through a reader waker during `send`, then
+  verifies all six methods' panic payloads and retained queue/credit/close state.
+- `cargo test -p russh --lib --locked --
+  every_inbox_operation_preserves_the_poisoned_lock_panic
+  malformed_pty_req_truncated_modes_rejected_by_server --test-threads=2`:
+  before 0 and after 0, two tests each, including panic-hook isolation.
+- `cargo test -p russh-config --lib --locked -- tests::expand_home --exact`: 0.
+- `cargo fmt --all --check`: 0 after repair. The include-file inbox is also
+  formatted explicitly with Rust 1.97 `rustfmt --edition 2024`.
+
+The nine selected integration targets (`auth_partial_success`, `auth_state_reset`,
+`managed_channels`, `test_backpressure`, `test_kex_shared_secret`,
+`test_max_channel_packet_size`, `test_mlkem_kex`, `test_rekey_strict_kex`,
+`test_server_cert`) also exit 0 after their fixture repairs.
+
+Full per-command logs and the per-finding location/resolution inventory are
+retained in Boundless's `fix-340/.scratch/impl/` review artifacts. The strict
+command's 101-to-0 transition is the lint regression; the poison regression's
+0-to-0 result demonstrates preservation of the existing failure behavior.
+
 ## 0.64.1 rebuild (#277)
 
 The upstream source at the revision above was compared with every old patch.

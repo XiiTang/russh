@@ -187,6 +187,7 @@ impl KexAlgorithmImplementor for Curve25519Kex {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use super::*;
     use crate::session::Exchange;
 

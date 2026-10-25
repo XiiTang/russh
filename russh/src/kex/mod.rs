@@ -503,6 +503,7 @@ pub(crate) fn encode_mpint<W: Writer>(s: &[u8], w: &mut W) -> Result<(), Error> 
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use super::encode_mpint;
     use crate::CryptoVec;
 

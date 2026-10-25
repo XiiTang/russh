@@ -85,10 +85,11 @@ impl Session {
         let key_pair = load_secret_key(key_path, None)?;
 
         // load ssh certificate
-        let mut openssh_cert = None;
-        if openssh_cert_path.is_some() {
-            openssh_cert = Some(load_openssh_certificate(openssh_cert_path.unwrap())?);
-        }
+        let openssh_cert = if let Some(path) = openssh_cert_path {
+            Some(load_openssh_certificate(path)?)
+        } else {
+            None
+        };
 
         let config = client::Config {
             inactivity_timeout: Some(Duration::from_secs(5)),
@@ -107,7 +108,15 @@ impl Session {
 
         let mut session = client::connect(config, addrs, sh).await?;
         // use publickey authentication, with or without certificate
-        if openssh_cert.is_none() {
+        if let Some(certificate) = openssh_cert {
+            let auth_res = session
+                .authenticate_openssh_cert(user, Arc::new(key_pair), certificate)
+                .await?;
+
+            if !auth_res.success() {
+                anyhow::bail!("Authentication (with publickey+cert) failed");
+            }
+        } else {
             let auth_res = session
                 .authenticate_publickey(
                     user,
@@ -120,14 +129,6 @@ impl Session {
 
             if !auth_res.success() {
                 anyhow::bail!("Authentication (with publickey) failed");
-            }
-        } else {
-            let auth_res = session
-                .authenticate_openssh_cert(user, Arc::new(key_pair), openssh_cert.unwrap())
-                .await?;
-
-            if !auth_res.success() {
-                anyhow::bail!("Authentication (with publickey+cert) failed");
             }
         }
 
