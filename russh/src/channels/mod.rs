@@ -776,17 +776,20 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use tokio::sync::mpsc;
 
     use super::*;
 
+    type WriteFixture = (
+        ChannelWriteHalf<(ChannelId, ChannelMsg)>,
+        mpsc::Receiver<(ChannelId, ChannelMsg)>,
+    );
+
     fn test_write_half(
         window_size: SendCredit,
         max_packet_size: u32,
-    ) -> (
-        ChannelWriteHalf<(ChannelId, ChannelMsg)>,
-        mpsc::Receiver<(ChannelId, ChannelMsg)>,
-    ) {
+    ) -> WriteFixture {
         let (sender, receiver) = mpsc::channel(8);
         (
             ChannelWriteHalf {
@@ -923,10 +926,7 @@ mod tests {
     /// `blocker`, so the next send waits for room.
     fn blocked_write_half(
         credit: u32,
-    ) -> (
-        ChannelWriteHalf<(ChannelId, ChannelMsg)>,
-        mpsc::Receiver<(ChannelId, ChannelMsg)>,
-    ) {
+    ) -> WriteFixture {
         let (sender, receiver) = mpsc::channel(1);
         sender.try_send((ChannelId(1), ChannelMsg::Eof)).unwrap();
         let write_half = ChannelWriteHalf {

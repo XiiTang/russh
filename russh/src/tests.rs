@@ -1,3 +1,4 @@
+#![allow(clippy::indexing_slicing)] // Fixed packet fixture indexing is a test assertion.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // Allow unwraps, expects and panics in the test suite
 
 use futures::Future;
@@ -28,10 +29,12 @@ mod compress {
         let _ = env_logger::try_init();
 
         let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
-        let mut config = server::Config::default();
-        config.preferred = preferred_zlib();
-        config.inactivity_timeout = None; // Some(std::time::Duration::from_secs(3));
-        config.auth_rejection_time = std::time::Duration::from_secs(3);
+        let mut config = server::Config {
+            preferred: preferred_zlib(),
+            inactivity_timeout: None,
+            auth_rejection_time: std::time::Duration::from_secs(3),
+            ..Default::default()
+        };
         config
             .keys
             .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
@@ -50,8 +53,10 @@ mod compress {
             server::run_stream(config, socket, server).await.unwrap();
         });
 
-        let mut config = client::Config::default();
-        config.preferred = preferred_zlib();
+        let config = client::Config {
+            preferred: preferred_zlib(),
+            ..Default::default()
+        };
         let config = Arc::new(config);
 
         let mut session = client::connect(config, addr, Client {}).await.unwrap();
@@ -181,6 +186,7 @@ mod channels {
 
     use super::*;
 
+    #[allow(clippy::async_yields_async)] // Live session handles are handed to the fixture owner, not awaited to termination.
     async fn test_session<RC, RS, CH, SH, F1, F2>(
         client_handler: CH,
         server_handler: SH,
@@ -201,9 +207,11 @@ mod channels {
         let _ = env_logger::try_init();
 
         let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
-        let mut config = server::Config::default();
-        config.inactivity_timeout = None;
-        config.auth_rejection_time = std::time::Duration::from_secs(3);
+        let mut config = server::Config {
+            inactivity_timeout: None,
+            auth_rejection_time: std::time::Duration::from_secs(3),
+            ..Default::default()
+        };
         config
             .keys
             .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
@@ -249,6 +257,7 @@ mod channels {
     }
 
     #[tokio::test]
+    #[allow(clippy::async_yields_async)] // Live session handles are handed to the fixture owner, not awaited to termination.
     async fn test_server_channels() {
         #[derive(Debug)]
         struct Client {
@@ -342,6 +351,7 @@ mod channels {
     }
 
     #[tokio::test]
+    #[allow(clippy::async_yields_async)] // Live session handles are handed to the fixture owner, not awaited to termination.
     async fn test_channel_streams() {
         #[derive(Debug)]
         struct Client {}
@@ -438,6 +448,7 @@ mod channels {
     }
 
     #[tokio::test]
+    #[allow(clippy::async_yields_async)] // Live session handles are handed to the fixture owner, not awaited to termination.
     async fn test_channel_objects() {
         #[derive(Debug)]
         struct Client {}
@@ -524,6 +535,7 @@ mod channels {
     /// Verify that the server-side CHANNEL_CLOSE handler delivers
     /// `ChannelMsg::Close` before the channel stream ends.
     #[tokio::test]
+    #[allow(clippy::async_yields_async)] // Live session handles are handed to the fixture owner, not awaited to termination.
     async fn test_server_receives_close_on_client_close() {
         #[derive(Debug)]
         struct Client {}
@@ -596,6 +608,7 @@ mod channels {
     }
 
     #[tokio::test]
+    #[allow(clippy::async_yields_async)] // Live session handles are handed to the fixture owner, not awaited to termination.
     async fn test_channel_window_size() {
         #[derive(Debug)]
         struct Client {}
@@ -718,6 +731,7 @@ mod channels {
     }
 
     /// Send one pty-req and return the modes the server side received.
+    #[allow(clippy::async_yields_async)] // Live session handles are handed to the fixture owner, not awaited to termination.
     async fn send_pty_req(modes: Vec<(Pty, u32)>) -> Vec<(Pty, u32)> {
         struct Client {}
 
@@ -1051,8 +1065,10 @@ pub(crate) mod raw_no_crypto {
     pub(crate) const MSG_IGNORE: u8 = 2;
 
     fn strict_kex_server_config() -> Arc<server::Config> {
-        let mut config = server::Config::default();
-        config.inactivity_timeout = None;
+        let mut config = server::Config {
+            inactivity_timeout: None,
+            ..Default::default()
+        };
         config
             .keys
             .push(PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap());
@@ -1113,11 +1129,13 @@ pub(crate) mod raw_no_crypto {
     /// negotiate curve25519, so a rekey offering only curve25519 parks it
     /// waiting for a KEX_ECDH_INIT the raw client never sends.
     fn stalled_rekey_server_config() -> Arc<server::Config> {
-        let mut config = server::Config::default();
-        config.inactivity_timeout = None;
-        config.preferred = Preferred {
-            kex: Cow::Owned(vec![kex::NONE, kex::CURVE25519]),
-            ..no_crypto_preferred()
+        let mut config = server::Config {
+            inactivity_timeout: None,
+            preferred: Preferred {
+                kex: Cow::Owned(vec![kex::NONE, kex::CURVE25519]),
+                ..no_crypto_preferred()
+            },
+            ..Default::default()
         };
         config
             .keys
@@ -1238,11 +1256,13 @@ pub(crate) mod raw_no_crypto {
     }
 
     fn no_crypto_server_config() -> Arc<server::Config> {
-        let mut config = server::Config::default();
-        config.inactivity_timeout = None;
-        config.auth_rejection_time = Duration::from_millis(1);
-        config.auth_rejection_time_initial = Some(Duration::from_millis(1));
-        config.preferred = no_crypto_preferred();
+        let mut config = server::Config {
+            inactivity_timeout: None,
+            auth_rejection_time: Duration::from_millis(1),
+            auth_rejection_time_initial: Some(Duration::from_millis(1)),
+            preferred: no_crypto_preferred(),
+            ..Default::default()
+        };
         config
             .keys
             .push(PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap());
@@ -1375,9 +1395,14 @@ pub(crate) mod raw_no_crypto {
         tokio::time::timeout(Duration::from_secs(3), future).await
     }
 
-    pub(crate) async fn capture_panics<T>(future: impl Future<Output = T>) -> (T, bool) {
-        static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    // Tests that deliberately panic must also exclude the global capture hook.
+    pub(crate) static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    // Its sole async caller owns a test runtime; the competing synchronous
+    // poison test runs on a different test thread. Keep the hook through
+    // native completion, as the fixture promises.
+    #[allow(clippy::await_holding_lock)] // The global panic hook needs this complete observation window.
+    pub(crate) async fn capture_panics<T>(future: impl Future<Output = T>) -> (T, bool) {
         let _guard = PANIC_HOOK_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -1584,6 +1609,7 @@ mod future_certificate {
     }
 
     #[tokio::test]
+    #[allow(clippy::async_yields_async)] // Live session handles are handed to the fixture owner, not awaited to termination.
     async fn test_future_certificate_auth_full_flow() {
         let _ = env_logger::try_init();
 
@@ -1629,9 +1655,11 @@ mod future_certificate {
         assert!(status.success(), "ssh-add failed");
 
         // 5. Set up test server that accepts certificate auth
-        let mut server_config = server::Config::default();
-        server_config.inactivity_timeout = None;
-        server_config.auth_rejection_time = std::time::Duration::from_secs(3);
+        let mut server_config = server::Config {
+            inactivity_timeout: None,
+            auth_rejection_time: std::time::Duration::from_secs(3),
+            ..Default::default()
+        };
         server_config
             .keys
             .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
@@ -1804,10 +1832,12 @@ mod rekey_under_load {
     async fn client_traffic_in_flight_during_server_rekey_survives() {
         let _ = env_logger::try_init();
 
-        let mut config = server::Config::default();
-        config.inactivity_timeout = None;
-        // Rekey every 64 KiB written: ~16 rekeys over the transfer below.
-        config.limits = Limits::new(64 * 1024, 1 << 30, std::time::Duration::from_secs(3600));
+        let mut config = server::Config {
+            inactivity_timeout: None,
+            // Rekey every 64 KiB written: ~16 rekeys over the transfer below.
+            limits: Limits::new(64 * 1024, 1 << 30, std::time::Duration::from_secs(3600)),
+            ..Default::default()
+        };
         config
             .keys
             .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());

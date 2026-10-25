@@ -968,6 +968,7 @@ pub(crate) enum GlobalRequestResponse {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use std::collections::{HashMap, VecDeque};
     use std::num::Wrapping;
 

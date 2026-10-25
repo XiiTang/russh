@@ -267,6 +267,12 @@ fn is_base64_char(c: char) -> bool {
 
 #[cfg(test)]
 mod test {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+    )] // Test assertions on fixture replies and bytes must fail on unexpected values.
 
     #[cfg(unix)]
     use futures::Future;

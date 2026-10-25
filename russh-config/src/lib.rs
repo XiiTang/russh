@@ -425,7 +425,7 @@ mod tests {
                 env::home_dir().expect("homedir").to_str().expect("to_str"),
                 "/some/folder"
             ),
-            value.to_str().unwrap()
+            value.to_str().expect("to_str")
         );
     }
 

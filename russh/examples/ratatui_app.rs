@@ -56,11 +56,8 @@ impl std::io::Write for TerminalHandle {
 
     fn flush(&mut self) -> std::io::Result<()> {
         let result = self.sender.send(self.sink.clone());
-        if result.is_err() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                result.unwrap_err(),
-            ));
+        if let Err(error) = result {
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, error));
         }
 
         self.sink.clear();
@@ -88,7 +85,7 @@ impl AppServer {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-                for (_, (terminal, app)) in clients.lock().await.iter_mut() {
+                for (terminal, app) in clients.lock().await.values_mut() {
                     app.counter += 1;
 
                     terminal

@@ -20,16 +20,17 @@ async fn test_kex_done_callback_receives_shared_secret() {
     let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
 
     // Set up server
-    let mut server_config = server::Config::default();
-    server_config.inactivity_timeout = None;
-    server_config.auth_rejection_time = std::time::Duration::from_secs(3);
+    let mut server_config = server::Config {
+        inactivity_timeout: None,
+        auth_rejection_time: std::time::Duration::from_secs(3),
+        ..Default::default()
+    };
     server_config
         .keys
         .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
-    server_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::CURVE25519]);
-        p
+    server_config.preferred = Preferred {
+        kex: Cow::Borrowed(&[kex::CURVE25519]),
+        ..Default::default()
     };
     let server_config = Arc::new(server_config);
 
@@ -47,11 +48,12 @@ async fn test_kex_done_callback_receives_shared_secret() {
     let captured_secret: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     let captured_names: Arc<Mutex<Option<Names>>> = Arc::new(Mutex::new(None));
 
-    let mut client_config = client::Config::default();
-    client_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::CURVE25519]);
-        p
+    let client_config = client::Config {
+        preferred: Preferred {
+            kex: Cow::Borrowed(&[kex::CURVE25519]),
+            ..Default::default()
+        },
+        ..Default::default()
     };
     let client_config = Arc::new(client_config);
 
@@ -74,27 +76,29 @@ async fn test_kex_done_callback_receives_shared_secret() {
     assert!(authenticated, "Authentication should succeed");
 
     // Verify the shared secret was captured
-    let secret = captured_secret.lock().unwrap();
-    assert!(secret.is_some(), "Shared secret should be captured");
-    let secret_bytes = secret.as_ref().unwrap();
-    assert!(
-        !secret_bytes.is_empty(),
-        "Shared secret should not be empty"
-    );
-    assert_eq!(
-        secret_bytes.len(),
-        32,
-        "Curve25519 shared secret should be 32 bytes"
-    );
+    {
+        let secret = captured_secret.lock().unwrap();
+        assert!(secret.is_some(), "Shared secret should be captured");
+        let secret_bytes = secret.as_ref().unwrap();
+        assert!(
+            !secret_bytes.is_empty(),
+            "Shared secret should not be empty"
+        );
+        assert_eq!(
+            secret_bytes.len(),
+            32,
+            "Curve25519 shared secret should be 32 bytes"
+        );
 
-    // Verify negotiated cipher was captured
-    let cipher = captured_names.lock().unwrap();
-    assert!(cipher.is_some(), "Negotiated cipher should be captured");
+        // Verify negotiated cipher was captured
+        let cipher = captured_names.lock().unwrap();
+        assert!(cipher.is_some(), "Negotiated cipher should be captured");
 
-    assert!(
-        cipher.as_ref().unwrap().kex.as_ref().contains("curve25519"),
-        "KEX algorithm should be curve25519"
-    );
+        assert!(
+            cipher.as_ref().unwrap().kex.as_ref().contains("curve25519"),
+            "KEX algorithm should be curve25519"
+        );
+    }
 
     session
         .disconnect(Disconnect::ByApplication, "", "")
@@ -109,16 +113,17 @@ async fn test_kex_done_with_ecdh_nistp256() {
 
     let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
 
-    let mut server_config = server::Config::default();
-    server_config.inactivity_timeout = None;
-    server_config.auth_rejection_time = std::time::Duration::from_secs(3);
+    let mut server_config = server::Config {
+        inactivity_timeout: None,
+        auth_rejection_time: std::time::Duration::from_secs(3),
+        ..Default::default()
+    };
     server_config
         .keys
         .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
-    server_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::ECDH_SHA2_NISTP256]);
-        p
+    server_config.preferred = Preferred {
+        kex: Cow::Borrowed(&[kex::ECDH_SHA2_NISTP256]),
+        ..Default::default()
     };
     let server_config = Arc::new(server_config);
 
@@ -135,11 +140,12 @@ async fn test_kex_done_with_ecdh_nistp256() {
     let captured_secret: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     let captured_names: Arc<Mutex<Option<Names>>> = Arc::new(Mutex::new(None));
 
-    let mut client_config = client::Config::default();
-    client_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::ECDH_SHA2_NISTP256]);
-        p
+    let client_config = client::Config {
+        preferred: Preferred {
+            kex: Cow::Borrowed(&[kex::ECDH_SHA2_NISTP256]),
+            ..Default::default()
+        },
+        ..Default::default()
     };
     let client_config = Arc::new(client_config);
 
@@ -160,25 +166,27 @@ async fn test_kex_done_with_ecdh_nistp256() {
         .success();
     assert!(authenticated);
 
-    let secret = captured_secret.lock().unwrap();
-    assert!(secret.is_some(), "Shared secret should be captured");
-    let secret_bytes = secret.as_ref().unwrap();
-    assert!(
-        !secret_bytes.is_empty(),
-        "Shared secret should not be empty"
-    );
-    // NIST P-256 shared secret is 32 bytes
-    assert_eq!(
-        secret_bytes.len(),
-        32,
-        "ECDH-NISTP256 shared secret should be 32 bytes"
-    );
+    {
+        let secret = captured_secret.lock().unwrap();
+        assert!(secret.is_some(), "Shared secret should be captured");
+        let secret_bytes = secret.as_ref().unwrap();
+        assert!(
+            !secret_bytes.is_empty(),
+            "Shared secret should not be empty"
+        );
+        // NIST P-256 shared secret is 32 bytes
+        assert_eq!(
+            secret_bytes.len(),
+            32,
+            "ECDH-NISTP256 shared secret should be 32 bytes"
+        );
 
-    let kex_alg = captured_names.lock().unwrap();
-    assert!(
-        kex_alg.as_ref().unwrap().kex.as_ref().contains("nistp256"),
-        "KEX algorithm should be nistp256"
-    );
+        let kex_alg = captured_names.lock().unwrap();
+        assert!(
+            kex_alg.as_ref().unwrap().kex.as_ref().contains("nistp256"),
+            "KEX algorithm should be nistp256"
+        );
+    }
 
     session
         .disconnect(Disconnect::ByApplication, "", "")
@@ -192,16 +200,17 @@ async fn test_kex_done_with_dh_gex_sha256_and_rfc4419_minimum() {
 
     let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
 
-    let mut server_config = server::Config::default();
-    server_config.inactivity_timeout = None;
-    server_config.auth_rejection_time = std::time::Duration::from_secs(3);
+    let mut server_config = server::Config {
+        inactivity_timeout: None,
+        auth_rejection_time: std::time::Duration::from_secs(3),
+        ..Default::default()
+    };
     server_config
         .keys
         .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
-    server_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::DH_GEX_SHA256]);
-        p
+    server_config.preferred = Preferred {
+        kex: Cow::Borrowed(&[kex::DH_GEX_SHA256]),
+        ..Default::default()
     };
     let server_config = Arc::new(server_config);
 
@@ -218,11 +227,12 @@ async fn test_kex_done_with_dh_gex_sha256_and_rfc4419_minimum() {
     let captured_secret: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     let captured_names: Arc<Mutex<Option<Names>>> = Arc::new(Mutex::new(None));
 
-    let mut client_config = client::Config::default();
-    client_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::DH_GEX_SHA256]);
-        p
+    let mut client_config = client::Config {
+        preferred: Preferred {
+            kex: Cow::Borrowed(&[kex::DH_GEX_SHA256]),
+            ..Default::default()
+        },
+        ..Default::default()
     };
     client_config.gex = client::GexParams::for_client_config(2048, 4097, 8192).unwrap();
     let client_config = Arc::new(client_config);
@@ -244,12 +254,14 @@ async fn test_kex_done_with_dh_gex_sha256_and_rfc4419_minimum() {
         .success();
     assert!(authenticated);
 
-    let secret = captured_secret.lock().unwrap();
-    assert!(secret.is_some(), "Shared secret should be captured");
-    assert!(!secret.as_ref().unwrap().is_empty());
+    {
+        let secret = captured_secret.lock().unwrap();
+        assert!(secret.is_some(), "Shared secret should be captured");
+        assert!(!secret.as_ref().unwrap().is_empty());
 
-    let kex_alg = captured_names.lock().unwrap();
-    assert_eq!(kex_alg.as_ref().unwrap().kex, kex::DH_GEX_SHA256);
+        let kex_alg = captured_names.lock().unwrap();
+        assert_eq!(kex_alg.as_ref().unwrap().kex, kex::DH_GEX_SHA256);
+    }
 
     session
         .disconnect(Disconnect::ByApplication, "", "")
@@ -264,16 +276,17 @@ async fn test_kex_done_on_rekey() {
 
     let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
 
-    let mut server_config = server::Config::default();
-    server_config.inactivity_timeout = None;
-    server_config.auth_rejection_time = std::time::Duration::from_secs(3);
+    let mut server_config = server::Config {
+        inactivity_timeout: None,
+        auth_rejection_time: std::time::Duration::from_secs(3),
+        ..Default::default()
+    };
     server_config
         .keys
         .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
-    server_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::CURVE25519]);
-        p
+    server_config.preferred = Preferred {
+        kex: Cow::Borrowed(&[kex::CURVE25519]),
+        ..Default::default()
     };
     let server_config = Arc::new(server_config);
 
@@ -291,11 +304,12 @@ async fn test_kex_done_on_rekey() {
     let first_secret: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     let second_secret: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
 
-    let mut client_config = client::Config::default();
-    client_config.preferred = {
-        let mut p = Preferred::default();
-        p.kex = Cow::Borrowed(&[kex::CURVE25519]);
-        p
+    let mut client_config = client::Config {
+        preferred: Preferred {
+            kex: Cow::Borrowed(&[kex::CURVE25519]),
+            ..Default::default()
+        },
+        ..Default::default()
     };
     // Set rekey limits very low to trigger rekey quickly
     client_config.limits = Limits {

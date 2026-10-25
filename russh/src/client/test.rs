@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -100,10 +101,12 @@ mod tests {
         let client_key = PrivateKey::random(&mut rng(), ssh_key::Algorithm::Ed25519).unwrap();
 
         // Configure the server
-        let mut config = server::Config::default();
-        config.auth_rejection_time = std::time::Duration::from_secs(1);
-        config.server_id = SshId::Standard("SSH-1.99-CustomServer_1.0".into());
-        config.inactivity_timeout = None;
+        let mut config = server::Config {
+            auth_rejection_time: std::time::Duration::from_secs(1),
+            server_id: SshId::Standard("SSH-1.99-CustomServer_1.0".into()),
+            inactivity_timeout: None,
+            ..Default::default()
+        };
         config
             .keys
             .push(PrivateKey::random(&mut rng(), ssh_key::Algorithm::Ed25519).unwrap());
@@ -180,9 +183,11 @@ mod tests {
 
         let client_key = PrivateKey::random(&mut rng(), ssh_key::Algorithm::Ed25519).unwrap();
 
-        let mut config = server::Config::default();
-        config.auth_rejection_time = std::time::Duration::from_secs(1);
-        config.inactivity_timeout = None;
+        let mut config = server::Config {
+            auth_rejection_time: std::time::Duration::from_secs(1),
+            inactivity_timeout: None,
+            ..Default::default()
+        };
         config
             .keys
             .push(PrivateKey::random(&mut rng(), ssh_key::Algorithm::Ed25519).unwrap());

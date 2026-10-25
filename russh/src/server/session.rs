@@ -1679,6 +1679,7 @@ impl Session {
 
 #[cfg(all(test, feature = "flate2"))]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use std::collections::{HashMap, VecDeque};
     use std::io::Write;
     use std::num::Wrapping;
