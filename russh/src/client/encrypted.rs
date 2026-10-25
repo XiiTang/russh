@@ -520,6 +520,9 @@ impl Session {
                     error!("no channel for id {local_id:?}");
                 }
 
+                if self.close_inbox_overflow(local_id)? {
+                    return Ok(());
+                }
                 client
                     .channel_open_confirmation(
                         local_id,
@@ -559,6 +562,9 @@ impl Session {
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
                     let _ = chan.send(ChannelMsg::Eof).await;
+                }
+                if self.close_inbox_overflow(channel_num)? {
+                    return Ok(());
                 }
                 client.channel_eof(channel_num, self).await
             }
@@ -615,6 +621,9 @@ impl Session {
                     self.credit_unread(channel_num, data.len())?;
                 }
 
+                if self.close_inbox_overflow(channel_num)? {
+                    return Ok(());
+                }
                 client.data(channel_num, &data, self).await
             }
             Some((&msg::CHANNEL_EXTENDED_DATA, mut r)) => {
@@ -642,6 +651,9 @@ impl Session {
                     self.credit_unread(channel_num, data.len())?;
                 }
 
+                if self.close_inbox_overflow(channel_num)? {
+                    return Ok(());
+                }
                 client
                     .extended_data(channel_num, extended_code, &data, self)
                     .await
@@ -661,6 +673,9 @@ impl Session {
                         if let Some(chan) = self.channels.get(&channel_num) {
                             let _ = chan.send(ChannelMsg::XonXoff { client_can_do }).await;
                         }
+                        if self.close_inbox_overflow(channel_num)? {
+                            return Ok(());
+                        }
                         client.xon_xoff(channel_num, client_can_do, self).await
                     }
                     "exit-status" => {
@@ -669,6 +684,9 @@ impl Session {
                         map_err!(ensure_end(&r))?;
                         if let Some(chan) = self.channels.get(&channel_num) {
                             let _ = chan.send(ChannelMsg::ExitStatus { exit_status }).await;
+                        }
+                        if self.close_inbox_overflow(channel_num)? {
+                            return Ok(());
                         }
                         client.exit_status(channel_num, exit_status, self).await
                     }
@@ -689,6 +707,9 @@ impl Session {
                                     lang_tag: lang_tag.to_string(),
                                 })
                                 .await;
+                        }
+                        if self.close_inbox_overflow(channel_num)? {
+                            return Ok(());
                         }
                         client
                             .exit_signal(
@@ -874,9 +895,9 @@ impl Session {
                     self.managed_close.clone(),
                 );
 
-                let inbox = crate::channels::inbox::Inbox::new(
+                let inbox = crate::channels::inbox::Inbox::with_limits(
                     self.managed_close.clone(),
-                    self.common.config.channel_buffer_size,
+                    self.common.config.channel_inbox_limits,
                 );
                 channel.read_half.inbox = Some(inbox.clone());
                 channel_ref.inbox = Some(inbox);

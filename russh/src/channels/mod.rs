@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Notify;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{ChannelId, ChannelOpenFailure, Error, Pty, Sig};
 
@@ -18,6 +18,37 @@ mod channel_stream;
 pub use channel_stream::ChannelStream;
 pub(crate) mod managed;
 pub use managed::ManagedChannel;
+
+/// Limits for one client's queued inbound channel messages.
+/// DATA bytes remain governed by the SSH window and packet limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelInboxLimits {
+    /// Retained heap storage of queued controls, including String/Vec capacity.
+    pub max_control_bytes: usize,
+    /// Queued ordinary messages, including each nonempty DATA/EXTENDED_DATA.
+    /// The final Close or limit-exceeded message has a separate fixed slot.
+    pub max_entries: usize,
+}
+
+impl Default for ChannelInboxLimits {
+    fn default() -> Self {
+        Self {
+            max_control_bytes: 1024 * 1024,
+            max_entries: 128,
+        }
+    }
+}
+
+/// Why one channel's inbound queue ended. The session and siblings stay live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InboxLimitExceeded {
+    /// Queued controls would exceed their retained-storage limit.
+    #[error("channel inbox control storage exceeded {limit} bytes")]
+    ControlBytes { limit: usize },
+    /// Another ordinary message would exceed the queue's entry limit.
+    #[error("channel inbox exceeded {limit} entries")]
+    Entries { limit: usize },
+}
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -44,6 +75,10 @@ pub enum ChannelMsg {
     },
     Eof,
     Close,
+    /// Client receive-only terminal message, after all accepted messages.
+    /// Nothing follows it, as with Close. The engine cancels the native channel
+    /// immediately; observing this message does not drive that cancellation.
+    InboxLimitExceeded(InboxLimitExceeded),
     /// (client only)
     RequestPty {
         want_reply: bool,
@@ -150,14 +185,18 @@ impl SendCredit {
     }
 
     fn value(&self) -> std::sync::MutexGuard<'_, i64> {
-        self.value.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.value
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Credits what the peer's window grew by.
     pub(crate) fn grant(&self, amount: u32) {
         {
             let mut value = self.value();
-            *value = value.saturating_add(i64::from(amount)).min(i64::from(u32::MAX));
+            *value = value
+                .saturating_add(i64::from(amount))
+                .min(i64::from(u32::MAX));
         }
         self.notifier.notify_waiters();
     }
@@ -187,7 +226,12 @@ impl SendCredit {
     /// hands the admitted length to the session queue through a permit it
     /// already holds, under the same lock that debits it. Returns 0, without
     /// calling `send`, when another writer took the credit first.
-    pub(crate) fn admit(&self, len: usize, max_packet_size: u32, send: impl FnOnce(usize)) -> usize {
+    pub(crate) fn admit(
+        &self,
+        len: usize,
+        max_packet_size: u32,
+        send: impl FnOnce(usize),
+    ) -> usize {
         let mut value = self.value();
         let available = usize::try_from((*value).max(0)).unwrap_or(usize::MAX);
         let admitted = available.min(max_packet_size as usize).min(len);
@@ -220,24 +264,40 @@ impl std::fmt::Debug for ChannelReadHalf {
 }
 
 impl Drop for ChannelReadHalf {
-    fn drop(&mut self) { if let Some(inbox) = &self.inbox { inbox.close_reader(); } }
+    fn drop(&mut self) {
+        if let Some(inbox) = &self.inbox {
+            inbox.close_reader();
+        }
+    }
 }
 
 impl ChannelReadHalf {
-    pub(crate) fn poll_recv(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<ChannelMsg>> {
-        match &self.inbox { Some(inbox) => inbox.poll_recv(cx), None => self.receiver.poll_recv(cx) }
+    pub(crate) fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<ChannelMsg>> {
+        match &self.inbox {
+            Some(inbox) => inbox.poll_recv(cx),
+            None => self.receiver.poll_recv(cx),
+        }
     }
     pub(crate) fn close(&mut self) {
-        if let Some(inbox) = &self.inbox { inbox.close_reader(); }
+        if let Some(inbox) = &self.inbox {
+            inbox.close_reader();
+        }
         self.receiver.close();
     }
-    /// Awaits an incoming [`ChannelMsg`], this method returns [`None`] if the channel has been closed.
+    /// Awaits an incoming [`ChannelMsg`], returning [`None`] after the channel ends.
+    /// An exhausted client inbox drains its accepted prefix, then yields one
+    /// [`ChannelMsg::InboxLimitExceeded`] before `None`, just as peer Close is
+    /// delivered before `None`. Native cancellation does not wait for a read.
     pub async fn wait(&mut self) -> Option<ChannelMsg> {
         std::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
 
     /// Make a reader for the [`Channel`] to receive [`ChannelMsg::Data`]
-    /// through the `AsyncRead` trait.
+    /// through the `AsyncRead` trait. An exhausted client inbox returns an
+    /// `io::Error` containing [`InboxLimitExceeded`], including on later reads.
     pub fn make_reader(&mut self) -> impl AsyncRead + '_ {
         self.make_reader_ext(None)
     }
@@ -418,11 +478,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
     }
 
     /// Send owned extended data to a channel without copying it into the `AsyncWrite` path.
-    pub async fn extended_data_bytes(
-        &self,
-        ext: u32,
-        data: impl Into<Bytes>,
-    ) -> Result<(), Error> {
+    pub async fn extended_data_bytes(&self, ext: u32, data: impl Into<Bytes>) -> Result<(), Error> {
         self.send_bytes(Some(ext), data.into()).await
     }
 
@@ -454,14 +510,16 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
             self.window_size.ready().await;
             let permit = self.sender.reserve().await.map_err(|_| Error::SendError)?;
             let start = offset;
-            offset += self.window_size.admit(data.len() - start, self.max_packet_size, |len| {
-                let chunk = data.slice(start..start + len);
-                let msg = match ext {
-                    None => ChannelMsg::Data { data: chunk },
-                    Some(ext) => ChannelMsg::ExtendedData { data: chunk, ext },
-                };
-                permit.send((self.id, msg).into());
-            });
+            offset += self
+                .window_size
+                .admit(data.len() - start, self.max_packet_size, |len| {
+                    let chunk = data.slice(start..start + len);
+                    let msg = match ext {
+                        None => ChannelMsg::Data { data: chunk },
+                        Some(ext) => ChannelMsg::ExtendedData { data: chunk, ext },
+                    };
+                    permit.send((self.id, msg).into());
+                });
         }
 
         Ok(())
@@ -535,7 +593,11 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
         let (tx, rx) = tokio::sync::mpsc::channel(channel_buffer_size);
         let window_size = SendCredit::new(window_size);
         let (handles, reader, writer) = handles::Handles::new(wake);
-        let read_half = ChannelReadHalf { receiver: rx, inbox: None, _hold: Some(reader) };
+        let read_half = ChannelReadHalf {
+            receiver: rx,
+            inbox: None,
+            _hold: Some(reader),
+        };
         let write_half = ChannelWriteHalf {
             id,
             sender,
@@ -702,11 +764,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
     }
 
     /// Send owned extended data to a channel without copying it into the `AsyncWrite` path.
-    pub async fn extended_data_bytes(
-        &self,
-        ext: u32,
-        data: impl Into<Bytes>,
-    ) -> Result<(), Error> {
+    pub async fn extended_data_bytes(&self, ext: u32, data: impl Into<Bytes>) -> Result<(), Error> {
         self.write_half.extended_data_bytes(ext, data).await
     }
 
@@ -723,7 +781,10 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
         self.write_half.close().await
     }
 
-    /// Awaits an incoming [`ChannelMsg`], this method returns [`None`] if the channel has been closed.
+    /// Awaits an incoming [`ChannelMsg`], returning [`None`] after the channel ends.
+    /// An exhausted client inbox drains its accepted prefix, then yields one
+    /// [`ChannelMsg::InboxLimitExceeded`] before `None`, just as peer Close is
+    /// delivered before `None`. Native cancellation does not wait for a read.
     pub async fn wait(&mut self) -> Option<ChannelMsg> {
         self.read_half.wait().await
     }
@@ -751,7 +812,8 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
     }
 
     /// Make a reader for the [`Channel`] to receive [`ChannelMsg::Data`]
-    /// through the `AsyncRead` trait.
+    /// through the `AsyncRead` trait. An exhausted client inbox returns an
+    /// `io::Error` containing [`InboxLimitExceeded`], including on later reads.
     pub fn make_reader(&mut self) -> impl AsyncRead + '_ {
         self.read_half.make_reader()
     }
@@ -787,10 +849,7 @@ mod tests {
         mpsc::Receiver<(ChannelId, ChannelMsg)>,
     );
 
-    fn test_write_half(
-        window_size: SendCredit,
-        max_packet_size: u32,
-    ) -> WriteFixture {
+    fn test_write_half(window_size: SendCredit, max_packet_size: u32) -> WriteFixture {
         let (sender, receiver) = mpsc::channel(8);
         (
             ChannelWriteHalf {
@@ -910,10 +969,19 @@ mod tests {
     #[tokio::test]
     async fn channel_data_bytes_forwards_to_write_half() {
         let (sender, mut receiver) = mpsc::channel(8);
-        let (channel, _reference) =
-            Channel::<(ChannelId, ChannelMsg)>::new(ChannelId(9), sender, 1024, 1024, 8, Default::default());
+        let (channel, _reference) = Channel::<(ChannelId, ChannelMsg)>::new(
+            ChannelId(9),
+            sender,
+            1024,
+            1024,
+            8,
+            Default::default(),
+        );
 
-        channel.data_bytes(Bytes::from_static(b"channel")).await.unwrap();
+        channel
+            .data_bytes(Bytes::from_static(b"channel"))
+            .await
+            .unwrap();
 
         match receiver.recv().await.unwrap() {
             (ChannelId(9), ChannelMsg::Data { data }) => {
@@ -925,9 +993,7 @@ mod tests {
 
     /// A write half whose session queue holds one message, already taken by
     /// `blocker`, so the next send waits for room.
-    fn blocked_write_half(
-        credit: u32,
-    ) -> WriteFixture {
+    fn blocked_write_half(credit: u32) -> WriteFixture {
         let (sender, receiver) = mpsc::channel(1);
         sender.try_send((ChannelId(1), ChannelMsg::Eof)).unwrap();
         let write_half = ChannelWriteHalf {
@@ -951,7 +1017,10 @@ mod tests {
 
         // A follow-up write can use the whole window.
         receiver.recv().await.unwrap();
-        write_half.data_bytes(Bytes::from(vec![2; 64])).await.unwrap();
+        write_half
+            .data_bytes(Bytes::from(vec![2; 64]))
+            .await
+            .unwrap();
         match receiver.recv().await.unwrap() {
             (ChannelId(7), ChannelMsg::Data { data }) => assert_eq!(data.len(), 64),
             msg => panic!("unexpected message: {msg:?}"),
@@ -977,11 +1046,17 @@ mod tests {
         assert_eq!(write_half.writable_packet_size().await, 58);
 
         // A shutdown after a pending write sends only EOF.
-        write_half.sender.try_send((ChannelId(1), ChannelMsg::Eof)).unwrap();
+        write_half
+            .sender
+            .try_send((ChannelId(1), ChannelMsg::Eof))
+            .unwrap();
         assert!(futures::poll!(Box::pin(writer.write(b"third"))).is_pending());
         receiver.recv().await.unwrap();
         writer.shutdown().await.unwrap();
-        assert!(matches!(receiver.recv().await.unwrap(), (ChannelId(7), ChannelMsg::Eof)));
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            (ChannelId(7), ChannelMsg::Eof)
+        ));
         assert_eq!(write_half.writable_packet_size().await, 58);
     }
 }

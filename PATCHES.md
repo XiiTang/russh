@@ -130,6 +130,83 @@ inbox rustfmt check also exit 0. Complete workspace verification, through
 Those complete suites had not run before review because a lane held the markers;
 the earlier selected-target runs were not complete-suite evidence.
 
+
+## Bounded client receive inboxes (W17c, Rule 11)
+
+The SSH receive window bounds DATA bytes, but the old inbox's control-count
+limit did not bound retained control storage or the number of tiny DATA
+entries. On unchanged `ac4ef620f9aa887b0966202990bf201dc8ca1226`, two 600 KiB
+controls and 129 one-byte DATA messages both passed admission. An exhausted
+control queue also waited behind application release fences and KEX before
+closing; its reader eventually saw only `None`.
+
+Public API: `client::Config::channel_inbox_limits: ChannelInboxLimits`, with
+`max_control_bytes` (default 1 MiB) and `max_entries` (default 128). Zero is an
+exact limit. The private `Inbox::send` checks both before push; all ordinary
+messages, including each nonempty DATA/EXTENDED_DATA, consume an entry. Empty
+DATA is still discarded. Control storage counts retained String/Vec capacities,
+including custom signals, PTY modes and unknown channel-open reasons, using
+checked sums/products. Exhaustive variant matches make new payloads require an
+accounting decision. DATA keeps its independent SSH window, packet and
+compression limits. The existing bounded application queues are unchanged.
+
+Exhaustion reserves `ChannelMsg::InboxLimitExceeded(InboxLimitExceeded)` in a
+fixed terminal slot outside the ordinary queue. The typed cause is
+`ControlBytes { limit }` or `Entries { limit }`. Accepted messages drain first,
+then exactly one terminal message, then the normal closed state. Nothing can
+be appended after it, including peer Close. Peer Close uses the same reserved
+last-slot discipline when it ends the channel first. Dropping the native
+sender cannot erase the terminal message. `AsyncRead` returns an `io::Error`
+containing the typed cause, and retains it for later reads/adapters.
+
+The engine immediately cancels the affected native channel through its owned
+close path, discarding unsent output and queuing one CLOSE. No handler callback
+is added, and a refused packet does not enter a handler. Cancellation precedes
+handler awaits, window/release fences and the KEX gate. The existing wire gate
+retains CLOSE until connection packets are legal after NEWKEYS. The session
+and siblings remain usable; ordinary release still follows its graceful fence.
+
+Source comparison: upstream russh `e5d80a0` uses bounded Tokio mpsc channel
+entries (`russh/src/channels/mod.rs`) and has no fork receive inbox. OpenSSH
+`26b1363` checks both retained bytes and overflow before buffer growth
+(`sshbuf.c::sshbuf_check_reserve`) and uses channel buffer maxima
+(`channels.c`). This patch follows that pre-insertion bound at the semantic
+queue owner; it adds no per-Vec allocation callback or timer.
+
+Regression evidence on macOS arm64, Rust 1.97.0, through `build-slot`,
+`CARGO_INCREMENTAL=0`:
+
+- `cargo +1.97.0 test -p russh --lib --locked -- w17c_`: before 101, both
+  growth regressions fail on unchanged production source; after included below.
+- `cargo +1.97.0 test -p russh --lib --locked -- w17c_exhaustion`: before 101,
+  both native cancellation tests fail on unchanged W4b production: the native
+  reference remains, behind either a queued EOF/window or active KEX.
+- `cargo +1.97.0 test -p russh --lib --locked -- w17c_
+  every_inbox_operation_preserves_the_poisoned_lock_panic
+  malformed_pty_req_truncated_modes_rejected_by_server`: after 0, 11 tests.
+  The two growth and two native-cancellation regressions now pass, alongside
+  exact terminal ordering, peer Close, storage refunds, zero caps and typed
+  stream errors retained across later adapters. Poison/panic-hook behavior
+  remains unchanged.
+- `cargo +1.97.0 test -p russh --locked --test inbox_limits`: after 0, 2 tests. The two peer cases await native close before draining the
+  affected inbox, then check the exact typed tail, live sibling and a fresh
+  channel on the same session. The initial fixture run reached these assertions
+  but exited 101 at cleanup; its join assertion now accepts the normal
+  Disconnect result, matching the existing completion fixture.
+- `cargo +1.97.0 clippy --all-targets --locked -- -D warnings`: 0.
+- `cargo +1.97.0 clippy --all-targets --all-features --locked -- -D warnings`: 0.
+- `cargo +1.97.0 fmt --all --check`: 0; explicit Rust 1.97 rustfmt checks of
+  the touched include-file modules also exit 0.
+- `cargo +1.97.0 test --workspace --locked`: 0, 332 passed, 8 ignored,
+  including doctests.
+- `cargo +1.97.0 test --workspace --locked --all-features`: 0, 333 passed,
+  8 ignored, including doctests. Both lane markers remain absent during these
+  complete runs.
+
+No lint exception is added. The W4b Boundless adapter and W17 coordinated
+cutover remain separate; compatibility uses a disposable prepared Boundless
+worktree with the GitHub URL and this local commit as its rev.
+
 ## 0.64.1 rebuild (#277)
 
 The upstream source at the revision above was compared with every old patch.
@@ -470,10 +547,12 @@ window gate, which leaves application output in the bounded queues while a
 channel is window-blocked; once the count reaches the fence and no key exchange
 runs, `Encrypted::close` queues CLOSE behind the channel's pending data. A
 sibling the peer's window holds back therefore holds the close back too, as
-upstream's ordered Close did, and the queues stay the memory bound. Only a
-managed channel's cancellation discards pending data. A control overflow closes
-the channel the same graceful way. The two ends differ in which channels this
-covers:
+upstream's ordered Close did, and the queues stay the memory bound. At this
+patch's original revision only managed cancellation discarded pending data;
+control overflow also used the graceful fence. W17c above supersedes that
+overflow behavior with immediate native cancellation and a typed inbox end.
+Ordinary release retains this fence. The two ends differ in which channels
+ordinary release covers:
 
 - A client closes every channel let go of. A dropped client channel already
   closed itself on this branch, and Boundless relies on it.
@@ -489,7 +568,6 @@ Run `cargo test -p russh --test channel_release`.
 the previous commit; `a_server_stream_let_go_closes_after_its_queued_data`
 keeps a server stream's close without the detached task. The `--lib` tests
 `a_channel_closing_behind_pending_data_still_credits_what_arrives`,
-`an_overflowed_channel_waiting_at_its_fence_still_credits_what_arrives`,
 `a_managed_channel_let_go_is_cancelled_though_its_holds_drop_first`,
 `releases_never_take_messages_past_a_blocked_siblings_window`,
 `a_release_during_kex_closes_after_it_behind_its_fixed_fence` and
@@ -498,7 +576,9 @@ close's edges: credit while CLOSE or the fence waits, a managed channel's guard 
 after its holds, repeated releases beside siblings held on both client queues
 (their pending data does not grow), a key exchange pausing the count, and a
 server stream registered after its wakeup. Upstream's
-`tests::channels::test_channel_streams` no longer fails intermittently.
+`tests::channels::test_channel_streams` no longer fails intermittently. W17c
+replaces the original overflow-at-a-fence test with its immediate-cancellation
+and KEX regressions; that old overflow expectation is no longer the rule.
 
 ## Nothing follows this side's CHANNEL_CLOSE
 

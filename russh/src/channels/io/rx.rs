@@ -1,7 +1,7 @@
 use std::borrow::BorrowMut;
 use std::io;
 use std::pin::Pin;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use tokio::io::AsyncRead;
 
@@ -38,7 +38,18 @@ where
             Some(msg) => msg,
             None => match ready!(self.channel.borrow_mut().poll_recv(cx)) {
                 Some(msg) => (msg, 0),
-                None => return Poll::Ready(Ok(())),
+                None => {
+                    let failure = self
+                        .channel
+                        .borrow_mut()
+                        .inbox
+                        .as_ref()
+                        .and_then(|inbox| inbox.failure());
+                    return Poll::Ready(match failure {
+                        Some(cause) => Err(io::Error::other(cause)),
+                        None => Ok(()),
+                    });
+                }
             },
         };
 
@@ -70,6 +81,9 @@ where
                 }
 
                 Poll::Ready(Ok(()))
+            }
+            (ChannelMsg::InboxLimitExceeded(cause), _) => {
+                Poll::Ready(Err(io::Error::other(*cause)))
             }
             (ChannelMsg::Eof, _) => {
                 self.channel.borrow_mut().close();

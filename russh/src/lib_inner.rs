@@ -61,7 +61,8 @@ macro_rules! push_packet {
 
 mod channels;
 pub use channels::{
-    Channel, ChannelMsg, ChannelReadHalf, ChannelStream, ChannelWriteHalf, ManagedChannel,
+    Channel, ChannelInboxLimits, ChannelMsg, ChannelReadHalf, ChannelStream, ChannelWriteHalf,
+    InboxLimitExceeded, ManagedChannel,
 };
 
 mod parsing;

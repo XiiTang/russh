@@ -506,6 +506,7 @@ pub struct Handle<H: Handler> {
     join: russh_util::runtime::JoinHandle<Result<(), H::Error>>,
     abort: futures::future::AbortHandle,
     channel_buffer_size: usize,
+    channel_inbox_limits: crate::ChannelInboxLimits,
 }
 
 impl<H: Handler> Drop for Handle<H> {
@@ -1160,9 +1161,9 @@ impl<H: Handler> Handle<H> {
     /// holds until confirmation. An untaken channel goes to its sink, or lets
     /// both holds go so the engine closes it.
     fn opening(&self, channel_ref: &mut ChannelRef) -> Opening {
-        let inbox = crate::channels::inbox::Inbox::new(
+        let inbox = crate::channels::inbox::Inbox::with_limits(
             self.managed_close.clone(),
-            self.channel_buffer_size,
+            self.channel_inbox_limits,
         );
         let (handles, reader, writer) =
             crate::channels::handles::Handles::new(self.managed_close.clone());
@@ -1817,6 +1818,7 @@ where
         );
     }
     let channel_buffer_size = config.channel_buffer_size;
+    let channel_inbox_limits = config.channel_inbox_limits;
     let mut session = Session::new(
         config.window_size,
         CommonSession {
@@ -1858,6 +1860,7 @@ where
             abort,
             join,
             channel_buffer_size,
+            channel_inbox_limits,
         }),
         kex_done: Some(kex_done_signal_rx),
         established: false,
@@ -2017,7 +2020,7 @@ impl Session {
                 crate::future_or_pending(self.rekey_time_remaining(), tokio::time::sleep);
             pin!(rekey_timer);
             tokio::select! {
-                () = managed_close.notified(), if !self.kex.active() => {
+                () = managed_close.notified() => {
                     self.close_released_channels()?;
                 }
                 r = &mut reading => {
@@ -2195,14 +2198,50 @@ impl Session {
         })
     }
 
-    /// The one place the engine closes a channel on the program's behalf. A
-    /// cancelled managed channel loses its unsent data and closes now. A
-    /// channel the program let go of, or whose controls overflowed, closes
-    /// gracefully: once the engine has taken, through its ordinary window
-    /// gate, every message the application queues held when it first saw the
-    /// release, and CLOSE then waits behind its pending data. A sibling the
-    /// peer's window holds back holds that close back too, as upstream.
+    /// Cancels through the engine's owned path: discard unsent output, enqueue
+    /// exactly one CLOSE, and retain encrypted parameters until the peer closes.
+    fn cancel_channel(&mut self, id: ChannelId) -> Result<(), crate::Error> {
+        if let Some(enc) = self.common.encrypted.as_mut() {
+            enc.cancel(id)?;
+        }
+        self.channels.remove(&id);
+        self.release_fences.remove(&id);
+        Ok(())
+    }
+
+    // Run before awaiting a packet handler, so the refused packet cannot hold
+    // the native close behind a handler, a peer window, or a release fence.
+    fn close_inbox_overflow(&mut self, id: ChannelId) -> Result<bool, crate::Error> {
+        if self
+            .channels
+            .get(&id)
+            .and_then(|channel| channel.inbox.as_ref())
+            .is_some_and(|inbox| inbox.overflowed())
+        {
+            self.cancel_channel(id)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Cancel exhausted inboxes before the KEX gate. Encrypted::flush retains
+    /// connection packets until NEWKEYS; native cancellation itself never waits.
+    /// Ordinary released channels keep their existing graceful queue fence.
     fn close_released_channels(&mut self) -> Result<(), crate::Error> {
+        let exhausted: Vec<_> = self
+            .channels
+            .iter()
+            .filter_map(|(id, channel)| {
+                channel
+                    .inbox
+                    .as_ref()
+                    .is_some_and(|inbox| inbox.overflowed())
+                    .then_some(*id)
+            })
+            .collect();
+        for id in exhausted {
+            self.cancel_channel(id)?;
+        }
         if self.kex.active() {
             return Ok(());
         }
@@ -2225,20 +2264,19 @@ impl Session {
                 .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
             {
                 cancelled.push(*id);
-            } else if channel.inbox.as_ref().is_some_and(|inbox| inbox.overflowed())
-                // A managed channel let go of is cancelled by its guard, which
-                // drops after its holds.
-                || (channel.managed_close.is_none()
-                    && channel.handles.as_ref().is_some_and(|handles| handles.released()))
+            // A managed channel let go of is cancelled by its guard, which
+            // drops after its holds.
+            } else if channel.managed_close.is_none()
+                && channel
+                    .handles
+                    .as_ref()
+                    .is_some_and(|handles| handles.released())
             {
                 released.push(*id);
             }
         }
         for id in cancelled {
-            if let Some(enc) = self.common.encrypted.as_mut() {
-                enc.cancel(id)?;
-            }
-            self.channels.remove(&id);
+            self.cancel_channel(id)?;
         }
         // A release is seen after everything its handles queued, so the
         // queues' lengths then cover it. The fence is never moved.
@@ -3342,12 +3380,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_overflowed_channel_waiting_at_its_fence_still_credits_what_arrives() {
+    async fn w17c_exhaustion_cancels_window_blocked_output_before_queued_commands() {
         let (mut session, sender, _replies) = keyboard_interactive_session();
         let channel = released_test_channel(&mut session, &sender, 0);
         let id = channel.id();
-        // The reader stays; the peer floods controls past the inbox limit while
-        // an EOF the program queued keeps the fence ahead.
+        session
+            .handle_msg(Msg::Channel(
+                id,
+                ChannelMsg::Data {
+                    data: bytes::Bytes::from_static(b"unsent"),
+                },
+            ))
+            .unwrap();
         sender.try_send(Msg::Channel(id, ChannelMsg::Eof)).unwrap();
         let inbox = session.channels[&id].inbox.clone().unwrap();
         while !inbox.overflowed() {
@@ -3356,21 +3400,75 @@ mod tests {
             });
         }
         session.close_released_channels().unwrap();
-        assert!(session.channels.contains_key(&id));
-        let mut packet = Vec::new();
-        msg::CHANNEL_DATA.encode(&mut packet).unwrap();
-        id.encode(&mut packet).unwrap();
-        [7u8; 64][..].encode(&mut packet).unwrap();
+        assert!(!session.channels.contains_key(&id));
+        assert!(!session.release_fences.contains_key(&id));
+        assert_eq!(
+            session.receiver.len(),
+            1,
+            "cap cancellation waited for a release fence"
+        );
+        let enc = session.common.encrypted.as_ref().unwrap();
+        assert!(enc.channels[&id].close_sent && enc.channels[&id].pending_data.is_empty());
+        let close = enc.write.clone();
+        assert_eq!(
+            close.len(),
+            9,
+            "native cancellation must enqueue one CLOSE only"
+        );
+        assert_eq!(close[4], msg::CHANNEL_CLOSE);
+        let queued = session.receiver.try_recv().unwrap();
+        session.handle_app_msg(AppQueue::Outbound, queued).unwrap();
         session
-            .process_packet(&mut TestHandler, &packet)
-            .await
+            .handle_msg(Msg::Channel(
+                id,
+                ChannelMsg::Data {
+                    data: bytes::Bytes::from_static(b"too late"),
+                },
+            ))
             .unwrap();
         session.close_released_channels().unwrap();
         assert_eq!(
-            session.common.encrypted.as_ref().unwrap().channels[&id].sender_window_size,
-            64
+            session.common.encrypted.as_ref().unwrap().write,
+            close,
+            "a frame followed CLOSE"
         );
+        let sibling = released_test_channel(&mut session, &sender, 64);
+        session
+            .handle_msg(Msg::Channel(
+                sibling.id(),
+                ChannelMsg::Data {
+                    data: bytes::Bytes::from_static(b"sibling"),
+                },
+            ))
+            .unwrap();
+        assert!(session.common.encrypted.as_ref().unwrap().write.len() > close.len());
         drop(channel);
+    }
+
+    #[tokio::test]
+    async fn w17c_exhaustion_cancels_during_kex_but_holds_close_until_newkeys() {
+        let (mut session, sender, _replies) = keyboard_interactive_session();
+        let channel = released_test_channel(&mut session, &sender, 64);
+        let id = channel.id();
+        session.common.encrypted.as_mut().unwrap().kex =
+            KEXES.get(&crate::kex::CURVE25519).unwrap().make();
+        session.handle_msg(Msg::Rekey).unwrap();
+        assert!(session.kex.active());
+        let inbox = session.channels[&id].inbox.clone().unwrap();
+        while !inbox.overflowed() {
+            let _ = inbox.send(ChannelMsg::Success);
+        }
+        session.close_released_channels().unwrap();
+        assert!(!session.channels.contains_key(&id));
+        let enc = session.common.encrypted.as_ref().unwrap();
+        assert!(enc.channels[&id].close_sent);
+        let close = enc.write.clone();
+        assert!(!close.is_empty());
+        session.flush().unwrap();
+        assert_eq!(session.common.encrypted.as_ref().unwrap().write, close);
+        session.kex = SessionKexState::Idle;
+        session.flush().unwrap();
+        assert!(session.common.encrypted.as_ref().unwrap().write.is_empty());
     }
 
     #[tokio::test]
@@ -3702,8 +3800,12 @@ pub struct Config {
     pub window_size: u32,
     /// The maximal size of a single packet.
     pub maximum_packet_size: u32,
-    /// Buffer size for each channel (a number of unprocessed messages to store before propagating backpressure to the TCP stream)
+    /// Capacity of the bounded per-channel application command/reply queues.
+    /// Client inbound delivery uses `channel_inbox_limits` and the SSH window.
     pub channel_buffer_size: usize,
+    /// Bounds each client's inbound queue before insertion. Zero is an exact
+    /// limit, and the terminal message always has its own fixed slot.
+    pub channel_inbox_limits: crate::ChannelInboxLimits,
     /// Lists of preferred algorithms.
     pub preferred: negotiation::Preferred,
     /// Time after which the connection is garbage-collected.
@@ -3733,6 +3835,7 @@ impl Default for Config {
             window_size: 2097152,
             maximum_packet_size: 32768,
             channel_buffer_size: 100,
+            channel_inbox_limits: Default::default(),
             preferred: Default::default(),
             inactivity_timeout: None,
             keepalive_interval: None,
