@@ -91,3 +91,46 @@ async fn unread_channel_keeps_sibling_and_keepalive_live_then_delivers_exact_tai
         server.await.unwrap().unwrap();
     }).await.unwrap();
 }
+
+struct WindowHandler(tokio::sync::mpsc::UnboundedSender<(russh::ChannelId, u32)>);
+impl russh::client::Handler for WindowHandler {
+    type Error = russh::Error;
+    async fn check_server_key(
+        &mut self,
+        _: &russh::keys::PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+    fn adjust_window(&mut self, channel: russh::ChannelId, window: u32) -> u32 {
+        let _ = self.0.send((channel, window));
+        window
+    }
+}
+
+#[tokio::test]
+async fn channel_window_notifications_and_the_receive_adjustment_hook_remain_reachable() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        use russh::keys::ssh_key::private::{Ed25519Keypair, Ed25519PrivateKey};
+        let key = russh::keys::PrivateKey::from(Ed25519Keypair::from(Ed25519PrivateKey::from_bytes(&[29;32])));
+        let (left, right) = tokio::io::duplex(65536);
+        let server = tokio::spawn(async move {
+            let config = server::Config { keys: vec![key], window_size: 64, maximum_packet_size: 32,
+                auth_rejection_time: Duration::ZERO, ..Default::default() };
+            server::run_stream(Arc::new(config), right, Peer).await.unwrap().await
+        });
+        let (adjusted, mut adjustments) = tokio::sync::mpsc::unbounded_channel();
+        let config = russh::client::Config { window_size: 64, maximum_packet_size: 32, ..Default::default() };
+        let mut client = russh::client::connect_stream(Arc::new(config), left, WindowHandler(adjusted)).await.unwrap();
+        assert!(client.authenticate_none("test").await.unwrap().success());
+        let mut channel = client.channel_open_session().await.unwrap();
+        let id = channel.id();
+        channel.exec(true, b"small".as_slice()).await.unwrap();
+        assert!(matches!(channel.wait().await, Some(ChannelMsg::Success)));
+        assert!(matches!(channel.wait().await, Some(ChannelMsg::Data { data }) if data.as_ref() == b"sibling"));
+        assert_eq!(adjustments.recv().await.unwrap(), (id, 64));
+        channel.data(&[1; 48][..]).await.unwrap();
+        assert!(matches!(channel.wait().await, Some(ChannelMsg::WindowAdjusted { new_size }) if new_size > 0));
+        client.disconnect(russh::Disconnect::ByApplication, "done", "").await.unwrap();
+        server.await.unwrap().unwrap();
+    }).await.unwrap();
+}

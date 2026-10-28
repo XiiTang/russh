@@ -497,3 +497,26 @@ integration tests pass (269 tests). Strict library/test Clippy remains blocked o
 unchanged baseline's six library lock unwraps and 760 library-test diagnostics;
 the same command fails on both revisions. No lint policy or unrelated code is
 changed. Detailed commands and results belong to the consuming change's report.
+
+## Restore upstream window notifications and adjustment hook (F9)
+
+Start from upstream e5d80a07 client/encrypted.rs WindowAdjusted try_send and
+client/mod.rs Handler::adjust_window / target_window_size behavior. The inbox
+patch changed the client's reader but left try_send routed to its unused mpsc
+receiver. ChannelRef now routes that same nonblocking call through the existing
+Inbox::send checkpoint, retaining upstream's mpsc try_send for legacy channels.
+The existing bounded-control overflow policy and send-credit wakeup remain.
+
+Restore upstream's target-window callback value/positive-return retention at
+actual consumed-credit replenishment. The necessary difference is its timing:
+the recorded receive-backpressure patch must return credit only after the
+application consumes bytes, never merely when a packet arrives. Therefore the
+hook runs when that consumed credit is advertised, using the same upstream
+callback block, rather than restoring arrival-based replenishment. The checked
+receive-window debit / invalid-peer overrun rejection is unchanged.
+`channel_window_notifications_and_the_receive_adjustment_hook_remain_reachable`
+uses a real client/server session and observes both the ChannelMsg and callback;
+the existing unread-channel/sibling and window-overrun tests retain backpressure.
+
+On macOS arm64 with consumer Rust 1.97.0, workspace tests, strict all-target
+workspace Clippy, and workspace formatting pass, using the consumer-pinned RSA.
