@@ -87,6 +87,7 @@ mod test;
 /// allows sending messages to the server.
 #[derive(Debug)]
 pub struct Session {
+    target_window_size: u32,
     kex: SessionKexState<ClientKex>,
     common: CommonSession<Arc<Config>>,
     receiver: Receiver<Msg>,
@@ -1480,7 +1481,7 @@ impl Session {
     }
 
     fn new(
-        _target_window_size: u32,
+        target_window_size: u32,
         common: CommonSession<Arc<Config>>,
         receiver: Receiver<Msg>,
         sender: UnboundedSender<Reply>,
@@ -1488,6 +1489,7 @@ impl Session {
         let (priority_sender, priority_receiver) = unbounded_channel();
         let (inbound_channel_sender, inbound_channel_receiver) = channel(10);
         Self {
+            target_window_size,
             common,
             receiver,
             sender,
@@ -1601,7 +1603,7 @@ impl Session {
             pin!(rekey_timer);
             tokio::select! {
                 () = managed_close.notified(), if !self.kex.active() => {
-                    self.close_released_channels()?;
+                    self.close_released_channels(|id, window| handler.adjust_window(id, window))?;
                 }
                 r = &mut reading => {
                     let (stream_read, mut buffer, mut opening_cipher) = match r {
@@ -1711,7 +1713,7 @@ impl Session {
                 }
             };
 
-            self.close_released_channels()?;
+            self.close_released_channels(|id, window| handler.adjust_window(id, window))?;
             self.flush()?;
             crate::flush_or_timeout(
                 &mut self.common.packet_writer,
@@ -1785,11 +1787,18 @@ impl Session {
     /// gate, every message the application queues held when it first saw the
     /// release, and CLOSE then waits behind its pending data. A sibling the
     /// peer's window holds back holds that close back too, as upstream.
-    fn close_released_channels(&mut self) -> Result<(), crate::Error> {
+    fn close_released_channels(&mut self, mut adjust_window: impl FnMut(ChannelId, u32) -> u32) -> Result<(), crate::Error> {
         if self.kex.active() { return Ok(()); }
         if let Some(enc) = self.common.encrypted.as_mut() {
             for (id, channel) in &self.channels {
-                if let Some(inbox) = &channel.inbox { enc.replenish_window(*id, inbox.take_consumed())?; }
+                if let Some(inbox) = &channel.inbox {
+                    let consumed = inbox.take_consumed();
+                    enc.replenish_window(*id, consumed)?;
+                    if consumed > 0 {
+                        let next_window = adjust_window(*id, self.target_window_size);
+                        if next_window > 0 { self.target_window_size = next_window; }
+                    }
+                }
             }
         }
         let mut cancelled = Vec::new();
@@ -2848,7 +2857,7 @@ mod tests {
             .handle_msg(Msg::Channel(id, ChannelMsg::Data { data: bytes::Bytes::from_static(b"unsent output") }))
             .unwrap();
         drop(channel);
-        session.close_released_channels().unwrap();
+        session.close_released_channels(|_, window| window).unwrap();
         let enc = session.common.encrypted.as_ref().unwrap();
         assert!(enc.channels[&id].pending_close && !enc.channels[&id].close_sent);
         let mut packet = Vec::new();
@@ -2871,14 +2880,14 @@ mod tests {
         while !inbox.overflowed() {
             let _ = inbox.send(ChannelMsg::XonXoff { client_can_do: false });
         }
-        session.close_released_channels().unwrap();
+        session.close_released_channels(|_, window| window).unwrap();
         assert!(session.channels.contains_key(&id));
         let mut packet = Vec::new();
         msg::CHANNEL_DATA.encode(&mut packet).unwrap();
         id.encode(&mut packet).unwrap();
         [7u8; 64][..].encode(&mut packet).unwrap();
         session.process_packet(&mut TestHandler, &packet).await.unwrap();
-        session.close_released_channels().unwrap();
+        session.close_released_channels(|_, window| window).unwrap();
         assert_eq!(session.common.encrypted.as_ref().unwrap().channels[&id].sender_window_size, 64);
         drop(channel);
     }
@@ -2896,9 +2905,9 @@ mod tests {
         // A managed channel drops its channel before its guard; the engine may
         // run between the two.
         drop(channel);
-        session.close_released_channels().unwrap();
+        session.close_released_channels(|_, window| window).unwrap();
         drop(guard);
-        session.close_released_channels().unwrap();
+        session.close_released_channels(|_, window| window).unwrap();
         let params = &session.common.encrypted.as_ref().unwrap().channels[&id];
         assert!(params.close_sent && params.pending_data.is_empty());
     }
@@ -2931,7 +2940,7 @@ mod tests {
             let released = released_test_channel(&mut session, &outbound, 32);
             let id = released.id();
             drop(released);
-            session.close_released_channels().unwrap();
+            session.close_released_channels(|_, window| window).unwrap();
             assert_eq!(pending_messages(&session, held.id()), 1);
             assert_eq!(pending_messages(&session, held_inbound.id()), 1);
             assert_eq!((session.receiver.len(), session.inbound_channel_receiver.len()), (2, 2));
@@ -2999,17 +3008,17 @@ mod tests {
         drop(channel);
         session.handle_msg(Msg::Rekey).unwrap();
         assert!(session.kex.active());
-        session.close_released_channels().unwrap();
+        session.close_released_channels(|_, window| window).unwrap();
         assert!(session.channels.contains_key(&id));
         // The exchange ends; the queue held the EOF when the release was seen.
         session.kex = SessionKexState::Idle;
-        session.close_released_channels().unwrap();
+        session.close_released_channels(|_, window| window).unwrap();
         assert!(session.channels.contains_key(&id));
         // A message queued after the release does not move the fence.
         sender.try_send(Msg::Channel(ChannelId(999), ChannelMsg::Eof)).unwrap();
         let eof = session.receiver.try_recv().unwrap();
         session.handle_app_msg(AppQueue::Outbound, eof).unwrap();
-        session.close_released_channels().unwrap();
+        session.close_released_channels(|_, window| window).unwrap();
         let enc = session.common.encrypted.as_ref().unwrap();
         assert!(enc.channels[&id].close_sent);
         assert_eq!(session.receiver.len(), 1);

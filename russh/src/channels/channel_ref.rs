@@ -21,6 +21,12 @@ impl ChannelRef {
     pub(crate) async fn send(&self, message: ChannelMsg) -> Result<(), tokio::sync::mpsc::error::SendError<ChannelMsg>> {
         match &self.inbox { Some(inbox) => inbox.send(message), None => self.sender.send(message).await }
     }
+    pub(crate) fn try_send(&self, message: ChannelMsg) -> Result<(), tokio::sync::mpsc::error::TrySendError<ChannelMsg>> {
+        match &self.inbox {
+            Some(inbox) => inbox.send(message).map_err(|error| tokio::sync::mpsc::error::TrySendError::Closed(error.0)),
+            None => self.sender.try_send(message),
+        }
+    }
     pub fn new(sender: Sender<ChannelMsg>) -> Self {
         Self {
             sender,
