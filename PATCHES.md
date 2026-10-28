@@ -520,3 +520,25 @@ the existing unread-channel/sibling and window-overrun tests retain backpressure
 
 On macOS arm64 with consumer Rust 1.97.0, workspace tests, strict all-target
 workspace Clippy, and workspace formatting pass, using the consumer-pinned RSA.
+
+## Preserve non-fatal informational credit refusal (review A R1)
+
+Starting from upstream e5d80a07 `client/encrypted.rs:748-755`, keep the
+informational `try_send` refusal when the receiver is full: delivery may be
+omitted, while the send-credit grant, writer wake and handler callback still
+happen. The necessary fork difference is routing to the actual bounded Inbox,
+whose `send` is the single admission checkpoint. At its control limit an
+informational WindowAdjusted is now refused without marking that inbox
+overflowed; other control overflow and checked receive-window debit stay.
+There is no recorded need for information loss to close a healthy channel.
+
+`unread_upload_credit_notifications_do_not_close_the_channel` uses a real SSH
+session with an unread reader, synchronizes each of 129 uploads with the
+client credit callback, then reads the retained notifications, executes a
+command, observes its output and uploads again. Against bdd1e3b4 it fails
+because that command's reader ends; with this correction it stays usable.
+
+On macOS arm64 with consumer Rust 1.97.0 and the pinned RSA, the complete
+workspace tests, strict all-target Clippy and fmt pass (exit 0). The real
+unread-upload regression passes alongside the notification/hook and unread
+receive-window regressions.
