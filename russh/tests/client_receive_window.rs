@@ -134,3 +134,90 @@ async fn channel_window_notifications_and_the_receive_adjustment_hook_remain_rea
         server.await.unwrap().unwrap();
     }).await.unwrap();
 }
+
+struct UploadCredits(tokio::sync::mpsc::UnboundedSender<()>);
+impl russh::client::Handler for UploadCredits {
+    type Error = russh::Error;
+    async fn check_server_key(
+        &mut self,
+        _: &russh::keys::PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+    async fn window_adjusted(
+        &mut self,
+        _: russh::ChannelId,
+        _: u32,
+        _: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        self.0.send(()).unwrap();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn unread_upload_credit_notifications_do_not_close_the_channel() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        use russh::keys::ssh_key::private::{Ed25519Keypair, Ed25519PrivateKey};
+        let key = russh::keys::PrivateKey::from(Ed25519Keypair::from(
+            Ed25519PrivateKey::from_bytes(&[39; 32]),
+        ));
+        let (left, right) = tokio::io::duplex(65536);
+        let server = tokio::spawn(async move {
+            let config = server::Config {
+                keys: vec![key],
+                window_size: 64,
+                maximum_packet_size: 32,
+                auth_rejection_time: Duration::ZERO,
+                ..Default::default()
+            };
+            server::run_stream(Arc::new(config), right, Peer)
+                .await
+                .unwrap()
+                .await
+        });
+        let (credited, mut credits) = tokio::sync::mpsc::unbounded_channel();
+        let config = russh::client::Config {
+            channel_buffer_size: 8,
+            ..Default::default()
+        };
+        let mut client =
+            russh::client::connect_stream(Arc::new(config), left, UploadCredits(credited))
+                .await
+                .unwrap();
+        assert!(client.authenticate_none("test").await.unwrap().success());
+        let mut channel = client.channel_open_session().await.unwrap();
+        // The reader stays unread. Each callback proves that the real session
+        // processed the peer's upload credit, including one beyond its 128 slots.
+        for _ in 0..129 {
+            channel.data(&[1; 48][..]).await.unwrap();
+            credits.recv().await.unwrap();
+        }
+        for _ in 0..128 {
+            assert!(matches!(
+                channel.wait().await,
+                Some(ChannelMsg::WindowAdjusted { .. })
+            ));
+        }
+        channel.exec(true, b"small".as_slice()).await.unwrap();
+        assert!(
+            matches!(channel.wait().await, Some(ChannelMsg::Success)),
+            "an informational refusal must leave the channel usable"
+        );
+        assert!(matches!(channel.wait().await,
+            Some(ChannelMsg::Data { data }) if data.as_ref() == b"sibling"));
+        channel.data(&[2; 48][..]).await.unwrap();
+        credits.recv().await.unwrap();
+        assert!(matches!(
+            channel.wait().await,
+            Some(ChannelMsg::WindowAdjusted { .. })
+        ));
+        client
+            .disconnect(russh::Disconnect::ByApplication, "done", "")
+            .await
+            .unwrap();
+        server.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+}

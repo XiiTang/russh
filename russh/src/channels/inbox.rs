@@ -74,6 +74,11 @@ impl Inbox {
                 return Ok(());
             }
             if state.controls == self.control_limit {
+                // Upstream drops a full-buffer informational notification.
+                // Credit was already granted and its writer already woken.
+                if matches!(message, ChannelMsg::WindowAdjusted { .. }) {
+                    return Err(tokio::sync::mpsc::error::SendError(message));
+                }
                 state.overflowed = true;
                 self.wake_session.notify_one();
                 if let Some(waker) = state.waker.take() {
