@@ -2056,6 +2056,7 @@ impl Session {
             unreachable!()
         };
         let channel_params = ChannelParams {
+            _handles: None,
             recipient_channel: msg.recipient_channel,
 
             // "sender" is the local end, i.e. we're the sender, the remote is the recipient.

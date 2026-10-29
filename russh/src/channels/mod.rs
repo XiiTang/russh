@@ -786,6 +786,16 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
     }
 }
 
+/// Client channel lifetime ownership is shared with its existing native holds.
+impl Channel<crate::client::Msg> {
+    /// Keep an admitted external owner through application release and native
+    /// retirement. Called once, before an incoming channel's acceptance.
+    pub fn retain_owner(&self, owner: Arc<dyn std::fmt::Debug + Send + Sync>) -> Result<(), crate::Error> {
+        self.write_half.hold.as_ref().ok_or(crate::Error::Inconsistent)?.retain(owner);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)] // Test assertions on fixture replies and bytes must fail on unexpected values.
@@ -996,3 +1006,4 @@ mod tests {
         assert_eq!(write_half.writable_packet_size().await, 58);
     }
 }
+

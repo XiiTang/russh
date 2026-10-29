@@ -855,7 +855,8 @@ impl Session {
                     return Err(crate::Error::Inconsistent.into());
                 };
 
-                let channel_params = ChannelParams {
+                let mut channel_params = ChannelParams {
+                    _handles: None,
                     recipient_channel: msg.recipient_channel,
                     sender_channel: id,
                     recipient_window_size: msg.recipient_window_size,
@@ -886,6 +887,8 @@ impl Session {
                 );
                 channel.read_half.inbox = Some(inbox.clone());
                 channel_ref.inbox = Some(inbox);
+
+                channel_params._handles = channel_ref.handles.clone();
 
                 let pending = crate::PendingChannelOpen {
                     recipient_channel: msg.recipient_channel,

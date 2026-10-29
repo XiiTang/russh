@@ -519,6 +519,7 @@ pub(crate) struct ChannelParams {
     pending_close: bool,
     close_sent: bool,
     close_received: bool,
+    _handles: Option<std::sync::Arc<crate::channels::handles::Handles>>,
 }
 
 impl ChannelParams {

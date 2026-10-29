@@ -903,10 +903,11 @@ impl<H: Handler> Handle<H> {
     /// A channel's receive queue and its handles' holds, attached to its
     /// engine reference before the OPEN is sent. Dropping the open before its
     /// confirmation lets both holds go, and the engine closes the channel.
-    fn opening(&self, channel_ref: &mut ChannelRef) -> Opening {
+    fn opening(&self, channel_ref: &mut ChannelRef, owner: Option<std::sync::Arc<dyn std::fmt::Debug + Send + Sync>>) -> Opening {
         let inbox = crate::channels::inbox::Inbox::new(self.managed_close.clone(), self.channel_buffer_size);
         let (handles, reader, writer) = crate::channels::handles::Handles::new(self.managed_close.clone());
         channel_ref.inbox = Some(inbox.clone());
+        if let Some(owner) = owner { handles.retain(owner); }
         channel_ref.handles = Some(handles);
         Opening { inbox, reader, writer }
     }
@@ -1020,10 +1021,15 @@ impl<H: Handler> Handle<H> {
     /// Open a cancellation-owned session channel. An abandoned OPEN is closed
     /// on confirmation; cancellation never waits behind window-blocked data.
     pub async fn channel_open_session_managed(&self) -> Result<crate::channels::ManagedChannel<Msg>, crate::Error> {
+        self.channel_open_session_managed_with_owner(None).await
+    }
+
+    /// Open with the same external owner retained until actual native retirement.
+    pub async fn channel_open_session_managed_with_owner(&self, owner: Option<std::sync::Arc<dyn std::fmt::Debug + Send + Sync>>) -> Result<crate::channels::ManagedChannel<Msg>, crate::Error> {
         let guard = crate::channels::managed::CloseGuard::new(self.managed_close.clone());
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
-        let opening = self.opening(&mut channel_ref);
+        let opening = self.opening(&mut channel_ref, owner);
         channel_ref.managed_close = Some(guard.flag.clone());
         let window_size_ref = channel_ref.window_size().clone();
         self.sender.send(Msg::ChannelOpenSession { channel_ref }).await.map_err(|_|crate::Error::SendError)?;
@@ -1032,9 +1038,14 @@ impl<H: Handler> Handle<H> {
     }
 
     pub async fn channel_open_session(&self) -> Result<Channel<Msg>, crate::Error> {
+        self.channel_open_session_with_owner(None).await
+    }
+
+    /// Open with the same external owner retained until actual native retirement.
+    pub async fn channel_open_session_with_owner(&self, owner: Option<std::sync::Arc<dyn std::fmt::Debug + Send + Sync>>) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
-        let opening = self.opening(&mut channel_ref);
+        let opening = self.opening(&mut channel_ref, owner);
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -1053,7 +1064,7 @@ impl<H: Handler> Handle<H> {
     ) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
-        let opening = self.opening(&mut channel_ref);
+        let opening = self.opening(&mut channel_ref, None);
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -1083,9 +1094,21 @@ impl<H: Handler> Handle<H> {
         originator_address: B,
         originator_port: u32,
     ) -> Result<Channel<Msg>, crate::Error> {
+        self.channel_open_direct_tcpip_with_owner(host_to_connect, port_to_connect, originator_address, originator_port, None).await
+    }
+
+    /// Open with the same external owner retained until actual native retirement.
+    pub async fn channel_open_direct_tcpip_with_owner<A: Into<String>, B: Into<String>>(
+        &self,
+        host_to_connect: A,
+        port_to_connect: u32,
+        originator_address: B,
+        originator_port: u32,
+        owner: Option<std::sync::Arc<dyn std::fmt::Debug + Send + Sync>>,
+    ) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
-        let opening = self.opening(&mut channel_ref);
+        let opening = self.opening(&mut channel_ref, owner);
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -1106,9 +1129,18 @@ impl<H: Handler> Handle<H> {
         &self,
         socket_path: S,
     ) -> Result<Channel<Msg>, crate::Error> {
+        self.channel_open_direct_streamlocal_with_owner(socket_path, None).await
+    }
+
+    /// Open with the same external owner retained until actual native retirement.
+    pub async fn channel_open_direct_streamlocal_with_owner<S: Into<String>>(
+        &self,
+        socket_path: S,
+        owner: Option<std::sync::Arc<dyn std::fmt::Debug + Send + Sync>>,
+    ) -> Result<Channel<Msg>, crate::Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let mut channel_ref = ChannelRef::new(sender);
-        let opening = self.opening(&mut channel_ref);
+        let opening = self.opening(&mut channel_ref, owner);
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -1834,6 +1866,14 @@ impl Session {
         })
     }
 
+    fn register_channel(&mut self, id: ChannelId, channel: ChannelRef) -> Result<(), crate::Error> {
+        self.common.encrypted.as_mut().ok_or(crate::Error::Inconsistent)?
+            .channels.get_mut(&id).ok_or(crate::Error::Inconsistent)?
+            ._handles = channel.handles.clone();
+        self.channels.insert(id, channel);
+        Ok(())
+    }
+
     /// The one place the engine closes a channel on the program's behalf. A
     /// cancelled managed channel loses its unsent data and closes now. A
     /// channel the program let go of, or whose controls overflowed, closes
@@ -1959,7 +1999,7 @@ impl Session {
             }
             Msg::ChannelOpenSession { channel_ref } => {
                 let id = self.channel_open_session()?;
-                self.channels.insert(id, channel_ref);
+                self.register_channel(id, channel_ref)?;
             }
             Msg::ChannelOpenX11 {
                 originator_address,
@@ -1967,7 +2007,7 @@ impl Session {
                 channel_ref,
             } => {
                 let id = self.channel_open_x11(&originator_address, originator_port)?;
-                self.channels.insert(id, channel_ref);
+                self.register_channel(id, channel_ref)?;
             }
             Msg::ChannelOpenDirectTcpIp {
                 host_to_connect,
@@ -1982,14 +2022,14 @@ impl Session {
                     &originator_address,
                     originator_port,
                 )?;
-                self.channels.insert(id, channel_ref);
+                self.register_channel(id, channel_ref)?;
             }
             Msg::ChannelOpenDirectStreamLocal {
                 socket_path,
                 channel_ref,
             } => {
                 let id = self.channel_open_direct_streamlocal(&socket_path)?;
-                self.channels.insert(id, channel_ref);
+                self.register_channel(id, channel_ref)?;
             }
             Msg::TcpIpForward {
                 reply_channel,
@@ -2925,8 +2965,36 @@ mod tests {
         let inbox = crate::channels::inbox::Inbox::new(session.managed_close.clone(), 2);
         channel.read_half.inbox = Some(inbox.clone());
         reference.inbox = Some(inbox);
-        session.channels.insert(id, reference);
+        session.register_channel(id, reference).unwrap();
         channel
+    }
+
+    #[tokio::test]
+    async fn a_released_stream_keeps_its_owner_through_the_fence_and_native_pending_data() {
+        let (mut session, sender, _replies) = keyboard_interactive_session();
+        let channel = released_test_channel(&mut session, &sender, 0);
+        let id = channel.id();
+        let owner = Arc::new(());
+        let retired = Arc::downgrade(&owner);
+        channel.retain_owner(owner).unwrap();
+        session.handle_msg(Msg::Channel(id, ChannelMsg::Data {
+            data: bytes::Bytes::from_static(b"queued native work"),
+        })).unwrap();
+        sender.try_send(Msg::Channel(id, ChannelMsg::Eof)).unwrap();
+        drop(channel.into_stream());
+        session.close_released_channels(|_, window| window).unwrap();
+        assert!(session.channels.contains_key(&id));
+        assert!(retired.upgrade().is_some());
+        let msg = session.receiver.recv().await.unwrap();
+        session.handle_app_msg(AppQueue::Outbound, msg).unwrap();
+        session.close_released_channels(|_, window| window).unwrap();
+        assert!(!session.channels.contains_key(&id));
+        let enc = session.common.encrypted.as_mut().unwrap();
+        assert!(enc.channels[&id].pending_close);
+        assert!(retired.upgrade().is_some());
+        enc.receive_close(id).unwrap();
+        assert!(!enc.channels.contains_key(&id));
+        assert!(retired.upgrade().is_none());
     }
 
     #[tokio::test]

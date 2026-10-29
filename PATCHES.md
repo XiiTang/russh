@@ -604,3 +604,28 @@ the consuming task's explicit 30 GiB stop rule. No push or boundless fast-forwar
 Pinned-toolchain formatting recheck (2026-10-29, macOS arm64):
 `RUSTUP_TOOLCHAIN=1.97.0 build-slot cargo fmt --all --check` exited 0
 on source tip `e1336ac9f42debb5f5f557aadbd1a3dcfff4165a`. No source changed for this recheck.
+
+
+## External channel ownership through native retirement (W17a)
+
+Upstream and the existing fork keep unconfirmed OPEN entries and release channels
+through the native queue fence, pending data and CLOSE handshake. An application
+waiter/stream is not that entry: dropping it cannot release an external admitted
+block while those native owners remain. Optional external ownership now attaches
+once to the existing channel holds before an outgoing OPEN is queued, or before
+an incoming channel is accepted. The same holds live in the encrypted channel
+parameters, after their pending data, as well as in the engine reference and
+application halves. No new cap, cleanup reservation, scheduling or cancellation
+policy is introduced. Existing callers without an external owner keep their API.
+
+Source precedent: OpenSSH channels.c::channel_garbage_collect (2711) releases
+only after nchan.c::chan_is_dead (333); channel_input_open_failure (3767) marks
+an opening channel dead. Envoy source/common/conn_pool/conn_pool_base.cc (934-947)
+counts the ActiveClient until releaseResourcesBase, independent of its waiters.
+
+The native regression
+client::tests::a_released_stream_keeps_its_owner_through_the_fence_and_native_pending_data
+uses an actual ChannelStream release, a queued application message and native
+pending data. The external owner remains through both tables and is dropped
+only at native retirement. Boundless's held-OPEN bounded-account fixture covers
+abandonment before confirmation through the real adapter and native opening.
