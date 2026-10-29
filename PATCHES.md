@@ -571,3 +571,32 @@ typed maximum once and EOF. The ChannelRx effect test reads accepted stream
 bytes then the actual typed io::Error. Existing client_receive_window tests
 exercise real notification/callback, unread upload and sibling/keepalive credit.
 No test asserts the removed fatal informational-notification policy.
+
+
+Validation of source tip e1336ac9f42debb5f5f557aadbd1a3dcfff4165a on macOS
+Darwin 27.2.0 arm64 / Rust 1.97.0, all through build-slot. The consumer mode is
+`--no-default-features --features ring,rsa,flate2`; Cargo's local patch pins RSA
+ d8a034bbb784b8922efa4b37b71bf592b8103761. Put `--config` after the external
+Clippy subcommand so it is forwarded to its Cargo check (a config before Clippy
+alone did not retain that patch).
+
+| cargo arguments, with that local RSA config | Exit / result |
+| --- | --- |
+| test -p russh --lib channels::inbox::tests:: | 0; 2 tests, default features |
+| test -p russh --lib channels::io::rx::tests:: --locked | 0; 1 test, default features |
+| test -p russh --test client_receive_window --locked | 0; 3 tests, default features |
+| test -p russh --no-default-features --features ring,rsa,flate2 --lib channels::inbox::tests:: --locked | 0; 2 tests |
+| test -p russh --no-default-features --features ring,rsa,flate2 --lib channels::io::rx::tests:: --locked | 0; 1 test |
+| test -p russh --no-default-features --features ring,rsa,flate2 --test client_receive_window --locked | 0; 3 tests |
+| test -p russh --no-default-features --features ring,rsa,flate2 --lib an_overflowed_channel_waiting_at_its_fence_still_credits_what_arrives --locked | 0; 1 test |
+| clippy -p russh --lib --tests -- -D warnings | 0; pinned RSA, default features |
+| clippy -p russh --no-default-features --features ring,rsa,flate2 --lib --tests --locked -- -D warnings | 0; pinned RSA, consumer features |
+| fmt --all --check | Not started: disk-preflight runner exit 70 at 29 GiB free |
+
+An earlier locked Clippy attempt exited 101 because its ignored local lock
+needed resolution; the first nonlocked/default rerun resolved registry RSA.
+The corrected invocation after the subcommand resolved the consumer-pinned Git
+RSA and passed strict Clippy; the locked consumer-feature result above is the
+relevant integration check. No manifest patch/configuration or Cargo.lock is
+committed. Formatting and complete Boundless integration remain pending under
+the consuming task's explicit 30 GiB stop rule. No push or boundless fast-forward.
