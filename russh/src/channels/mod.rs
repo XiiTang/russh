@@ -19,6 +19,15 @@ pub use channel_stream::ChannelStream;
 pub(crate) mod managed;
 pub use managed::ManagedChannel;
 
+/// The existing required-control inbox bound was exceeded. Optional window
+/// credit notifications do not produce this terminal report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("SSH channel inbox controls exceeded the maximum of {maximum}")]
+pub struct ChannelInboxOverflow {
+    /// The selected existing control count, including its native minimum.
+    pub maximum: usize,
+}
+
 #[derive(Debug)]
 #[non_exhaustive]
 /// Possible messages that [Channel::wait] can receive.
@@ -122,6 +131,9 @@ pub enum ChannelMsg {
     /// (server only)
     Failure,
     OpenFailure(ChannelOpenFailure),
+    /// The inbox's required controls exceeded its existing bound. Reported
+    /// once after messages already accepted into the inbox, before input ends.
+    InboxOverflow(ChannelInboxOverflow),
 }
 
 /// The credit a channel's writers may still hand to the session: the peer's
