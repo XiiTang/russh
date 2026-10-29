@@ -17,6 +17,7 @@ pub(crate) struct Handles {
     writer_released: AtomicBool,
     streamed: AtomicBool,
     wake: Arc<Notify>,
+    retained: std::sync::OnceLock<Arc<dyn std::fmt::Debug + Send + Sync>>,
 }
 
 impl Handles {
@@ -28,12 +29,18 @@ impl Handles {
             writer_released: AtomicBool::new(false),
             streamed: AtomicBool::new(false),
             wake,
+            retained: std::sync::OnceLock::new(),
         });
         (
             handles.clone(),
             ReaderHold(handles.clone()),
             Arc::new(WriterHold(handles)),
         )
+    }
+
+    /// Attach an external owner once; every native and application hold shares it.
+    pub(crate) fn retain(&self, owner: Arc<dyn std::fmt::Debug + Send + Sync>) {
+        assert!(self.retained.set(owner).is_ok(), "a channel owner is fixed once");
     }
 
     /// Whether the program let both directions go. A hold is released after
@@ -70,6 +77,10 @@ impl Drop for ReaderHold {
 pub(crate) struct WriterHold(Arc<Handles>);
 
 impl WriterHold {
+    pub(crate) fn retain(&self, owner: Arc<dyn std::fmt::Debug + Send + Sync>) {
+        self.0.retain(owner);
+    }
+
     pub(crate) fn mark_streamed(&self) {
         self.0.streamed.store(true, Ordering::Release);
     }

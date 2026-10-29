@@ -879,6 +879,7 @@ impl Encrypted {
                 self.channels.entry(ChannelId(self.last_channel_id.0))
             {
                 vacant_entry.insert(ChannelParams {
+                    _handles: None,
                     recipient_channel: 0,
                     sender_channel: ChannelId(self.last_channel_id.0),
                     sender_window_size: window_size,
@@ -1011,6 +1012,7 @@ mod tests {
         pending_close: bool,
     ) -> ChannelParams {
         ChannelParams {
+            _handles: None,
             recipient_channel,
             sender_channel,
             recipient_window_size: 1024,
@@ -1067,6 +1069,7 @@ mod tests {
         pending_close: bool,
     ) -> ChannelParams {
         ChannelParams {
+            _handles: None,
             recipient_channel,
             sender_channel,
             recipient_window_size: window_size,
