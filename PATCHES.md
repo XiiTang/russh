@@ -608,9 +608,10 @@ on source tip `e1336ac9f42debb5f5f557aadbd1a3dcfff4165a`. No source changed for 
 
 ## External channel ownership through native retirement (W17a)
 
-Upstream and the existing fork keep unconfirmed OPEN entries and release channels
-through the native queue fence, pending data and CLOSE handshake. An application
-waiter/stream is not that entry: dropping it cannot release an external admitted
+Upstream `e5d80a07` registers OPENs in its native channel tables and keeps native
+channel state independently of the application OPEN waiter. The existing Boundless
+fork adds the queue-fence and managed-release policy around pending data and CLOSE.
+An application waiter/stream is not that entry: dropping it cannot release an external admitted
 block while those native owners remain. Optional external ownership now attaches
 once to the existing channel holds before an outgoing OPEN is queued, or before
 an incoming channel is accepted. The same holds live in the encrypted channel
