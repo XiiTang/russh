@@ -542,3 +542,32 @@ On macOS arm64 with consumer Rust 1.97.0 and the pinned RSA, the complete
 workspace tests, strict all-target Clippy and fmt pass (exit 0). The real
 unread-upload regression passes alongside the notification/hook and unread
 receive-window regressions.
+
+
+## W17c2: type the existing required-control inbox overflow
+
+Base d74984cdc61cd8cd82c3010754c490dafb9d14a0 already preserves upstream
+ e5d80a07's optional WindowAdjusted notification refusal: native credit and
+writer wake happen before try_send, and the callback still runs. Keep that
+behavior, the existing control count/minimum, SSH DATA window, consumed-credit
+accounting, close release fence and KEX scheduling. No new limit, byte counter,
+raw-sender restriction, cancellation or cap-driven early close is added.
+
+The observed failure is `Inbox::poll_recv` turning a latched required-control
+overflow into EOF, and ChannelRx ignoring a terminal message through its
+wildcard. `Inbox::send` remains the one count-admission checkpoint; the private
+latched state produces a single `ChannelMsg::InboxOverflow` tail outside the
+queue, after accepted messages and before EOF. The public immutable
+`ChannelInboxOverflow { maximum }` is Error/Display. ChannelRx explicitly carries
+it in io::Error; ChannelStream delegates to that reader. Later CLOSE/sender Drop
+cannot replace this latch. Upstream's channel notification queue does not supply
+this typed overflow; ordinary upstream EOF and the pin's close/fence ownership
+remain unchanged. Only the already required failure is made observable.
+
+Focused consumer-pinned Rust 1.97.0 / macOS Darwin 27.2.0 arm64 regressions,
+through build-slot, are being completed on this branch. The new private Inbox
+checkpoint test asserts accepted controls, nonfatal excess WindowAdjusted,
+typed maximum once and EOF. The ChannelRx effect test reads accepted stream
+bytes then the actual typed io::Error. Existing client_receive_window tests
+exercise real notification/callback, unread upload and sibling/keepalive credit.
+No test asserts the removed fatal informational-notification policy.

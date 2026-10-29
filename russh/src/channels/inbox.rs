@@ -18,6 +18,7 @@ struct State {
     closed: bool,
     reader_closed: bool,
     overflowed: bool,
+    overflow_reported: bool,
     waker: Option<Waker>,
 }
 #[derive(Debug)]
@@ -48,6 +49,7 @@ impl Inbox {
                 closed: false,
                 reader_closed: false,
                 overflowed: false,
+                overflow_reported: false,
                 waker: None,
             }),
             wake_session,
@@ -106,6 +108,12 @@ impl Inbox {
             }
             return Poll::Ready(Some(message));
         }
+        if state.overflowed && !state.overflow_reported {
+            state.overflow_reported = true;
+            return Poll::Ready(Some(ChannelMsg::InboxOverflow(crate::ChannelInboxOverflow {
+                maximum: self.control_limit,
+            })));
+        }
         if state.closed || state.reader_closed || state.overflowed {
             return Poll::Ready(None);
         }
@@ -150,6 +158,24 @@ mod tests {
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
     use std::task::Wake;
+
+    #[test]
+    fn required_control_overflow_reports_the_typed_tail_once() {
+        let inbox = Inbox::new(Arc::new(Notify::new()), 1);
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..128 { assert!(inbox.send(ChannelMsg::Success).is_ok()); }
+        // Upstream's optional notification refusal keeps all credit/callback
+        // behavior and does not end the native channel.
+        assert!(inbox.send(ChannelMsg::WindowAdjusted { new_size: 42 }).is_err());
+        assert!(!inbox.overflowed());
+        assert!(inbox.send(ChannelMsg::Failure).is_err());
+        inbox.close_sender();
+        assert!(inbox.send(ChannelMsg::Close).is_err());
+        for _ in 0..128 { assert!(matches!(inbox.poll_recv(&mut cx), Poll::Ready(Some(ChannelMsg::Success)))); }
+        assert!(matches!(inbox.poll_recv(&mut cx), Poll::Ready(Some(ChannelMsg::InboxOverflow(crate::ChannelInboxOverflow { maximum: 128 })))));
+        assert!(matches!(inbox.poll_recv(&mut cx), Poll::Ready(None)));
+        assert!(matches!(inbox.poll_recv(&mut cx), Poll::Ready(None)));
+    }
 
     struct PanickingWake;
 
