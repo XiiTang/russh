@@ -600,3 +600,7 @@ RSA and passed strict Clippy; the locked consumer-feature result above is the
 relevant integration check. No manifest patch/configuration or Cargo.lock is
 committed. Formatting and complete Boundless integration remain pending under
 the consuming task's explicit 30 GiB stop rule. No push or boundless fast-forward.
+
+Pinned-toolchain formatting recheck (2026-10-29, macOS arm64):
+`RUSTUP_TOOLCHAIN=1.97.0 build-slot cargo fmt --all --check` exited 0
+on source tip `e1336ac9f42debb5f5f557aadbd1a3dcfff4165a`. No source changed for this recheck.
