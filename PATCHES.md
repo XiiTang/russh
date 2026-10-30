@@ -6,6 +6,36 @@ Retain upstream history and licenses; keep application behavior outside this
 fork. Keep a patch only while upstream lacks the behavior, and run its
 regression and Boundless's SSH tests before moving the pin.
 
+## Correlated channel refusals and complete authentication facts (W4b/W5-D3)
+
+Upstream v0.64.1 decodes CHANNEL_OPEN_FAILURE description/language in both
+client and server roles, but the existing per-channel inbox and returned Error
+carry only the outgoing reason enum. Concurrent opens lose their own fields.
+Carry raw reason_code, description and language in RemoteChannelOpenFailureInfo
+through that same inbox and Error. Keep outgoing rejection APIs, existing
+handler callback, channel custody and retirement behavior. No last-error slot
+or completion framework is added.
+
+Upstream converts USERAUTH_FAILURE's NameList to MethodSet before publication,
+filtering unknown names. A default no-op Handler::auth_failure receives complete
+decoded names/partial-success before filtering and the existing reply. Keep
+selection, receiver lifetime and interruption behavior. The existing provider
+callback already exposes GSSAPI_ERROR; it needs no native patch.
+
+Export MAXIMUM_INCOMING_PACKET_LEN as an alias of the existing enforced
+transport/decompressed bound for prepaid required reply data. No new packet
+limit, formula or outgoing restriction is introduced.
+
+The three w1d3_ library regressions drive client decode through its original
+inbox/confirmation reader (concurrent opens, reverse replies, different/empty
+text/languages and an unknown raw code), the server decoder's original inbox,
+and complete USERAUTH_FAILURE hook facts before the typed reply is read.
+They and strict library/test Clippy pass with ring/rsa/flate2 and no default
+features. Interrupted-authentication and Boundless integration regressions
+remain required before publication. The optional partial formatter could not
+start on this host because the installed nightly lacks librustc_driver;
+this is not recorded as a formatting pass.
+
 ## Strict Rust 1.97 Clippy and receive-inbox lock invariants (#340)
 
 The six receive-inbox locks now use the private `Inbox::state` accessor.

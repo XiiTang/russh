@@ -144,16 +144,20 @@ impl Session {
                         Some((&msg::USERAUTH_FAILURE, mut r)) => {
                             debug!("userauth_failure");
 
-                            let remaining_methods: MethodSet =
-                                (&map_err!(NameList::decode(&mut r))?).into();
+                            let methods = map_err!(NameList::decode(&mut r))?;
                             let partial_success = map_err!(u8::decode(&mut r))? != 0;
                             map_err!(ensure_end(&r))?;
+                            client.auth_failure(&methods.0, partial_success, self).await?;
+                            let remaining_methods: MethodSet = (&methods).into();
                             debug!(
                                 "remaining methods {remaining_methods:?}, partial success {partial_success:?}"
                             );
-                            auth_request.methods = remaining_methods.clone();
-
-                            let no_more_methods = auth_request.methods.is_empty();
+                            if let Some(enc) = self.common.encrypted.as_mut()
+                                && let EncryptedState::WaitingAuthRequest(auth_request) = &mut enc.state
+                            {
+                                auth_request.methods = remaining_methods.clone();
+                            }
+                            let no_more_methods = remaining_methods.is_empty();
                             self.common.auth_method = None;
                             self.sender
                                 .send(Reply::AuthFailure {
@@ -575,7 +579,8 @@ impl Session {
             Some((&msg::CHANNEL_OPEN_FAILURE, mut r)) => {
                 debug!("channel_open_failure");
                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
-                let reason_code = ChannelOpenFailure::from_u32(map_err!(u32::decode(&mut r))?)
+                let raw_reason = map_err!(u32::decode(&mut r))?;
+                let reason_code = ChannelOpenFailure::from_u32(raw_reason)
                     .unwrap_or(ChannelOpenFailure::AdministrativelyProhibited);
                 let descr = map_err!(String::decode(&mut r))?;
                 let language = map_err!(String::decode(&mut r))?;
@@ -594,7 +599,11 @@ impl Session {
 
                 if let Some(sender) = self.channels.remove(&channel_num) {
                     let _ = sender
-                        .send(ChannelMsg::OpenFailure(reason_code.clone()))
+                        .send(ChannelMsg::OpenFailure(crate::RemoteChannelOpenFailureInfo {
+                            reason_code: raw_reason,
+                            description: descr.clone(),
+                            language: language.clone(),
+                        }))
                         .await;
                 }
 

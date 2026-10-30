@@ -761,6 +761,27 @@ mod tests {
         channel
     }
 
+    #[tokio::test]
+    #[allow(clippy::panic)] // An unexpected decoded reply must fail this native regression.
+    async fn w1d3_server_open_failure_keeps_the_peer_fields_in_its_original_inbox() {
+        let mut session = test_authenticated_session();
+        let id = insert_unconfirmed_server_open(&mut session);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        session.channels.insert(id, crate::channels::ChannelRef::new(sender));
+        let mut packet = vec![msg::CHANNEL_OPEN_FAILURE];
+        id.encode(&mut packet).unwrap();
+        91u32.encode(&mut packet).unwrap();
+        "server-initiated channel denied".encode(&mut packet).unwrap();
+        "de".encode(&mut packet).unwrap();
+        session.process_packet(&mut ChannelCallbackProbe::default(), &packet).await.unwrap();
+        let Some(ChannelMsg::OpenFailure(info)) = receiver.recv().await else {
+            panic!("expected the correlated OPEN refusal");
+        };
+        assert_eq!(info.reason_code, 91);
+        assert_eq!(info.description, "server-initiated channel denied");
+        assert_eq!(info.language, "de");
+    }
+
     fn publickey_probe_packet(user: &str, public_key: &PublicKey) -> Vec<u8> {
         publickey_probe_packet_as(user, public_key, public_key.algorithm().as_str())
     }
@@ -1947,8 +1968,7 @@ impl Session {
             msg::CHANNEL_OPEN_FAILURE => {
                 debug!("channel_open_failure");
                 let channel_num = map_err!(ChannelId::decode(r))?;
-                let reason = ChannelOpenFailure::from_u32(map_err!(u32::decode(r))?)
-                    .unwrap_or(ChannelOpenFailure::AdministrativelyProhibited);
+                let reason_code = map_err!(u32::decode(r))?;
                 let description = map_err!(String::decode(r))?;
                 let language_tag = map_err!(String::decode(r))?;
                 map_err!(ensure_end(r))?;
@@ -1962,7 +1982,11 @@ impl Session {
 
                 if let Some(channel_sender) = self.channels.remove(&channel_num) {
                     channel_sender
-                        .send(ChannelMsg::OpenFailure(reason))
+                        .send(ChannelMsg::OpenFailure(crate::RemoteChannelOpenFailureInfo {
+                            reason_code,
+                            description,
+                            language: language_tag,
+                        }))
                         .await
                         .map_err(|_| crate::Error::SendError)?;
                 }

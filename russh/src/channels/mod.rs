@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Notify;
 
-use crate::{ChannelId, ChannelOpenFailure, Error, Pty, Sig};
+use crate::{ChannelId, Error, Pty, Sig};
 
 pub mod io;
 
@@ -130,7 +130,7 @@ pub enum ChannelMsg {
     Success,
     /// (server only)
     Failure,
-    OpenFailure(ChannelOpenFailure),
+    OpenFailure(crate::RemoteChannelOpenFailureInfo),
     /// The inbox's required controls exceeded its existing bound. Reported
     /// once after messages already accepted into the inbox, before input ends.
     InboxOverflow(ChannelInboxOverflow),
