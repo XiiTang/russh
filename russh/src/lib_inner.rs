@@ -151,7 +151,7 @@ pub enum Error {
 
     /// Server refused to open a channel.
     #[error("Failed to open channel ({0:?})")]
-    ChannelOpenFailure(ChannelOpenFailure),
+    ChannelOpenFailure(RemoteChannelOpenFailureInfo),
 
     /// Disconnected
     #[error("Disconnected")]
@@ -408,6 +408,20 @@ impl Sig {
             x => Sig::Custom(x.to_string()),
         }
     }
+}
+
+/// The existing enforced transport and decompressed incoming packet bound.
+pub const MAXIMUM_INCOMING_PACKET_LEN: usize = cipher::MAXIMUM_DECOMPRESSED_PACKET_LEN;
+
+/// The peer's fields from the failure of one correlated channel OPEN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteChannelOpenFailureInfo {
+    /// The unmodified SSH reason code, including extension codes.
+    pub reason_code: u32,
+    /// The peer's description, including an empty description.
+    pub description: String,
+    /// The peer's language tag, including an empty tag.
+    pub language: String,
 }
 
 /// Reason for not being able to open a channel.

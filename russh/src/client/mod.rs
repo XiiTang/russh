@@ -2502,6 +2502,81 @@ mod tests {
         (session, sender, reply_receiver)
     }
 
+    #[tokio::test]
+    #[allow(clippy::panic)] // An unexpected decoded reply must fail this native regression.
+    async fn w1d3_correlated_open_failures_keep_all_peer_fields_through_confirmation() {
+        let (mut session, sender, receiver) = keyboard_interactive_session();
+        session.common.encrypted.as_mut().unwrap().state = EncryptedState::Authenticated;
+        let (abort, _) = futures::future::AbortHandle::new_pair();
+        let handle = Handle::<TestHandler> {
+            managed_close: Arc::new(tokio::sync::Notify::new()),
+            sender,
+            receiver,
+            join: russh_util::runtime::spawn(async { Ok(()) }),
+            abort,
+            channel_buffer_size: 8,
+        };
+        let mut pending = Vec::new();
+        for _ in 0..2 {
+            let id = session.common.encrypted.as_mut().unwrap().new_channel(65536, 32768);
+            let (sender, receiver) = channel(8);
+            let mut native = ChannelRef::new(sender);
+            let opening = handle.opening(&mut native, None);
+            let window = native.window_size().clone();
+            session.channels.insert(id, native);
+            pending.push((id, receiver, opening, window));
+        }
+        for (index, (id, _, _, _)) in pending.iter().enumerate().rev() {
+            let mut packet = vec![crate::msg::CHANNEL_OPEN_FAILURE];
+            id.encode(&mut packet).unwrap();
+            (if index == 0 { 2u32 } else { 9876u32 }).encode(&mut packet).unwrap();
+            (if index == 0 { "peer route refused" } else { "" }).encode(&mut packet).unwrap();
+            (if index == 0 { "fr" } else { "" }).encode(&mut packet).unwrap();
+            session.process_packet(&mut TestHandler, &packet).await.unwrap();
+        }
+        for (index, (_, receiver, opening, window)) in pending.into_iter().enumerate() {
+            let result = handle.wait_channel_confirmation(receiver, opening, window).await;
+            let Err(crate::Error::ChannelOpenFailure(info)) = result else {
+                panic!("expected the correlated OPEN refusal");
+            };
+            assert_eq!(info.reason_code, if index == 0 { 2 } else { 9876 });
+            assert_eq!(info.description, if index == 0 { "peer route refused" } else { "" });
+            assert_eq!(info.language, if index == 0 { "fr" } else { "" });
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::panic)] // An unexpected decoded reply must fail this native regression.
+    async fn w1d3_auth_failure_hook_keeps_unknown_names_before_the_reply() {
+        struct Taking {
+            heard: Option<(Vec<String>, bool)>,
+        }
+        impl Handler for Taking {
+            type Error = crate::Error;
+            async fn auth_failure(
+                &mut self,
+                methods: &[String],
+                partial_success: bool,
+                _: &mut Session,
+            ) -> Result<(), Self::Error> {
+                self.heard = Some((methods.to_vec(), partial_success));
+                Ok(())
+            }
+        }
+        let (mut session, _sender, mut replies) = keyboard_interactive_session();
+        let mut packet = vec![crate::msg::USERAUTH_FAILURE];
+        "unknown@peer,password".encode(&mut packet).unwrap();
+        1u8.encode(&mut packet).unwrap();
+        let mut handler = Taking { heard: None };
+        session.process_packet(&mut handler, &packet).await.unwrap();
+        assert_eq!(handler.heard, Some((vec!["unknown@peer".into(), "password".into()], true)));
+        let Reply::AuthFailure { proceed_with_methods, partial_success } = replies.try_recv().unwrap() else {
+            panic!("expected USERAUTH_FAILURE");
+        };
+        assert!(partial_success);
+        assert_eq!(&*proceed_with_methods, &[crate::MethodKind::Password]);
+    }
+
     const HOSTKEYS_SESSION_ID: &[u8] = b"hostkeys-session-id";
 
     /// An authenticated session with one outstanding `hostkeys-prove-00` request.
@@ -3303,6 +3378,18 @@ impl Default for Config {
 #[cfg_attr(feature = "async-trait", async_trait::async_trait)]
 pub trait Handler: Sized + Send {
     type Error: From<crate::Error> + Send + core::fmt::Debug;
+
+    /// The complete USERAUTH_FAILURE method list, before known-method filtering
+    /// and before the corresponding authentication result becomes visible.
+    #[allow(unused_variables)]
+    fn auth_failure(
+        &mut self,
+        remaining_methods: &[String],
+        partial_success: bool,
+        session: &mut Session,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async { Ok(()) }
+    }
 
     /// Called when the server sends us an authentication banner. This
     /// is usually meant to be shown to the user, see
