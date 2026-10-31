@@ -32,7 +32,7 @@ implementations add no separate production mechanism.
 | Interrupted authentication | Keep `recv_auth_reply` returning Disconnect instead of a fabricated refusal; upstream still returns empty-method Failure on closed reply streams. Preserve 0.65's new SignFailed/abandon_sign_request behavior in both signing paths. Adapt the new upstream signer fixture to the fork's existing From<Error> contract. | `auth_session_end`; upstream `auth_signer_failure` | 6be5385 |
 | Channel reply consumption | Keep final `Handler::channel_reply` replacement for the old ordering-only hook; upstream always queues replies for the reader, even after the handler answers them. | `channel_reply` | c43f884 |
 | Owned pre-Handle establishment | Adapt `PendingSession::establish` to carry 0.65's optional AgentSessionBinding into the same Handle after key exchange. Preserve cancellation, joined-result and error paths; upstream's normal connect path still supplies the same binding. | `owned_establishment`; upstream `test_agent_session_bind` | 419548f, 9309c9c |
-| Strict Rust 1.97 / poisoned inbox | Keep existing private Inbox::state assertion and test/example lint repairs. Upstream has no fork inbox, so supplies no equivalent poison invariant or strict regression coverage. New server-fixture signatures use 0.65 PublicKeyOffer/VerifiedPublicKey, preserving their assertions. | inbox poison library test; `russh-config::tests::expand_home`; strict Clippy | 422bdb6, f1c9710; 0.65 fixture adaptation |
+| Strict Rust 1.97 / poisoned inbox | Keep existing private Inbox::state assertion and test/example lint repairs. Upstream has no fork inbox, so supplies no equivalent poison invariant or strict regression coverage. New server-fixture signatures use 0.65 PublicKeyOffer/VerifiedPublicKey, preserving their assertions. | inbox poison library test; `russh-config::tests::expand_home`; strict Clippy | 422bdb6, f1c9710, 9309c9c, 34a6027 |
 | Window notifications and adjustment hook | Keep actual Inbox routing and the upstream hook at consumed-credit advertisement; upstream's try_send still targets its own mpsc and replenishes on arrival. | `client_receive_window::channel_window_notifications_and_the_receive_adjustment_hook_remain_reachable` | 6d4a4c8 |
 | Optional notification refusal | Keep refusal of excess informational WindowAdjusted nonfatal, as upstream try_send does, without changing credit or callbacks. | `client_receive_window::unread_upload_credit_notifications_do_not_close_the_channel` | d2602bc |
 | Required-control overflow tail | Keep one typed terminal tail through Inbox::poll_recv and ChannelRx; upstream has no fork control queue or overflow fact. | inbox admission and ChannelRx typed-error library tests | 8e2d425 |
@@ -50,9 +50,10 @@ body (69e4b55, pageant 0.2.5). No Boundless-side duplicate check is added.
 The previous fork already refused zero-sized writer chunks, but the new parser
 check rejects the invalid declaration before channel state is installed.
 
-Upstream's new pre-auth keepalive rearming, wasm rekey handling, certificate
-nesting check, RSA agent flags and agent session binding remain intact. No
-cancellation, timeout, retry, close or error behavior from 0.65 is dropped.
+Upstream's new pre-auth keepalive rearming, wasm rekey handling, RSA agent
+flags and agent session binding remain intact. The certificate nesting limit
+is retained with the structural correction documented below. No cancellation,
+timeout, retry, close or error behavior from 0.65 is dropped.
 The old pinned history is retained through ours merges without moving either
 published/default branch. Local boundless was behind the consuming pin, so the
 consuming pin is also retained explicitly; the landing owner publishes later.
@@ -60,7 +61,8 @@ consuming pin is also retained explicitly; the landing owner publishes later.
 Validation on macOS arm64 / Rust 1.97.0, CARGO_INCREMENTAL unset:
 
 - `cargo +1.97.0 test -p russh --lib --tests --no-default-features --features ring,rsa,flate2`:
-  exit 0, 293 tests, covering every named russh regression above, the new
+  exit 0, initially 293 tests and then 294 with the certificate regression,
+  covering every named russh regression above, the new
   EXT_INFO/zero-packet/agent-constraint tests and the upstream signer/binding/
   window-adjust tests. The fixtures use registry RSA 0.10.0-rc.18, as upstream
   expects. The first consumer-RSA run exited 101: seven RSA signing/agent
@@ -74,10 +76,46 @@ Validation on macOS arm64 / Rust 1.97.0, CARGO_INCREMENTAL unset:
   upstream `test_keepalive_before_auth` fixture's field_reassign_with_default
   warning. Its initializer and the upstream signer fixture's initializer now
   set the same fields in their Config literal; no behavior or assertion changes.
-  The workspace all-targets reruns in both feature modes are required below.
+  `cargo +1.97.0 clippy --workspace --all-targets --locked -- -D warnings`
+  and the same command with `--no-default-features --features ring,rsa,flate2`
+  now both exit 0. The new certificate unit setup propagates its errors through
+  Result rather than adding unwraps under the library's strict lint rules.
 - `cargo +1.97.0 fmt --all --check`: exit 0.
 
 No Windows Pageant runtime validation is claimed on this host.
+
+## Certificate nesting counts structure, not opaque key IDs (#416)
+
+Upstream 0.65 commit `730d663` adds `keys::key::check_cert_nesting` before raw
+network key/certificate decoding. It counts every `-cert-v01@` substring in the
+blob and refuses more than eight, to stop ssh-key's unbounded recursive
+`Certificate::signature_key` decoding. A valid signed shallow certificate whose
+key_id contains eight such strings consequently fails SSH host validation:
+one real algorithm plus eight opaque strings exceeds that heuristic limit.
+The unit regression first decoded and verified the signature with ssh-key,
+then failed at the unchanged guard on the rebuilt branch (exit 101).
+
+Keep the same private check point, callers, limit and depth error. Walk only
+actual signature_key fields iteratively, using `Algorithm::new_certificate`
+(including custom names), nonrecursive `KeyData::decode_as` for the subject
+key, and ssh-encoding's length-prefixed reads for opaque fields. This follows
+ssh-key 0.7.0-rc.11's `Certificate::decode_as` layout without recursing. Normal
+decoding and signature validation still follow the guard; none of the guard's
+network entry points can bypass it. Retire this patch when upstream counts
+structural depth or ssh-key bounds its own recursive decode.
+
+`keys::key::test::certificate_key_id_markers_do_not_count_as_nesting` now
+passes for the signed shallow certificate and public certificate decode.
+`deeply_nested_certificate_is_rejected` accepts eight actual levels, refuses
+nine, and retains the original 2,848-level attack through both certificate
+and public-key entry points. Both focused unit tests exit 0 on macOS arm64 /
+Rust 1.97.0. The existing `test_server_cert` fixtures also carry eight marker
+strings in their key_id so the real host-certificate handshake exercises this
+compatibility rule, including its RSA and authority/validity controls.
+The complete russh library/integration suite exits 0 (294 tests), including
+all five host-certificate tests. Workspace all-targets strict Clippy exits 0
+in default and Boundless feature modes; cargo fmt and direct key.rs rustfmt
+checks exit 0. No test assertion or production depth refusal is weakened.
 
 ## Correlated channel refusals and complete authentication facts (W4b/W5-D3)
 
