@@ -73,10 +73,12 @@ fn random_key() -> Arc<PrivateKey> {
 }
 
 async fn connect() -> client::Handle<AcceptServerKey> {
-    let mut server_config = server::Config::default();
-    server_config.inactivity_timeout = None;
-    server_config.auth_rejection_time = Duration::from_millis(1);
-    server_config.auth_rejection_time_initial = Some(Duration::from_millis(1));
+    let mut server_config = server::Config {
+        inactivity_timeout: None,
+        auth_rejection_time: Duration::from_millis(1),
+        auth_rejection_time_initial: Some(Duration::from_millis(1)),
+        ..Default::default()
+    };
     server_config
         .keys
         .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());

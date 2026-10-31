@@ -75,8 +75,10 @@ async fn connect_unauthenticated(
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<Result<(), russh::Error>>,
 ) {
-    let mut server_config = server::Config::default();
-    server_config.inactivity_timeout = None;
+    let mut server_config = server::Config {
+        inactivity_timeout: None,
+        ..Default::default()
+    };
     server_config.keys.push(
         PrivateKey::random(&mut rand::rng(), russh::keys::ssh_key::Algorithm::Ed25519).unwrap(),
     );

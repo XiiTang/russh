@@ -14,30 +14,31 @@ older sections retain their original reproduction and historical validation.
 Documentation commits, peer-join corrections and replaced intermediate hook
 implementations add no separate production mechanism.
 
-| Patch / observed failure it prevents | Upstream 0.65 source and disposition | Retained regression |
-| --- | --- | --- |
-| Explicit password change | Keep `client::Handle`/`Session::write_auth_request_if_needed`: upstream still offers only the old-password exchange and does not publish a replacement prompt. | `client::encrypted::tests::password_change_encodes_only_an_explicit_replacement`; password prompt library tests |
-| Cancellation-owned channels | Keep engine-owned `channels::managed`; upstream `channels/io/mod.rs::ChannelStream::drop` still spawns an unowned close. | `managed_channels` |
-| Receive credit / unread sibling stalls | Keep `channels::inbox` and consumption-driven replenishment; upstream `client/encrypted.rs` still replenishes DATA credit on arrival and awaits application delivery. | `client_receive_window` |
-| Channel close state | Keep `session::sendable` and sent/received CLOSE state; upstream `Encrypted::eof` and request writers still accept a channel until removal. | session close-state library tests |
-| Channel-open reply result | Keep the existing accept/reject send result in `ChannelOpenHandleInner`; upstream discards it. Adapt the new upstream window-adjust fixture's accept call. | `managed_channels::a_reply_after_its_session_ended_returns_the_send_failure` |
-| Malformed forward success | Keep the native `client/encrypted.rs` reply decoder's error; upstream still turns malformed success into rejection. | `raw_no_crypto::an_undecodable_forward_success_ends_the_session` |
-| Establishment cancellation | Keep stop/join custody through `PendingSession`; upstream `connect_stream` still spawns before awaiting key exchange without a retained abort owner. | `cancelled_establishment` |
-| Handle stop | Keep the existing AbortHandle beside the join; upstream Handle cannot request cancellation while retaining its result. | `stopped_session` (signing held at an explicit barrier; 0.65 abandons refused signatures) |
-| Graceful channel release and release edges | Keep engine queue fences and ownership through pending data; upstream still queues close from a detached stream-drop task. Preserve its rule that a bare server Channel need not close when dropped. | `channel_release`; release-edge library tests |
-| Fixed queue fence / blocked sibling | Keep the existing event-loop window gate and fixed accepted-message fence; do not drain more application data around that gate. Upstream ordered close remains ordered behind queued data. | blocked-sibling/fence/KEX library tests |
-| No message after CLOSE | Keep `session::sendable` across EOF, requests, adjustment and pending replay; upstream has no sent-CLOSE refusal there. | `nothing_follows_this_sides_close`; `no_request_follows_this_sides_close` |
-| Writer credit at queue admission | Keep `SendCredit::admit`, `charge`, `grant`. Upstream #790 now adds WINDOW_ADJUST credit, so retain that corrected behavior through `grant`; it still debits writer credit before queue admission and has no difference-based repeated-confirmation accounting. No parallel upstream `grow` remains. | cancelled/pending write, window-adjust and repeated-confirmation library tests; upstream `test_window_adjust` |
-| Disconnect observation | Keep handler publication before returning socket shutdown failure; upstream `Session::run` still uses `shutdown().await?` before the callback. Preserve upstream shutdown result and pre-handshake handling. | `disconnect_reason` |
-| Interrupted authentication | Keep `recv_auth_reply` returning Disconnect instead of a fabricated refusal; upstream still returns empty-method Failure on closed reply streams. Preserve 0.65's new SignFailed/abandon_sign_request behavior in both signing paths. Adapt the new upstream signer fixture to the fork's existing From<Error> contract. | `auth_session_end`; upstream `auth_signer_failure` |
-| Channel reply consumption | Keep final `Handler::channel_reply` replacement for the old ordering-only hook; upstream always queues replies for the reader, even after the handler answers them. | `channel_reply` |
-| Owned pre-Handle establishment | Adapt `PendingSession::establish` to carry 0.65's optional AgentSessionBinding into the same Handle after key exchange. Preserve cancellation, joined-result and error paths; upstream's normal connect path still supplies the same binding. | `owned_establishment`; upstream `test_agent_session_bind` |
-| Strict Rust 1.97 / poisoned inbox | Keep existing private Inbox::state assertion and test/example lint repairs. Upstream has no fork inbox, so supplies no equivalent poison invariant or strict regression coverage. New server-fixture signatures use 0.65 PublicKeyOffer/VerifiedPublicKey, preserving their assertions. | inbox poison library test; `russh-config::tests::expand_home`; strict Clippy |
-| Window notifications and adjustment hook | Keep actual Inbox routing and the upstream hook at consumed-credit advertisement; upstream's try_send still targets its own mpsc and replenishes on arrival. | `client_receive_window::channel_window_notifications_and_the_receive_adjustment_hook_remain_reachable` |
-| Optional notification refusal | Keep refusal of excess informational WindowAdjusted nonfatal, as upstream try_send does, without changing credit or callbacks. | `client_receive_window::unread_upload_credit_notifications_do_not_close_the_channel` |
-| Required-control overflow tail | Keep one typed terminal tail through Inbox::poll_recv and ChannelRx; upstream has no fork control queue or overflow fact. | inbox admission and ChannelRx typed-error library tests |
-| External ownership through retirement | Keep existing channel holds through the native entry, release fence and pending output; upstream has no external admitted owner. | `client::tests::a_released_stream_keeps_its_owner_through_the_fence_and_native_pending_data` |
-| Correlated refusals and auth facts | Keep complete CHANNEL_OPEN_FAILURE fields in the original inbox and Error, auth_failure before method filtering, and the alias of the existing packet bound; upstream still loses those received fields. | three `w1d3_` library tests |
+| Patch / observed failure it prevents | Upstream 0.65 source and disposition | Retained regression | Rebuilt commit(s) |
+| --- | --- | --- | --- |
+| Explicit password change | Keep `client::Handle`/`Session::write_auth_request_if_needed`: upstream still offers only the old-password exchange and does not publish a replacement prompt. | `client::encrypted::tests::password_change_encodes_only_an_explicit_replacement`; password prompt library tests | d606b90 |
+| Cancellation-owned channels | Keep engine-owned `channels::managed`; upstream `channels/io/mod.rs::ChannelStream::drop` still spawns an unowned close. | `managed_channels` | 9c628a3 |
+| Receive credit / unread sibling stalls | Keep `channels::inbox` and consumption-driven replenishment; upstream `client/encrypted.rs` still replenishes DATA credit on arrival and awaits application delivery. | `client_receive_window` | 96dc9ec |
+| Channel close state | Keep `session::sendable` and sent/received CLOSE state; upstream `Encrypted::eof` and request writers still accept a channel until removal. | session close-state library tests | 0b4c7f5 |
+| Channel-open reply result | Keep the existing accept/reject send result in `ChannelOpenHandleInner`; upstream discards it. Adapt the new upstream window-adjust fixture's accept call. | `managed_channels::a_reply_after_its_session_ended_returns_the_send_failure` | 0b1b252 |
+| Malformed forward success | Keep the native `client/encrypted.rs` reply decoder's error; upstream still turns malformed success into rejection. | `raw_no_crypto::an_undecodable_forward_success_ends_the_session` | 4bcbb7d |
+| Establishment cancellation | Keep stop/join custody through `PendingSession`; upstream `connect_stream` still spawns before awaiting key exchange without a retained abort owner. | `cancelled_establishment` | 285e5c2 |
+| Handle stop | Keep the existing AbortHandle beside the join; upstream Handle cannot request cancellation while retaining its result. | `stopped_session` (signing held at an explicit barrier; 0.65 abandons refused signatures) | fb68e32 |
+| Graceful channel release and release edges | Keep engine queue fences and ownership through pending data; upstream still queues close from a detached stream-drop task. Preserve its rule that a bare server Channel need not close when dropped. | `channel_release`; release-edge library tests | 2ebba3c, 52aa39a |
+| Fixed queue fence / blocked sibling | Keep the existing event-loop window gate and fixed accepted-message fence; do not drain more application data around that gate. Upstream ordered close remains ordered behind queued data. | blocked-sibling/fence/KEX library tests | 43b5059 |
+| No message after CLOSE | Keep `session::sendable` across EOF, requests, adjustment and pending replay; upstream has no sent-CLOSE refusal there. | `nothing_follows_this_sides_close`; `no_request_follows_this_sides_close` | b9c5b0d |
+| Writer credit at queue admission | Keep `SendCredit::admit`, `charge`, `grant`. Upstream #790 now adds WINDOW_ADJUST credit, so retain that corrected behavior through `grant`; it still debits writer credit before queue admission and has no difference-based repeated-confirmation accounting. No parallel upstream `grow` remains. | cancelled/pending write, window-adjust and repeated-confirmation library tests; upstream `test_window_adjust` | 11dff59 |
+| Disconnect observation | Keep handler publication before returning socket shutdown failure; upstream `Session::run` still uses `shutdown().await?` before the callback. Preserve upstream shutdown result and pre-handshake handling. | `disconnect_reason` | 3e80707 |
+| Interrupted authentication | Keep `recv_auth_reply` returning Disconnect instead of a fabricated refusal; upstream still returns empty-method Failure on closed reply streams. Preserve 0.65's new SignFailed/abandon_sign_request behavior in both signing paths. Adapt the new upstream signer fixture to the fork's existing From<Error> contract. | `auth_session_end`; upstream `auth_signer_failure` | 6be5385 |
+| Channel reply consumption | Keep final `Handler::channel_reply` replacement for the old ordering-only hook; upstream always queues replies for the reader, even after the handler answers them. | `channel_reply` | c43f884 |
+| Owned pre-Handle establishment | Adapt `PendingSession::establish` to carry 0.65's optional AgentSessionBinding into the same Handle after key exchange. Preserve cancellation, joined-result and error paths; upstream's normal connect path still supplies the same binding. | `owned_establishment`; upstream `test_agent_session_bind` | 419548f, 9309c9c |
+| Strict Rust 1.97 / poisoned inbox | Keep existing private Inbox::state assertion and test/example lint repairs. Upstream has no fork inbox, so supplies no equivalent poison invariant or strict regression coverage. New server-fixture signatures use 0.65 PublicKeyOffer/VerifiedPublicKey, preserving their assertions. | inbox poison library test; `russh-config::tests::expand_home`; strict Clippy | 422bdb6, f1c9710; 0.65 fixture adaptation |
+| Window notifications and adjustment hook | Keep actual Inbox routing and the upstream hook at consumed-credit advertisement; upstream's try_send still targets its own mpsc and replenishes on arrival. | `client_receive_window::channel_window_notifications_and_the_receive_adjustment_hook_remain_reachable` | 6d4a4c8 |
+| Optional notification refusal | Keep refusal of excess informational WindowAdjusted nonfatal, as upstream try_send does, without changing credit or callbacks. | `client_receive_window::unread_upload_credit_notifications_do_not_close_the_channel` | d2602bc |
+| Required-control overflow tail | Keep one typed terminal tail through Inbox::poll_recv and ChannelRx; upstream has no fork control queue or overflow fact. | inbox admission and ChannelRx typed-error library tests | 8e2d425 |
+| External ownership through retirement | Keep existing channel holds through the native entry, release fence and pending output; upstream has no external admitted owner. | `client::tests::a_released_stream_keeps_its_owner_through_the_fence_and_native_pending_data` | 90749b1 |
+| Correlated refusals and auth facts | Keep complete CHANNEL_OPEN_FAILURE fields in the original inbox and Error, auth_failure before method filtering, and the alias of the existing packet bound; upstream still loses those received fields. | three `w1d3_` library tests | 20a807f |
+
 
 The release supplies its security fixes unchanged at their native checkpoints:
 `client::Session::handle_ext_info` refuses a third EXT_INFO (b33e93b);
@@ -69,9 +70,11 @@ Validation on macOS arm64 / Rust 1.97.0, CARGO_INCREMENTAL unset:
 - `cargo +1.97.0 test -p russh-config --lib --locked -- tests::expand_home --exact`:
   exit 0, one test.
 - `cargo +1.97.0 clippy -p russh --lib --no-default-features --features ring,rsa,flate2 --locked -- -D warnings`:
-  exit 0. The additional all-targets command exits 101 at the new upstream
-  `test_keepalive_before_auth` fixture's field_reassign_with_default warning;
-  that file is byte-for-byte the release's source, and is not changed here.
+  exit 0. The first additional all-targets command exited 101 at the new
+  upstream `test_keepalive_before_auth` fixture's field_reassign_with_default
+  warning. Its initializer and the upstream signer fixture's initializer now
+  set the same fields in their Config literal; no behavior or assertion changes.
+  The workspace all-targets reruns in both feature modes are required below.
 - `cargo +1.97.0 fmt --all --check`: exit 0.
 
 No Windows Pageant runtime validation is claimed on this host.
