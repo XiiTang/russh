@@ -52,7 +52,7 @@ impl server::Handler for Peer {
     async fn auth_publickey(
         &mut self,
         _: &str,
-        _: &ssh_key::PublicKey,
+        _: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<server::Auth, Self::Error> {
         self.answers.fetch_add(1, Ordering::SeqCst);
         Ok(server::Auth::reject())
@@ -128,24 +128,12 @@ impl Fixture {
     }
 }
 
-#[derive(Debug)]
-enum SignError {
-    Refused,
-    Session,
+struct HoldSigning {
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-impl From<russh::Error> for SignError {
-    fn from(_: russh::Error) -> Self {
-        Self::Session
-    }
-}
-
-struct RefuseToSign {
-    called: bool,
-}
-
-impl russh::Signer for RefuseToSign {
-    type Error = SignError;
+impl russh::Signer for HoldSigning {
+    type Error = russh::Error;
 
     async fn auth_sign(
         &mut self,
@@ -153,8 +141,10 @@ impl russh::Signer for RefuseToSign {
         _: Option<ssh_key::HashAlg>,
         _: Vec<u8>,
     ) -> Result<Vec<u8>, Self::Error> {
-        self.called = true;
-        Err(SignError::Refused)
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.send(());
+        }
+        std::future::pending().await
     }
 }
 
@@ -183,19 +173,23 @@ async fn stop_ends_a_session_waiting_for_keyboard_interactive_answers() {
 async fn stop_ends_a_session_waiting_for_a_publickey_signature() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let mut fixture = Fixture::connect().await;
-        let mut signer = RefuseToSign { called: false };
-        let result = fixture
-            .handle
-            .authenticate_publickey_with(
-                "test-user",
-                key(73).public_key().clone(),
-                None,
-                &mut signer,
-            )
-            .await;
-        // A signer error sends no Signed message, leaving the native receive parked.
-        assert!(signer.called);
-        assert!(matches!(result, Err(SignError::Refused)));
+        let (entered, signing) = tokio::sync::oneshot::channel();
+        let mut signer = HoldSigning {
+            entered: Some(entered),
+        };
+        let mut authentication = Box::pin(fixture.handle.authenticate_publickey_with(
+            "test-user",
+            key(73).public_key().clone(),
+            None,
+            &mut signer,
+        ));
+        // 0.65 abandons a refused signature. Hold the signer instead, so no
+        // Signed or SignFailed is sent before the owner stops the session.
+        tokio::select! {
+            result = &mut authentication => panic!("signing unexpectedly ended: {result:?}"),
+            result = signing => result.unwrap(),
+        }
+        drop(authentication);
         fixture.stop_and_read().await;
     })
     .await
@@ -206,7 +200,10 @@ async fn stop_ends_a_session_waiting_for_a_publickey_signature() {
 async fn stop_ends_a_session_waiting_for_a_certificate_signature() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let mut fixture = Fixture::connect().await;
-        let mut signer = RefuseToSign { called: false };
+        let (entered, signing) = tokio::sync::oneshot::channel();
+        let mut signer = HoldSigning {
+            entered: Some(entered),
+        };
         let user_key = key(74);
         let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
             &mut rand::rng(),
@@ -221,12 +218,17 @@ async fn stop_ends_a_session_waiting_for_a_certificate_signature() {
         builder.key_id("stop-regression").unwrap();
         builder.valid_principal("test-user").unwrap();
         let certificate = builder.sign(&key(75)).unwrap();
-        let result = fixture
-            .handle
-            .authenticate_certificate_with("test-user", certificate, None, &mut signer)
-            .await;
-        assert!(signer.called);
-        assert!(matches!(result, Err(SignError::Refused)));
+        let mut authentication = Box::pin(fixture.handle.authenticate_certificate_with(
+            "test-user",
+            certificate,
+            None,
+            &mut signer,
+        ));
+        tokio::select! {
+            result = &mut authentication => panic!("signing unexpectedly ended: {result:?}"),
+            result = signing => result.unwrap(),
+        }
+        drop(authentication);
         fixture.stop_and_read().await;
     })
     .await

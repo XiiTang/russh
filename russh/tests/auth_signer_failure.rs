@@ -34,7 +34,7 @@ impl server::Handler for AcceptAnyKeyServer {
     async fn auth_publickey(
         &mut self,
         _user: &str,
-        _public_key: &ssh_key::PublicKey,
+        _public_key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<server::Auth, Self::Error> {
         Ok(server::Auth::Accept)
     }
@@ -43,12 +43,12 @@ impl server::Handler for AcceptAnyKeyServer {
 #[derive(Debug)]
 enum NoSignature {
     Refused,
-    Send(russh::SendError),
+    Session,
 }
 
-impl From<russh::SendError> for NoSignature {
-    fn from(e: russh::SendError) -> Self {
-        Self::Send(e)
+impl From<russh::Error> for NoSignature {
+    fn from(_: russh::Error) -> Self {
+        Self::Session
     }
 }
 

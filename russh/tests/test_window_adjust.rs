@@ -109,7 +109,7 @@ impl server::Handler for Server {
     async fn auth_publickey(
         &mut self,
         _: &str,
-        _: &ssh_key::PublicKey,
+        _: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         Ok(Auth::Accept)
     }
@@ -125,7 +125,7 @@ impl server::Handler for Server {
         reply: server::ChannelOpenHandle,
         _: &mut Session,
     ) -> Result<(), Self::Error> {
-        reply.accept().await;
+        reply.accept().await.unwrap();
         tokio::spawn(async move {
             loop {
                 match timeout(Duration::from_millis(200), channel.wait()).await {

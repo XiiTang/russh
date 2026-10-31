@@ -390,18 +390,21 @@ impl<H: Handler> PendingSession<H> {
         let agent_session_binding = match result {
             Ok(binding) => binding,
             Err(err) => {
-            debug!("kex_done_signal sender was dropped {err:?}");
-            let result = self
-                .handle
-                .as_mut()
-                .ok_or(crate::Error::Inconsistent)?
-                .await;
-            self.joined = true;
-            result?;
-            return Err(H::Error::from(crate::Error::Disconnect));
+                debug!("kex_done_signal sender was dropped {err:?}");
+                let result = self
+                    .handle
+                    .as_mut()
+                    .ok_or(crate::Error::Inconsistent)?
+                    .await;
+                self.joined = true;
+                result?;
+                return Err(H::Error::from(crate::Error::Disconnect));
             }
         };
-        self.handle.as_mut().ok_or(crate::Error::Inconsistent)?.agent_session_binding = agent_session_binding;
+        self.handle
+            .as_mut()
+            .ok_or(crate::Error::Inconsistent)?
+            .agent_session_binding = agent_session_binding;
         self.established = true;
         Ok(())
     }
@@ -2572,6 +2575,7 @@ mod tests {
             join: russh_util::runtime::spawn(async { Ok(()) }),
             abort,
             channel_buffer_size: 8,
+            agent_session_binding: None,
         };
         let mut pending = Vec::new();
         for _ in 0..2 {

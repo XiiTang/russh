@@ -70,7 +70,7 @@ impl server::Handler for Refusing {
     async fn auth_publickey_offered(
         &mut self,
         _: &str,
-        _: &ssh_key::PublicKey,
+        _: russh::server::PublicKeyOffer<'_>,
     ) -> Result<server::Auth, Self::Error> {
         Ok(server::Auth::reject())
     }
