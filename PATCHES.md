@@ -117,6 +117,48 @@ all five host-certificate tests. Workspace all-targets strict Clippy exits 0
 in default and Boundless feature modes; cargo fmt and direct key.rs rustfmt
 checks exit 0. No test assertion or production depth refusal is weakened.
 
+## A zlib stream end inside a packet is refused (Boundless #443)
+
+SSH keeps one zlib stream across packets and flushes it at each packet
+boundary (RFC 4253 section 6.2); no sender ends it. Upstream 0.65.0
+(`183a22e`) `compression::Decompress::decompress` breaks out of its inflate
+loop on `flate2::Status::StreamEnd` without checking the input it consumed,
+and returns the output decoded so far. A peer that ends the stream after a
+complete message and appends bytes in the same packet therefore has the
+message dispatched without those bytes, so the message's own end check never
+sees them. Every later packet on that context decodes to nothing, and both
+receive loops skip an empty payload, so the rest of the session's input is
+silently lost. A scratch reproduction at `c7ba656` (flate2 1.1.9, miniz_oxide
+0.8.9) returned the 14-byte CHANNEL_DATA from a 31-byte packet that also held
+a second zlib stream, and `Ok` with no bytes for the next ordinary packet.
+
+OpenSSH `packet.c::uncompress_buffer` sends `Z_STREAM_END` to its default
+error arm (`SSH_ERR_INTERNAL_ERROR`) and does not deliver the packet. Do the
+same at the one inbound check point: the Zlib arm of `Decompress::decompress`
+returns the new `Error::CompressedStreamEnd` (feature `flate2`, like
+`Decompress`) on any stream end, with bytes after it or exactly at the packet's
+end. `flate2::DecompressError` has no public constructor, and no existing
+variant says the peer's compression is malformed. Both `client::Session` and
+`server::Session` call `maybe_decompress` before dispatching, so the error
+ends the session before any handler or channel sees the packet. The
+`Ok`/`BufError` loop, the size limit, empty input and rekey's fresh stream
+(neither russh nor OpenSSH ends the old one) are unchanged. Retire this patch
+when upstream refuses a stream end.
+
+`compression::tests::a_stream_end_inside_a_packet_is_refused` round-trips two
+sync-flushed packets on one context, then refuses a stream end followed by a
+second zlib stream and one exactly at the packet's end. Without the patch it
+fails (exit 101, `Ok` with the truncated message). The upstream fixtures
+`decompressed_packet_at_limit_is_accepted` and the client and server
+`compressed_debug_payload` helpers encoded a finished stream, which the patch
+refuses; they now flush the stream as an SSH packet does, with unchanged
+assertions. On macOS arm64 / Rust 1.97.0:
+`cargo +1.97.0 test -p russh --lib --tests --no-default-features --features ring,rsa,flate2`
+exits 0 (295 tests); `cargo +1.97.0 fmt --all --check` and workspace
+all-targets strict Clippy in default and Boundless feature modes exit 0.
+Boundless classifies the error as the peer's malformed packet and tests the
+effect against AsyncSSH 2.24.0.
+
 ## Correlated channel refusals and complete authentication facts (W4b/W5-D3)
 
 Upstream v0.64.1 decodes CHANNEL_OPEN_FAILURE description/language in both

@@ -1784,9 +1784,11 @@ mod tests {
         let mut payload = vec![b'A'; payload_len];
         payload[0] = crate::msg::DEBUG;
 
+        // An SSH packet flushes the one zlib stream; it never ends it.
         let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
         encoder.write_all(&payload).unwrap();
-        let compressed = encoder.finish().unwrap();
+        encoder.flush().unwrap();
+        let compressed = encoder.get_ref().clone();
         assert!(compressed.len() < 256 * 1024);
         compressed
     }

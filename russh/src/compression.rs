@@ -180,15 +180,54 @@ mod tests {
     #[test]
     fn decompressed_packet_at_limit_is_accepted() {
         let payload = vec![b'A'; MAXIMUM_DECOMPRESSED_PACKET_LEN];
+        // An SSH packet flushes the one zlib stream; it never ends it.
         let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::best());
         encoder.write_all(&payload).unwrap();
-        let compressed = encoder.finish().unwrap();
+        encoder.flush().unwrap();
+        let compressed = encoder.get_ref().clone();
 
         let mut decompressor = Decompress::Zlib(flate2::Decompress::new(true));
         let mut output = Vec::new();
 
         let decompressed = decompressor.decompress(&compressed, &mut output).unwrap();
         assert_eq!(decompressed.len(), MAXIMUM_DECOMPRESSED_PACKET_LEN);
+    }
+
+    #[test]
+    fn a_stream_end_inside_a_packet_is_refused() {
+        // Ordinary packets flush one continuous stream. A packet holding the
+        // stream's end, with bytes after it or exactly at its own end, is
+        // refused rather than delivered short, as OpenSSH's uncompress_buffer
+        // refuses Z_STREAM_END.
+        let message = b"\x5e\0\0\0\0\0\0\0\x05hello";
+        for trailing in [true, false] {
+            let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            let mut decompressor = Decompress::None;
+            Compression::Zlib.init_decompress(&mut decompressor);
+            for _ in 0..2 {
+                let start = encoder.get_ref().len();
+                encoder.write_all(message).unwrap();
+                encoder.flush().unwrap();
+                let packet = encoder.get_ref()[start..].to_vec();
+                let mut output = Vec::new();
+                let decompressed = decompressor.decompress(&packet, &mut output).unwrap();
+                assert_eq!(decompressed, message);
+            }
+            let start = encoder.get_ref().len();
+            encoder.write_all(message).unwrap();
+            let mut packet = encoder.finish().unwrap()[start..].to_vec();
+            if trailing {
+                let mut more = ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+                more.write_all(b"WORLD!").unwrap();
+                packet.extend(more.finish().unwrap());
+            }
+            let mut output = Vec::new();
+            let refused = decompressor.decompress(&packet, &mut output);
+            assert!(
+                matches!(refused, Err(crate::Error::CompressedStreamEnd)),
+                "trailing {trailing}: {refused:?}"
+            );
+        }
     }
 
     #[test]
@@ -399,7 +438,13 @@ impl Decompress {
                                 output.resize(next_len, 0);
                             }
                         }
-                        _ => break,
+                        // SSH keeps one zlib stream across packets (RFC 4253
+                        // section 6.2): a stream end inside a packet is
+                        // malformed, and the bytes after it would be lost. As
+                        // OpenSSH's uncompress_buffer does, refuse the packet.
+                        flate2::Status::StreamEnd => {
+                            return Err(crate::Error::CompressedStreamEnd);
+                        }
                     }
                 }
                 let n_out_ = z.total_out() as usize - n_out;

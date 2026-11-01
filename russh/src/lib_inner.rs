@@ -218,6 +218,11 @@ pub enum Error {
     #[cfg(feature = "flate2")]
     Decompress(#[from] flate2::DecompressError),
 
+    /// The peer's compressed stream ended inside a packet.
+    #[error("Compressed stream ended inside a packet")]
+    #[cfg(feature = "flate2")]
+    CompressedStreamEnd,
+
     #[error(transparent)]
     Join(#[from] russh_util::runtime::JoinError),
 
