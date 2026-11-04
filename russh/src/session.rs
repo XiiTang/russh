@@ -951,12 +951,12 @@ pub(crate) enum GlobalRequestResponse {
     /// request was for NoMoreSessions, disallow additional sessions
     NoMoreSessions,
     /// request was for TcpIpForward, sends Some(port) for success or None for failure
-    TcpIpForward(oneshot::Sender<Option<u32>>),
+    TcpIpForward(crate::client::ForwardReply<Option<u32>>),
     /// request was for CancelTcpIpForward, sends true for success or false for failure
-    CancelTcpIpForward(oneshot::Sender<bool>),
+    CancelTcpIpForward(crate::client::ForwardReply<bool>),
     /// request was for StreamLocalForward, sends true for success or false for failure
-    StreamLocalForward(oneshot::Sender<bool>),
-    CancelStreamLocalForward(oneshot::Sender<bool>),
+    StreamLocalForward(crate::client::ForwardReply<bool>),
+    CancelStreamLocalForward(crate::client::ForwardReply<bool>),
     /// OpenSSH host-key ownership proof
     HostKeysProve {
         return_channel: oneshot::Sender<Result<(), crate::Error>>,

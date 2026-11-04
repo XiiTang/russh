@@ -813,3 +813,42 @@ uses an actual ChannelStream release, a queued application message and native
 pending data. The external owner remains through both tables and is dropped
 only at native retirement. Boundless's held-OPEN bounded-account fixture covers
 abandonment before confirmation through the real adapter and native opening.
+
+## Global forwarding completion at the original FIFO (#530)
+
+Upstream v0.65.0 (`183a22e8`) `client::Handle`'s four forwarding methods
+send a Msg with a private oneshot, then await it. `client/encrypted.rs` pops
+that original global FIFO at REQUEST_SUCCESS/FAILURE; dropping the FIFO or
+admission queue closes the oneshot and the convenience waiter answers
+Disconnect. A consumer cannot commit its original operation there, so a later
+normal connection end can overtake its scheduler-dependent result relay.
+Boundless `ssh/forward.rs::Registry::{listen,cancel_native}` needs that boundary.
+
+Add `tcpip_forward_with_reply`, `streamlocal_forward_with_reply` and both
+cancel equivalents. Their result remains queue admission. A retirement-owned
+ForwardReply wraps the original native payload and calls its sink synchronously
+at the same FIFO send, or Disconnect at original retirement without a reply.
+The sink must not reenter the session. Existing convenience/Session APIs and
+oneshot results remain; both use that one native FIFO/decoder. Keep server-mode
+forwarding's original raw oneshot semantics through the same private wrapper.
+No timeout, retry, new task, FIFO bound or separate correlation is added.
+
+Error/close/cancellation comparison with upstream:
+- Queue send failure still returns SendError; the new sink receives that same
+  admission error rather than a fabricated peer refusal.
+- REQUEST_FAILURE still means RequestDenied in the Handle API. TCP success
+  still returns its decoded allocated port or zero for an empty success;
+  Boundless retains requested-port/range and listener-grant admission checks.
+- Original FIFO and queued-message destruction still mean Disconnect. Dropping
+  a convenience waiter does not retract dispatch or skip its FIFO position.
+- Packet parsing/dispatch errors and native session result are unchanged. Keep
+  the earlier malformed-forward-success patch (upstream conflates malformed
+  success with refusal); this patch changes neither role's decoder.
+
+Native regression `client::tests::global_forward_completion_*` covers all four
+hooks' success/refusal FIFO consumption, queued and dispatched no-reply
+retirement, dispatch admission failure, malformed success, and a departed
+convenience waiter before the next global reply. Boundless's gated forwarding
+effect tests cover original Terminal completion before normal end and preserve
+listener-grant validation and late-cancellation ownership. Test commands and
+platform results are in the consuming change's report; no full lane is claimed.

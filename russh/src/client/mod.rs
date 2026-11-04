@@ -180,6 +180,69 @@ enum Reply {
     },
 }
 
+/// An original global-forward reply, owned by the native queue through retirement.
+/// The sink must not reenter the session.
+#[doc(hidden)]
+pub struct ForwardReply<T: Send + 'static> {
+    // Msg must be Sync, although this slot only has exclusive native custody.
+    target: std::sync::Mutex<Option<ForwardReplyTarget<T>>>,
+}
+enum ForwardReplyTarget<T> {
+    Channel(oneshot::Sender<T>),
+    Sink(Box<dyn FnOnce(Result<T, crate::Error>) + Send>),
+}
+impl<T: Send + 'static> std::fmt::Debug for ForwardReply<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForwardReply").finish_non_exhaustive()
+    }
+}
+impl<T: Send + 'static> From<oneshot::Sender<T>> for ForwardReply<T> {
+    fn from(sender: oneshot::Sender<T>) -> Self {
+        Self {
+            target: std::sync::Mutex::new(Some(ForwardReplyTarget::Channel(sender))),
+        }
+    }
+}
+impl<T: Send + 'static> ForwardReply<T> {
+    fn new(sink: impl FnOnce(Result<T, crate::Error>) + Send + 'static) -> Self {
+        Self {
+            target: std::sync::Mutex::new(Some(ForwardReplyTarget::Sink(Box::new(sink)))),
+        }
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "ForwardReply never locks its exclusive target, so it cannot be poisoned"
+    )]
+    fn take(&mut self) -> Option<ForwardReplyTarget<T>> {
+        self.target
+            .get_mut()
+            .expect("ForwardReply only accesses its target exclusively")
+            .take()
+    }
+    pub(crate) fn send(mut self, value: T) -> Result<(), T> {
+        match self.take() {
+            Some(ForwardReplyTarget::Channel(sender)) => sender.send(value),
+            Some(ForwardReplyTarget::Sink(sink)) => {
+                sink(Ok(value));
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+    fn fail(mut self, error: crate::Error) {
+        if let Some(ForwardReplyTarget::Sink(sink)) = self.take() {
+            sink(Err(error));
+        }
+    }
+}
+impl<T: Send + 'static> Drop for ForwardReply<T> {
+    fn drop(&mut self) {
+        if let Some(ForwardReplyTarget::Sink(sink)) = self.take() {
+            sink(Err(crate::Error::Disconnect));
+        }
+    }
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Msg {
@@ -247,6 +310,28 @@ pub enum Msg {
     CancelStreamLocalForward {
         /// Provide a channel for the reply result to request a reply from the server
         reply_channel: Option<oneshot::Sender<bool>>,
+        socket_path: String,
+    },
+    /// Dispatch a forward request with its native completion sink.
+    TcpIpForwardWithReply {
+        reply: ForwardReply<Option<u32>>,
+        address: String,
+        port: u32,
+    },
+    /// Dispatch a forward request with its native completion sink.
+    CancelTcpIpForwardWithReply {
+        reply: ForwardReply<bool>,
+        address: String,
+        port: u32,
+    },
+    /// Dispatch a forward request with its native completion sink.
+    StreamLocalForwardWithReply {
+        reply: ForwardReply<bool>,
+        socket_path: String,
+    },
+    /// Dispatch a forward request with its native completion sink.
+    CancelStreamLocalForwardWithReply {
+        reply: ForwardReply<bool>,
         socket_path: String,
     },
     Close {
@@ -1259,6 +1344,124 @@ impl<H: Handler> Handle<H> {
         }
     }
 
+    /// Dispatch this global request, retaining its sink in the original FIFO.
+    ///
+    /// The return value is queue admission only. The sink receives the complete
+    /// peer result or original retirement; it must not reenter the session.
+    pub async fn tcpip_forward_with_reply<A: Into<String>>(
+        &self,
+        address: A,
+        port: u32,
+        sink: impl FnOnce(Result<u32, crate::Error>) + Send + 'static,
+    ) -> Result<(), crate::Error> {
+        let message = Msg::TcpIpForwardWithReply {
+            reply: ForwardReply::new(move |result: Result<Option<u32>, crate::Error>| {
+                sink(result.and_then(|value| value.ok_or(crate::Error::RequestDenied)))
+            }),
+            address: address.into(),
+            port,
+        };
+        if let Err(error) = self.sender.send(message).await {
+            if let Msg::TcpIpForwardWithReply { reply, .. } = error.0 {
+                reply.fail(crate::Error::SendError);
+            }
+            return Err(crate::Error::SendError);
+        }
+        Ok(())
+    }
+
+    /// Dispatch this global request, retaining its sink in the original FIFO.
+    ///
+    /// The return value is queue admission only. The sink receives the complete
+    /// peer result or original retirement; it must not reenter the session.
+    pub async fn cancel_tcpip_forward_with_reply<A: Into<String>>(
+        &self,
+        address: A,
+        port: u32,
+        sink: impl FnOnce(Result<(), crate::Error>) + Send + 'static,
+    ) -> Result<(), crate::Error> {
+        let message = Msg::CancelTcpIpForwardWithReply {
+            reply: ForwardReply::new(move |result| {
+                sink(result.and_then(|value| {
+                    if value {
+                        Ok(())
+                    } else {
+                        Err(crate::Error::RequestDenied)
+                    }
+                }))
+            }),
+            address: address.into(),
+            port,
+        };
+        if let Err(error) = self.sender.send(message).await {
+            if let Msg::CancelTcpIpForwardWithReply { reply, .. } = error.0 {
+                reply.fail(crate::Error::SendError);
+            }
+            return Err(crate::Error::SendError);
+        }
+        Ok(())
+    }
+
+    /// Dispatch this global request, retaining its sink in the original FIFO.
+    ///
+    /// The return value is queue admission only. The sink receives the complete
+    /// peer result or original retirement; it must not reenter the session.
+    pub async fn streamlocal_forward_with_reply<A: Into<String>>(
+        &self,
+        socket_path: A,
+        sink: impl FnOnce(Result<(), crate::Error>) + Send + 'static,
+    ) -> Result<(), crate::Error> {
+        let message = Msg::StreamLocalForwardWithReply {
+            reply: ForwardReply::new(move |result| {
+                sink(result.and_then(|value| {
+                    if value {
+                        Ok(())
+                    } else {
+                        Err(crate::Error::RequestDenied)
+                    }
+                }))
+            }),
+            socket_path: socket_path.into(),
+        };
+        if let Err(error) = self.sender.send(message).await {
+            if let Msg::StreamLocalForwardWithReply { reply, .. } = error.0 {
+                reply.fail(crate::Error::SendError);
+            }
+            return Err(crate::Error::SendError);
+        }
+        Ok(())
+    }
+
+    /// Dispatch this global request, retaining its sink in the original FIFO.
+    ///
+    /// The return value is queue admission only. The sink receives the complete
+    /// peer result or original retirement; it must not reenter the session.
+    pub async fn cancel_streamlocal_forward_with_reply<A: Into<String>>(
+        &self,
+        socket_path: A,
+        sink: impl FnOnce(Result<(), crate::Error>) + Send + 'static,
+    ) -> Result<(), crate::Error> {
+        let message = Msg::CancelStreamLocalForwardWithReply {
+            reply: ForwardReply::new(move |result| {
+                sink(result.and_then(|value| {
+                    if value {
+                        Ok(())
+                    } else {
+                        Err(crate::Error::RequestDenied)
+                    }
+                }))
+            }),
+            socket_path: socket_path.into(),
+        };
+        if let Err(error) = self.sender.send(message).await {
+            if let Msg::CancelStreamLocalForwardWithReply { reply, .. } = error.0 {
+                reply.fail(crate::Error::SendError);
+            }
+            return Err(crate::Error::SendError);
+        }
+        Ok(())
+    }
+
     /// Sends a disconnect message.
     pub async fn disconnect(
         &self,
@@ -2052,6 +2255,22 @@ impl Session {
                 reply_channel,
                 socket_path,
             } => self.cancel_streamlocal_forward(reply_channel, &socket_path)?,
+            Msg::TcpIpForwardWithReply {
+                reply,
+                address,
+                port,
+            } => self.tcpip_forward_reply(Some(reply), &address, port)?,
+            Msg::CancelTcpIpForwardWithReply {
+                reply,
+                address,
+                port,
+            } => self.cancel_tcpip_forward_reply(Some(reply), &address, port)?,
+            Msg::StreamLocalForwardWithReply { reply, socket_path } => {
+                self.streamlocal_forward_reply(Some(reply), &socket_path)?
+            }
+            Msg::CancelStreamLocalForwardWithReply { reply, socket_path } => {
+                self.cancel_streamlocal_forward_reply(Some(reply), &socket_path)?
+            }
             Msg::Disconnect {
                 reason,
                 description,
@@ -2560,6 +2779,190 @@ mod tests {
             reply_sender,
         );
         (session, sender, reply_receiver)
+    }
+
+    fn global_forward_fixture() -> (Session, Handle<TestHandler>) {
+        let (mut session, sender, receiver) = keyboard_interactive_session();
+        session.common.encrypted.as_mut().unwrap().state = EncryptedState::Authenticated;
+        let (abort, _) = futures::future::AbortHandle::new_pair();
+        let handle = Handle {
+            managed_close: Arc::new(tokio::sync::Notify::new()),
+            sender,
+            receiver,
+            abort,
+            join: russh_util::runtime::spawn(async { Ok(()) }),
+            channel_buffer_size: 8,
+            agent_session_binding: None,
+        };
+        (session, handle)
+    }
+    async fn enqueue_global_forwards(
+        handle: &Handle<TestHandler>,
+    ) -> Vec<oneshot::Receiver<Result<u32, crate::Error>>> {
+        let mut replies = Vec::new();
+        let (send, receive) = oneshot::channel();
+        handle
+            .tcpip_forward_with_reply("localhost", 0, move |result| {
+                let _ = send.send(result);
+            })
+            .await
+            .unwrap();
+        replies.push(receive);
+        let (send, receive) = oneshot::channel();
+        handle
+            .cancel_tcpip_forward_with_reply("localhost", 4000, move |result| {
+                let _ = send.send(result.map(|()| 0));
+            })
+            .await
+            .unwrap();
+        replies.push(receive);
+        let (send, receive) = oneshot::channel();
+        handle
+            .streamlocal_forward_with_reply("/fixture", move |result| {
+                let _ = send.send(result.map(|()| 0));
+            })
+            .await
+            .unwrap();
+        replies.push(receive);
+        let (send, receive) = oneshot::channel();
+        handle
+            .cancel_streamlocal_forward_with_reply("/fixture", move |result| {
+                let _ = send.send(result.map(|()| 0));
+            })
+            .await
+            .unwrap();
+        replies.push(receive);
+        replies
+    }
+
+    #[tokio::test]
+    async fn global_forward_completion_success_and_refusal_consume_the_original_fifo() {
+        for success in [true, false] {
+            let (mut session, handle) = global_forward_fixture();
+            let replies = enqueue_global_forwards(&handle).await;
+            for _ in 0..4 {
+                let message = session.receiver.try_recv().unwrap();
+                session.handle_msg(message).unwrap();
+            }
+            assert_eq!(session.open_global_requests.len(), 4);
+            for (index, mut reply) in replies.into_iter().enumerate() {
+                let mut packet = vec![if success {
+                    crate::msg::REQUEST_SUCCESS
+                } else {
+                    crate::msg::REQUEST_FAILURE
+                }];
+                if success && index == 0 {
+                    4000u32.encode(&mut packet).unwrap();
+                }
+                session
+                    .process_packet(&mut TestHandler, &packet)
+                    .await
+                    .unwrap();
+                let result = reply.try_recv().unwrap();
+                if success {
+                    assert_eq!(result.unwrap(), if index == 0 { 4000 } else { 0 });
+                } else {
+                    assert!(matches!(result, Err(crate::Error::RequestDenied)));
+                }
+                assert_eq!(session.open_global_requests.len(), 3 - index);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn global_forward_completion_original_retirement_is_disconnect_not_refusal() {
+        for dispatched in [true, false] {
+            let (mut session, handle) = global_forward_fixture();
+            let replies = enqueue_global_forwards(&handle).await;
+            if dispatched {
+                for _ in 0..4 {
+                    let message = session.receiver.try_recv().unwrap();
+                    session.handle_msg(message).unwrap();
+                }
+            }
+            // Both native FIFO retirement and native admission-queue retirement
+            // consume the same one-shot sink, without fabricating peer refusal.
+            drop(session);
+            for mut reply in replies {
+                assert!(matches!(
+                    reply.try_recv().unwrap(),
+                    Err(crate::Error::Disconnect)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn global_forward_completion_keeps_admission_error_and_malformed_success() {
+        let (mut session, handle) = global_forward_fixture();
+        session.receiver.close();
+        let (send, mut receive) = oneshot::channel();
+        let result = handle
+            .tcpip_forward_with_reply("localhost", 0, move |result| {
+                let _ = send.send(result);
+            })
+            .await;
+        assert!(matches!(result, Err(crate::Error::SendError)));
+        assert!(matches!(
+            receive.try_recv().unwrap(),
+            Err(crate::Error::SendError)
+        ));
+
+        let (mut session, handle) = global_forward_fixture();
+        let (send, mut receive) = oneshot::channel();
+        handle
+            .tcpip_forward_with_reply("localhost", 0, move |result| {
+                let _ = send.send(result);
+            })
+            .await
+            .unwrap();
+        let message = session.receiver.try_recv().unwrap();
+        session.handle_msg(message).unwrap();
+        assert!(
+            session
+                .process_packet(&mut TestHandler, &[crate::msg::REQUEST_SUCCESS, 0])
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            receive.try_recv().unwrap(),
+            Err(crate::Error::Disconnect)
+        ));
+    }
+
+    #[tokio::test]
+    async fn global_forward_completion_convenience_cancellation_keeps_fifo_correlation() {
+        let (mut session, handle) = global_forward_fixture();
+        let mut departed = Box::pin(handle.tcpip_forward("localhost", 0));
+        assert!(futures::poll!(&mut departed).is_pending());
+        drop(departed);
+        let message = session.receiver.try_recv().unwrap();
+        session.handle_msg(message).unwrap();
+        let (send, mut receive) = oneshot::channel();
+        handle
+            .cancel_tcpip_forward_with_reply("localhost", 4000, move |result| {
+                let _ = send.send(result);
+            })
+            .await
+            .unwrap();
+        let message = session.receiver.try_recv().unwrap();
+        session.handle_msg(message).unwrap();
+        let mut packet = vec![crate::msg::REQUEST_SUCCESS];
+        4000u32.encode(&mut packet).unwrap();
+        session
+            .process_packet(&mut TestHandler, &packet)
+            .await
+            .unwrap();
+        assert!(matches!(
+            receive.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        session
+            .process_packet(&mut TestHandler, &[crate::msg::REQUEST_SUCCESS])
+            .await
+            .unwrap();
+        assert!(receive.try_recv().unwrap().is_ok());
+        assert!(session.open_global_requests.is_empty());
     }
 
     #[tokio::test]

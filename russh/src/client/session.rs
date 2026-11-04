@@ -314,6 +314,14 @@ impl Session {
         address: &str,
         port: u32,
     ) -> Result<(), crate::Error> {
+        self.tcpip_forward_reply(reply_channel.map(super::ForwardReply::from), address, port)
+    }
+    pub(super) fn tcpip_forward_reply(
+        &mut self,
+        reply_channel: Option<super::ForwardReply<Option<u32>>>,
+        address: &str,
+        port: u32,
+    ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
             let want_reply = reply_channel.is_some();
             if let Some(reply_channel) = reply_channel {
@@ -339,6 +347,14 @@ impl Session {
     pub fn cancel_tcpip_forward(
         &mut self,
         reply_channel: Option<oneshot::Sender<bool>>,
+        address: &str,
+        port: u32,
+    ) -> Result<(), crate::Error> {
+        self.cancel_tcpip_forward_reply(reply_channel.map(super::ForwardReply::from), address, port)
+    }
+    pub(super) fn cancel_tcpip_forward_reply(
+        &mut self,
+        reply_channel: Option<super::ForwardReply<bool>>,
         address: &str,
         port: u32,
     ) -> Result<(), crate::Error> {
@@ -369,6 +385,13 @@ impl Session {
         reply_channel: Option<oneshot::Sender<bool>>,
         socket_path: &str,
     ) -> Result<(), crate::Error> {
+        self.streamlocal_forward_reply(reply_channel.map(super::ForwardReply::from), socket_path)
+    }
+    pub(super) fn streamlocal_forward_reply(
+        &mut self,
+        reply_channel: Option<super::ForwardReply<bool>>,
+        socket_path: &str,
+    ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
             let want_reply = reply_channel.is_some();
             if let Some(reply_channel) = reply_channel {
@@ -393,6 +416,16 @@ impl Session {
     pub fn cancel_streamlocal_forward(
         &mut self,
         reply_channel: Option<oneshot::Sender<bool>>,
+        socket_path: &str,
+    ) -> Result<(), crate::Error> {
+        self.cancel_streamlocal_forward_reply(
+            reply_channel.map(super::ForwardReply::from),
+            socket_path,
+        )
+    }
+    pub(super) fn cancel_streamlocal_forward_reply(
+        &mut self,
+        reply_channel: Option<super::ForwardReply<bool>>,
         socket_path: &str,
     ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
@@ -515,7 +548,11 @@ impl Session {
         Ok(())
     }
 
-    pub fn data(&mut self, channel: ChannelId, data: impl Into<bytes::Bytes>) -> Result<(), crate::Error> {
+    pub fn data(
+        &mut self,
+        channel: ChannelId,
+        data: impl Into<bytes::Bytes>,
+    ) -> Result<(), crate::Error> {
         let data = data.into();
         self.charge(channel, data.len());
         self.admitted_data(channel, None, data)
