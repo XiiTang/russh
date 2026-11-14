@@ -82,12 +82,14 @@ fn partial_success_reject() -> server::Auth {
 }
 
 async fn connect() -> client::Handle<AcceptServerKey> {
-    let mut server_config = server::Config::default();
-    server_config.auth_rejection_time = Duration::from_millis(1);
-    server_config.auth_rejection_time_initial = Some(Duration::from_millis(1));
-    // A partial success must not count as a failed attempt: every test below
-    // that sends a second request after a partial success relies on this.
-    server_config.max_auth_attempts = 1;
+    let mut server_config = server::Config {
+        auth_rejection_time: Duration::from_millis(1),
+        auth_rejection_time_initial: Some(Duration::from_millis(1)),
+        // A partial success must not count as a failed attempt: every test below
+        // that sends a second request after a partial success relies on this.
+        max_auth_attempts: 1,
+        ..Default::default()
+    };
     server_config
         .keys
         .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
@@ -97,9 +99,11 @@ async fn connect() -> client::Handle<AcceptServerKey> {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
-        let _ = server::run_stream(server_config, socket, PartialSuccessServer)
-            .await
-            .unwrap();
+        drop(
+            server::run_stream(server_config, socket, PartialSuccessServer)
+                .await
+                .unwrap(),
+        );
     });
 
     client::connect(Arc::new(client::Config::default()), addr, AcceptServerKey)

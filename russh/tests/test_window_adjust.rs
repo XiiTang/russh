@@ -125,7 +125,7 @@ impl server::Handler for Server {
         reply: server::ChannelOpenHandle,
         _: &mut Session,
     ) -> Result<(), Self::Error> {
-        reply.accept().await;
+        reply.accept().await.unwrap();
         tokio::spawn(async move {
             loop {
                 match timeout(Duration::from_millis(200), channel.wait()).await {

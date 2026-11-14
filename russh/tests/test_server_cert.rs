@@ -23,7 +23,10 @@ fn host_cert(
     )
     .unwrap();
     builder.serial(42).unwrap();
-    builder.key_id("test-server").unwrap();
+    // Opaque key IDs must not be counted as recursively nested certificates.
+    builder
+        .key_id(format!("test-server{}", "-cert-v01@".repeat(8)))
+        .unwrap();
     builder.cert_type(CertType::Host).unwrap();
     builder.valid_principal("localhost").unwrap();
     builder.sign(signing_ca).unwrap()
@@ -44,9 +47,11 @@ async fn serve_and_connect(
 
     tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
-        let _ = server::run_stream(config, socket, TestServer {})
-            .await
-            .unwrap();
+        drop(
+            server::run_stream(config, socket, TestServer {})
+                .await
+                .unwrap(),
+        );
     });
 
     let mut client_config = client::Config::default();

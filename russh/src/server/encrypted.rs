@@ -165,6 +165,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use std::borrow::Cow;
     use std::num::Wrapping;
     use std::sync::Arc;
@@ -465,16 +466,16 @@ mod tests {
         };
 
         let probe = publickey_probe_packet("alice", &pk_ok_key);
-        let mut probe = BytesMut::from(probe.as_slice());
+        let probe = BytesMut::from(probe.as_slice());
         session
-            .process_packet(&mut handler, &mut probe)
+            .process_packet(&mut handler, &probe)
             .await
             .unwrap();
 
         let signed = publickey_signed_packet("alice", Arc::new(signed_private), &signed_key);
-        let mut signed = BytesMut::from(signed.as_slice());
+        let signed = BytesMut::from(signed.as_slice());
         session
-            .process_packet(&mut handler, &mut signed)
+            .process_packet(&mut handler, &signed)
             .await
             .unwrap();
 
@@ -760,6 +761,27 @@ mod tests {
         channel
     }
 
+    #[tokio::test]
+    #[allow(clippy::panic)] // An unexpected decoded reply must fail this native regression.
+    async fn w1d3_server_open_failure_keeps_the_peer_fields_in_its_original_inbox() {
+        let mut session = test_authenticated_session();
+        let id = insert_unconfirmed_server_open(&mut session);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        session.channels.insert(id, crate::channels::ChannelRef::new(sender));
+        let mut packet = vec![msg::CHANNEL_OPEN_FAILURE];
+        id.encode(&mut packet).unwrap();
+        91u32.encode(&mut packet).unwrap();
+        "server-initiated channel denied".encode(&mut packet).unwrap();
+        "de".encode(&mut packet).unwrap();
+        session.process_packet(&mut ChannelCallbackProbe::default(), &packet).await.unwrap();
+        let Some(ChannelMsg::OpenFailure(info)) = receiver.recv().await else {
+            panic!("expected the correlated OPEN refusal");
+        };
+        assert_eq!(info.reason_code, 91);
+        assert_eq!(info.description, "server-initiated channel denied");
+        assert_eq!(info.language, "de");
+    }
+
     fn publickey_probe_packet(user: &str, public_key: &PublicKey) -> Vec<u8> {
         publickey_probe_packet_as(user, public_key, public_key.algorithm().as_str())
     }
@@ -817,14 +839,16 @@ mod tests {
     }
 
     fn test_auth_session() -> Session {
-        let mut config = Config::default();
-        config.preferred = Preferred {
-            host_key_certificates: Cow::Borrowed(&[]),
-            kex: Cow::Owned(vec![KEX_NONE]),
-            key: Cow::Owned(vec![ssh_key::Algorithm::Ed25519]),
-            cipher: Cow::Owned(vec![cipher::NONE]),
-            mac: Cow::Owned(vec![mac::NONE]),
-            compression: Cow::Owned(vec![compression::NONE]),
+        let config = Config {
+            preferred: Preferred {
+                host_key_certificates: Cow::Borrowed(&[]),
+                kex: Cow::Owned(vec![KEX_NONE]),
+                key: Cow::Owned(vec![ssh_key::Algorithm::Ed25519]),
+                cipher: Cow::Owned(vec![cipher::NONE]),
+                mac: Cow::Owned(vec![mac::NONE]),
+                compression: Cow::Owned(vec![compression::NONE]),
+            },
+            ..Default::default()
         };
         let config = Arc::new(config);
         let (priority_sender, priority_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -833,6 +857,7 @@ mod tests {
             priority_sender,
             sender,
             channel_buffer_size: config.channel_buffer_size,
+            released: Arc::new(tokio::sync::Notify::new()),
         };
 
         Session {
@@ -861,6 +886,8 @@ mod tests {
             channels: std::collections::HashMap::new(),
             open_global_requests: std::collections::VecDeque::new(),
             kex: SessionKexState::Idle,
+            taken: 0,
+            release_fences: std::collections::HashMap::new(),
         }
     }
 
@@ -1449,7 +1476,7 @@ impl Session {
                 }
                 if let Some(ref mut enc) = self.common.encrypted {
                     // Reply with CHANNEL_CLOSE per RFC 4254 Section 5.3.
-                    enc.close(channel_num)?;
+                    enc.receive_close(channel_num)?;
                 }
                 // Forward the close to the channel before removing it, so that
                 // consumers waiting on `Channel::wait()` receive an explicit
@@ -1527,12 +1554,14 @@ impl Session {
                     return Ok(());
                 }
                 let mut new_size = 0;
+                let mut granted = 0;
                 if let Some(ref mut enc) = self.common.encrypted {
                     let channel = enc
                         .channels
                         .get_mut(&channel_num)
                         .ok_or(Error::Inconsistent)?;
                     new_size = channel.recipient_window_size.saturating_add(amount);
+                    granted = new_size - channel.recipient_window_size;
                     channel.recipient_window_size = new_size;
                 }
                 let is_rekeying = self.kex.active();
@@ -1545,10 +1574,13 @@ impl Session {
                     )? as u32;
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    chan.window_size().grow(amount).await;
+                    // Writers' credit grows by what the window grew by. Setting
+                    // it to the window would count again the data they already
+                    // queued and the engine has not taken yet.
+                    chan.window_size().grant(granted);
                     // Use try_send to avoid blocking the session loop when channel buffer is full.
-                    // WindowAdjusted is informational - the critical side effect (updating
-                    // WindowSizeRef and notifying ChannelTx) already happens in grow().
+                    // WindowAdjusted is informational - the critical side effect (granting the
+                    // writers' credit and waking them) already happened.
                     let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
                 }
                 debug!("handler.window_adjusted {channel_num:?}");
@@ -1560,9 +1592,11 @@ impl Session {
                 let msg = ChannelOpenConfirmation::parse(r)?;
                 map_err!(ensure_end(r))?;
                 let local_id = ChannelId(msg.recipient_channel);
+                let before;
 
                 if let Some(ref mut enc) = self.common.encrypted {
                     if let Some(parameters) = enc.channels.get_mut(&local_id) {
+                        before = parameters.recipient_window_size;
                         parameters.confirm(&msg);
                     } else {
                         // We've not requested this channel, close connection.
@@ -1573,6 +1607,12 @@ impl Session {
                 };
 
                 if let Some(channel) = self.channels.get(&local_id) {
+                    // Writers' credit moves as the window does, here before any
+                    // WINDOW_ADJUST can add to it. A repeated confirmation
+                    // replaces the window, so it moves by the difference.
+                    let window = msg.initial_window_size;
+                    channel.window_size().grant(window.saturating_sub(before));
+                    channel.window_size().charge(before.saturating_sub(window) as usize);
                     channel
                         .send(ChannelMsg::Open {
                             id: local_id,
@@ -1928,8 +1968,7 @@ impl Session {
             msg::CHANNEL_OPEN_FAILURE => {
                 debug!("channel_open_failure");
                 let channel_num = map_err!(ChannelId::decode(r))?;
-                let reason = ChannelOpenFailure::from_u32(map_err!(u32::decode(r))?)
-                    .unwrap_or(ChannelOpenFailure::AdministrativelyProhibited);
+                let reason_code = map_err!(u32::decode(r))?;
                 let description = map_err!(String::decode(r))?;
                 let language_tag = map_err!(String::decode(r))?;
                 map_err!(ensure_end(r))?;
@@ -1943,7 +1982,11 @@ impl Session {
 
                 if let Some(channel_sender) = self.channels.remove(&channel_num) {
                     channel_sender
-                        .send(ChannelMsg::OpenFailure(reason))
+                        .send(ChannelMsg::OpenFailure(crate::RemoteChannelOpenFailureInfo {
+                            reason_code,
+                            description,
+                            language: language_tag,
+                        }))
                         .await
                         .map_err(|_| crate::Error::SendError)?;
                 }
@@ -2037,6 +2080,7 @@ impl Session {
             unreachable!()
         };
         let channel_params = ChannelParams {
+            _handles: None,
             recipient_channel: msg.recipient_channel,
 
             // "sender" is the local end, i.e. we're the sender, the remote is the recipient.
@@ -2051,6 +2095,8 @@ impl Session {
             pending_data: std::collections::VecDeque::new(),
             pending_eof: false,
             pending_close: false,
+            close_sent: false,
+            close_received: false,
         };
 
         let (channel, channel_ref) = Channel::new(
@@ -2059,6 +2105,7 @@ impl Session {
             channel_params.recipient_maximum_packet_size,
             channel_params.recipient_window_size,
             self.common.config.channel_buffer_size,
+            self.sender.released.clone(),
         );
 
         let pending = PendingChannelOpen {

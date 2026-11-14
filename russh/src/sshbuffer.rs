@@ -74,6 +74,7 @@ fn test_ssh_id() {
 }
 
 #[test]
+#[allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
 fn test_write_packet_leaves_reusable_buffer_for_cold_path_packets() {
     let mut writer = PacketWriter::clear();
     let large_len = 128 * 1024;
@@ -114,6 +115,7 @@ fn reserve_cleartext_packet_output_ignores_compressed_writer() {
 }
 
 #[test]
+#[allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
 fn test_packet_returns_retained_bytes() {
     let mut writer = PacketWriter::clear();
     let retained = writer
@@ -127,6 +129,7 @@ fn test_packet_returns_retained_bytes() {
 }
 
 #[test]
+#[allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
 fn packet_bytes_returns_retained_bytes() {
     let mut writer = PacketWriter::clear();
     let retained = writer
@@ -140,6 +143,7 @@ fn packet_bytes_returns_retained_bytes() {
 }
 
 #[test]
+#[allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
 fn packet_bytes_matches_packet_output() {
     let payload = b"abcdefghijklmno".to_vec();
 
@@ -167,6 +171,7 @@ fn packet_bytes_matches_packet_output() {
 }
 
 #[test]
+#[allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
 fn test_write_packet_matches_clear_cipher_write_output() {
     let payload = b"abcdefghijklmno".to_vec();
 
@@ -188,6 +193,7 @@ fn test_write_packet_matches_clear_cipher_write_output() {
 }
 
 #[test]
+#[allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
 fn installing_a_cipher_starts_a_new_write_key_epoch() {
     let mut writer = PacketWriter::clear();
     writer.packet_raw(b"initial key exchange").unwrap();
@@ -204,6 +210,7 @@ fn installing_a_cipher_starts_a_new_write_key_epoch() {
 // tokio has no `macros` feature; `#[cfg(test)]` drops the item first.
 #[cfg(test)]
 #[tokio::test]
+#[allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
 async fn automatic_rekey_read_counter_tracks_payload_bytes() {
     let payload = b"inbound rekey accounting";
     let mut writer = PacketWriter::clear();
@@ -223,6 +230,7 @@ async fn automatic_rekey_read_counter_tracks_payload_bytes() {
 }
 
 #[test]
+#[allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
 fn test_write_packet_restores_output_buffer_on_error() {
     let mut writer = PacketWriter::clear();
     writer
@@ -251,6 +259,7 @@ fn zlib_compress() -> Compress {
 
 #[cfg(feature = "flate2")]
 #[test]
+#[allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
 fn test_write_packet_compressed_matches_clear_cipher_output() {
     let payload = b"abcdefghijklmnoabcdefghijklmno".to_vec();
 
@@ -276,6 +285,7 @@ fn test_write_packet_compressed_matches_clear_cipher_output() {
 
 #[cfg(feature = "flate2")]
 #[test]
+#[allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
 fn test_packet_retains_plaintext_for_compressed_packets() {
     let payload = b"abcdefghijklmnoabcdefghijklmno".to_vec();
 
@@ -292,6 +302,7 @@ fn test_packet_retains_plaintext_for_compressed_packets() {
 
 #[cfg(feature = "flate2")]
 #[test]
+#[allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
 fn packet_bytes_compressed_matches_packet_output() {
     let payload = b"abcdefghijklmnoabcdefghijklmno".to_vec();
 

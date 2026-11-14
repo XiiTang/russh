@@ -175,6 +175,7 @@ pub fn learn_known_hosts_path<P: AsRef<Path>>(
 
 #[cfg(test)]
 mod test {
+    #![allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use std::fs::File;
 
     use super::*;

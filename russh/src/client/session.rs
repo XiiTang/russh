@@ -112,7 +112,7 @@ impl Session {
         terminal_modes: &[(Pty, u32)],
     ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted
-            && let Some(channel) = enc.channels.get(&channel)
+            && let Some(channel) = crate::session::sendable(&enc.channels, channel)
         {
             push_packet!(enc.write, {
                 map_err!(msg::CHANNEL_REQUEST.encode(&mut enc.write))?;
@@ -160,7 +160,7 @@ impl Session {
         x11_screen_number: u32,
     ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted
-            && let Some(channel) = enc.channels.get(&channel)
+            && let Some(channel) = crate::session::sendable(&enc.channels, channel)
         {
             push_packet!(enc.write, {
                 msg::CHANNEL_REQUEST.encode(&mut enc.write)?;
@@ -185,7 +185,7 @@ impl Session {
         variable_value: &str,
     ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted
-            && let Some(channel) = enc.channels.get(&channel)
+            && let Some(channel) = crate::session::sendable(&enc.channels, channel)
         {
             push_packet!(enc.write, {
                 msg::CHANNEL_REQUEST.encode(&mut enc.write)?;
@@ -206,7 +206,7 @@ impl Session {
         channel: ChannelId,
     ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted
-            && let Some(channel) = enc.channels.get(&channel)
+            && let Some(channel) = crate::session::sendable(&enc.channels, channel)
         {
             push_packet!(enc.write, {
                 msg::CHANNEL_REQUEST.encode(&mut enc.write)?;
@@ -226,7 +226,7 @@ impl Session {
         command: &[u8],
     ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted
-            && let Some(channel) = enc.channels.get(&channel)
+            && let Some(channel) = crate::session::sendable(&enc.channels, channel)
         {
             push_packet!(enc.write, {
                 msg::CHANNEL_REQUEST.encode(&mut enc.write)?;
@@ -244,7 +244,7 @@ impl Session {
 
     pub fn signal(&mut self, channel: ChannelId, signal: Sig) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted
-            && let Some(channel) = enc.channels.get(&channel)
+            && let Some(channel) = crate::session::sendable(&enc.channels, channel)
         {
             push_packet!(enc.write, {
                 msg::CHANNEL_REQUEST.encode(&mut enc.write)?;
@@ -264,7 +264,7 @@ impl Session {
         name: &str,
     ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted
-            && let Some(channel) = enc.channels.get(&channel)
+            && let Some(channel) = crate::session::sendable(&enc.channels, channel)
         {
             push_packet!(enc.write, {
                 msg::CHANNEL_REQUEST.encode(&mut enc.write)?;
@@ -287,7 +287,7 @@ impl Session {
         pix_height: u32,
     ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted
-            && let Some(channel) = enc.channels.get(&channel)
+            && let Some(channel) = crate::session::sendable(&enc.channels, channel)
         {
             push_packet!(enc.write, {
                 msg::CHANNEL_REQUEST.encode(&mut enc.write)?;
@@ -311,6 +311,14 @@ impl Session {
     pub fn tcpip_forward(
         &mut self,
         reply_channel: Option<oneshot::Sender<Option<u32>>>,
+        address: &str,
+        port: u32,
+    ) -> Result<(), crate::Error> {
+        self.tcpip_forward_reply(reply_channel.map(super::ForwardReply::from), address, port)
+    }
+    pub(super) fn tcpip_forward_reply(
+        &mut self,
+        reply_channel: Option<super::ForwardReply<Option<u32>>>,
         address: &str,
         port: u32,
     ) -> Result<(), crate::Error> {
@@ -342,6 +350,14 @@ impl Session {
         address: &str,
         port: u32,
     ) -> Result<(), crate::Error> {
+        self.cancel_tcpip_forward_reply(reply_channel.map(super::ForwardReply::from), address, port)
+    }
+    pub(super) fn cancel_tcpip_forward_reply(
+        &mut self,
+        reply_channel: Option<super::ForwardReply<bool>>,
+        address: &str,
+        port: u32,
+    ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
             let want_reply = reply_channel.is_some();
             if let Some(reply_channel) = reply_channel {
@@ -369,6 +385,13 @@ impl Session {
         reply_channel: Option<oneshot::Sender<bool>>,
         socket_path: &str,
     ) -> Result<(), crate::Error> {
+        self.streamlocal_forward_reply(reply_channel.map(super::ForwardReply::from), socket_path)
+    }
+    pub(super) fn streamlocal_forward_reply(
+        &mut self,
+        reply_channel: Option<super::ForwardReply<bool>>,
+        socket_path: &str,
+    ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
             let want_reply = reply_channel.is_some();
             if let Some(reply_channel) = reply_channel {
@@ -393,6 +416,16 @@ impl Session {
     pub fn cancel_streamlocal_forward(
         &mut self,
         reply_channel: Option<oneshot::Sender<bool>>,
+        socket_path: &str,
+    ) -> Result<(), crate::Error> {
+        self.cancel_streamlocal_forward_reply(
+            reply_channel.map(super::ForwardReply::from),
+            socket_path,
+        )
+    }
+    pub(super) fn cancel_streamlocal_forward_reply(
+        &mut self,
+        reply_channel: Option<super::ForwardReply<bool>>,
         socket_path: &str,
     ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
@@ -520,10 +553,38 @@ impl Session {
         channel: ChannelId,
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), crate::Error> {
+        let data = data.into();
+        self.charge(channel, data.len());
+        self.admitted_data(channel, None, data)
+    }
+
+    /// Debits the channel writers' credit for data taken outside them.
+    pub(crate) fn charge(&self, channel: ChannelId, bytes: usize) {
+        if let Some(chan) = self.channels.get(&channel) {
+            chan.window_size().charge(bytes);
+        }
+    }
+
+    /// Sends data whose credit is already taken.
+    pub(crate) fn admitted_data(
+        &mut self,
+        channel: ChannelId,
+        ext: Option<u32>,
+        data: bytes::Bytes,
+    ) -> Result<(), crate::Error> {
         let is_rekeying = self.kex.active();
         let common = &mut self.common;
         if let Some(enc) = common.encrypted.as_mut() {
-            enc.data_with_writer(&mut common.packet_writer, channel, data, is_rekeying)
+            match ext {
+                None => enc.data_with_writer(&mut common.packet_writer, channel, data, is_rekeying),
+                Some(ext) => enc.extended_data_with_writer(
+                    &mut common.packet_writer,
+                    channel,
+                    ext,
+                    data,
+                    is_rekeying,
+                ),
+            }
         } else {
             unreachable!()
         }
@@ -551,19 +612,9 @@ impl Session {
         ext: u32,
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), crate::Error> {
-        let is_rekeying = self.kex.active();
-        let common = &mut self.common;
-        if let Some(enc) = common.encrypted.as_mut() {
-            enc.extended_data_with_writer(
-                &mut common.packet_writer,
-                channel,
-                ext,
-                data,
-                is_rekeying,
-            )
-        } else {
-            unreachable!()
-        }
+        let data = data.into();
+        self.charge(channel, data.len());
+        self.admitted_data(channel, Some(ext), data)
     }
 
     pub fn agent_forward(
@@ -572,7 +623,7 @@ impl Session {
         want_reply: bool,
     ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted
-            && let Some(channel) = enc.channels.get(&channel)
+            && let Some(channel) = crate::session::sendable(&enc.channels, channel)
         {
             push_packet!(enc.write, {
                 msg::CHANNEL_REQUEST.encode(&mut enc.write)?;

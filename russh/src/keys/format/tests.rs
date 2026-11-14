@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
 use ssh_key::{Algorithm, PrivateKey};
 
 use crate::keys::pkcs8::{decode_pkcs8, encode_pkcs8_encrypted};

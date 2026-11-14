@@ -248,6 +248,7 @@ impl KexAlgorithmImplementor for MlKem768X25519Kex {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use super::*;
     use ssh_encoding::Encode;
 

@@ -144,16 +144,20 @@ impl Session {
                         Some((&msg::USERAUTH_FAILURE, mut r)) => {
                             debug!("userauth_failure");
 
-                            let remaining_methods: MethodSet =
-                                (&map_err!(NameList::decode(&mut r))?).into();
+                            let methods = map_err!(NameList::decode(&mut r))?;
                             let partial_success = map_err!(u8::decode(&mut r))? != 0;
                             map_err!(ensure_end(&r))?;
+                            client.auth_failure(&methods.0, partial_success, self).await?;
+                            let remaining_methods: MethodSet = (&methods).into();
                             debug!(
                                 "remaining methods {remaining_methods:?}, partial success {partial_success:?}"
                             );
-                            auth_request.methods = remaining_methods.clone();
-
-                            let no_more_methods = auth_request.methods.is_empty();
+                            if let Some(enc) = self.common.encrypted.as_mut()
+                                && let EncryptedState::WaitingAuthRequest(auth_request) = &mut enc.state
+                            {
+                                auth_request.methods = remaining_methods.clone();
+                            }
+                            let no_more_methods = remaining_methods.is_empty();
                             self.common.auth_method = None;
                             self.sender
                                 .send(Reply::AuthFailure {
@@ -168,7 +172,16 @@ impl Session {
                             }
                         }
                         Some((&msg::USERAUTH_INFO_REQUEST_OR_USERAUTH_PK_OK, mut r)) => {
-                            if let Some(auth::CurrentRequest::GssapiWithMic) = auth_request.current
+                            if let Some(auth::CurrentRequest::Password) = auth_request.current {
+                                let prompt = map_err!(String::decode(&mut r))?;
+                                let language = map_err!(String::decode(&mut r))?;
+                                map_err!(ensure_end(&r))?;
+                                self.sender
+                                    .send(Reply::AuthPasswordChange { prompt, language })
+                                    .map_err(|_| crate::Error::SendError)?;
+                                return Ok(());
+                            } else if let Some(auth::CurrentRequest::GssapiWithMic) =
+                                auth_request.current
                             {
                                 debug!("userauth_gssapi_response");
                                 let selected_mechanism = map_err!(Bytes::decode(&mut r))?.to_vec();
@@ -383,7 +396,7 @@ impl Session {
                                 let _language_tag = map_err!(String::decode(&mut r))?;
                                 map_err!(ensure_end(&r))?;
                                 warn!(
-                                    "userauth_gssapi_error major={major_status} minor={minor_status}: {message}"
+                                    "userauth_gssapi_error major={major_status} minor={minor_status}"
                                 );
                                 self.sender
                                     .send(Reply::AuthGssapiError {
@@ -488,9 +501,11 @@ impl Session {
                 let msg = ChannelOpenConfirmation::parse(&mut reader)?;
                 map_err!(ensure_end(&reader))?;
                 let local_id = ChannelId(msg.recipient_channel);
+                let before;
 
                 if let Some(ref mut enc) = self.common.encrypted {
                     if let Some(parameters) = enc.channels.get_mut(&local_id) {
+                        before = parameters.recipient_window_size;
                         parameters.confirm(&msg);
                     } else {
                         // We've not requested this channel, close connection.
@@ -501,6 +516,12 @@ impl Session {
                 };
 
                 if let Some(channel) = self.channels.get(&local_id) {
+                    // Writers' credit moves as the window does, here before any
+                    // WINDOW_ADJUST can add to it. A repeated confirmation
+                    // replaces the window, so it moves by the difference.
+                    let window = msg.initial_window_size;
+                    channel.window_size().grant(window.saturating_sub(before));
+                    channel.window_size().charge(before.saturating_sub(window) as usize);
                     channel
                         .send(ChannelMsg::Open {
                             id: local_id,
@@ -532,7 +553,7 @@ impl Session {
                 if let Some(ref mut enc) = self.common.encrypted {
                     // The CHANNEL_CLOSE message must be sent to the server at this point or the session
                     // will not be released.
-                    enc.close(channel_num)?;
+                    enc.receive_close(channel_num)?;
                 }
                 // Forward the close to the channel before removing it, so that
                 // consumers waiting on `Channel::wait()` receive an explicit
@@ -558,7 +579,8 @@ impl Session {
             Some((&msg::CHANNEL_OPEN_FAILURE, mut r)) => {
                 debug!("channel_open_failure");
                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
-                let reason_code = ChannelOpenFailure::from_u32(map_err!(u32::decode(&mut r))?)
+                let raw_reason = map_err!(u32::decode(&mut r))?;
+                let reason_code = ChannelOpenFailure::from_u32(raw_reason)
                     .unwrap_or(ChannelOpenFailure::AdministrativelyProhibited);
                 let descr = map_err!(String::decode(&mut r))?;
                 let language = map_err!(String::decode(&mut r))?;
@@ -577,7 +599,11 @@ impl Session {
 
                 if let Some(sender) = self.channels.remove(&channel_num) {
                     let _ = sender
-                        .send(ChannelMsg::OpenFailure(reason_code.clone()))
+                        .send(ChannelMsg::OpenFailure(crate::RemoteChannelOpenFailureInfo {
+                            reason_code: raw_reason,
+                            description: descr.clone(),
+                            language: language.clone(),
+                        }))
                         .await;
                 }
 
@@ -595,20 +621,15 @@ impl Session {
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
-                let target = self.common.config.window_size;
-                #[allow(clippy::collapsible_if)]
                 if let Some(ref mut enc) = self.common.encrypted {
-                    if enc.adjust_window_size(channel_num, &data, target)? {
-                        let next_window =
-                            client.adjust_window(channel_num, self.target_window_size);
-                        if next_window > 0 {
-                            self.target_window_size = next_window
-                        }
-                    }
+                    // Receive credit belongs to the application reader, not packet arrival.
+                    enc.debit_window(channel_num, data.len())?;
                 }
 
                 if let Some(chan) = self.channels.get(&channel_num) {
                     let _ = chan.send(ChannelMsg::Data { data: data.clone() }).await;
+                } else {
+                    self.credit_unread(channel_num, data.len())?;
                 }
 
                 client.data(channel_num, &data, self).await
@@ -622,16 +643,9 @@ impl Session {
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
-                let target = self.common.config.window_size;
-                #[allow(clippy::collapsible_if)]
                 if let Some(ref mut enc) = self.common.encrypted {
-                    if enc.adjust_window_size(channel_num, &data, target)? {
-                        let next_window =
-                            client.adjust_window(channel_num, self.target_window_size);
-                        if next_window > 0 {
-                            self.target_window_size = next_window
-                        }
-                    }
+                    // Receive credit belongs to the application reader, not packet arrival.
+                    enc.debit_window(channel_num, data.len())?;
                 }
 
                 if let Some(chan) = self.channels.get(&channel_num) {
@@ -641,6 +655,8 @@ impl Session {
                             data: data.clone(),
                         })
                         .await;
+                } else {
+                    self.credit_unread(channel_num, data.len())?;
                 }
 
                 client
@@ -709,7 +725,7 @@ impl Session {
                             if let Some(ref mut enc) = self.common.encrypted {
                                 trace!("Received channel keep alive message: {req:?}",);
                                 self.common.wants_reply = false;
-                                if let Some(ch) = enc.channels.get(&channel_num) {
+                                if let Some(ch) = crate::session::sendable(&enc.channels, channel_num) {
                                     push_packet!(enc.write, {
                                         map_err!(msg::CHANNEL_SUCCESS.encode(&mut enc.write))?;
                                         map_err!(ch.recipient_channel.encode(&mut enc.write))?;
@@ -727,7 +743,7 @@ impl Session {
                             && let Some(ref mut enc) = self.common.encrypted
                         {
                             self.common.wants_reply = false;
-                            if let Some(ch) = enc.channels.get(&channel_num) {
+                            if let Some(ch) = crate::session::sendable(&enc.channels, channel_num) {
                                 push_packet!(enc.write, {
                                     map_err!(msg::CHANNEL_FAILURE.encode(&mut enc.write))?;
                                     map_err!(ch.recipient_channel.encode(&mut enc.write))?;
@@ -747,10 +763,12 @@ impl Session {
                     return Ok(());
                 }
                 let mut new_size = 0;
+                let mut granted = 0;
                 debug!("channel_window_adjust amount: {amount:?}");
                 if let Some(ref mut enc) = self.common.encrypted {
                     if let Some(ref mut channel) = enc.channels.get_mut(&channel_num) {
                         new_size = channel.recipient_window_size.saturating_add(amount);
+                        granted = new_size - channel.recipient_window_size;
                         channel.recipient_window_size = new_size;
                     } else {
                         return Ok(());
@@ -767,10 +785,13 @@ impl Session {
                     )? as u32;
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    chan.window_size().grow(amount).await;
+                    // Writers' credit grows by what the window grew by. Setting
+                    // it to the window would count again the data they already
+                    // queued and the engine has not taken yet.
+                    chan.window_size().grant(granted);
                     // Use try_send to avoid blocking the session loop when channel buffer is full.
-                    // WindowAdjusted is informational - the critical side effect (updating
-                    // WindowSizeRef and notifying ChannelTx) already happens in grow().
+                    // WindowAdjusted is informational - the critical side effect (granting the
+                    // writers' credit and waking them) already happened.
                     let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
                 }
                 client.window_adjusted(channel_num, new_size, self).await
@@ -812,27 +833,27 @@ impl Session {
                 self.common.received_data = false;
                 Ok(())
             }
-            Some((&msg::CHANNEL_SUCCESS, mut r)) => {
+            Some((&msg::CHANNEL_SUCCESS, mut r)) | Some((&msg::CHANNEL_FAILURE, mut r)) => {
+                let success = buf.first() == Some(&msg::CHANNEL_SUCCESS);
                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
                 map_err!(ensure_end(&r))?;
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
-                if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Success).await;
+                // The handler takes the reply first; only one it lets through
+                // reaches the channel's reader.
+                if client.channel_reply(channel_num, success, self).await?
+                    && let Some(chan) = self.channels.get(&channel_num)
+                {
+                    let _ = chan
+                        .send(if success {
+                            ChannelMsg::Success
+                        } else {
+                            ChannelMsg::Failure
+                        })
+                        .await;
                 }
-                client.channel_success(channel_num, self).await
-            }
-            Some((&msg::CHANNEL_FAILURE, mut r)) => {
-                let channel_num = map_err!(ChannelId::decode(&mut r))?;
-                map_err!(ensure_end(&r))?;
-                if !self.common.is_established_channel(channel_num) {
-                    return Ok(());
-                }
-                if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Failure).await;
-                }
-                client.channel_failure(channel_num, self).await
+                Ok(())
             }
             Some((&msg::CHANNEL_OPEN, mut r)) => {
                 let msg = OpenChannelMessage::parse(&mut r)?;
@@ -843,7 +864,8 @@ impl Session {
                     return Err(crate::Error::Inconsistent.into());
                 };
 
-                let channel_params = ChannelParams {
+                let mut channel_params = ChannelParams {
+                    _handles: None,
                     recipient_channel: msg.recipient_channel,
                     sender_channel: id,
                     recipient_window_size: msg.recipient_window_size,
@@ -855,15 +877,27 @@ impl Session {
                     pending_data: std::collections::VecDeque::new(),
                     pending_eof: false,
                     pending_close: false,
+                    close_sent: false,
+                    close_received: false,
                 };
 
-                let (channel, channel_ref) = Channel::new(
+                let (mut channel, mut channel_ref) = Channel::new(
                     id,
                     self.inbound_channel_sender.clone(),
                     channel_params.recipient_maximum_packet_size,
                     channel_params.recipient_window_size,
                     self.common.config.channel_buffer_size,
+                    self.managed_close.clone(),
                 );
+
+                let inbox = crate::channels::inbox::Inbox::new(
+                    self.managed_close.clone(),
+                    self.common.config.channel_buffer_size,
+                );
+                channel.read_half.inbox = Some(inbox.clone());
+                channel_ref.inbox = Some(inbox);
+
+                channel_params._handles = channel_ref.handles.clone();
 
                 let pending = crate::PendingChannelOpen {
                     recipient_channel: msg.recipient_channel,
@@ -981,28 +1015,17 @@ impl Session {
                         debug!("no-more-sessions@openssh.com requests success");
                     }
                     Some(GlobalRequestResponse::TcpIpForward(return_channel)) => {
-                        let result = if r.is_empty() {
-                            // If a specific port was requested, the reply has no data
-                            Some(0)
+                        // If a specific port was requested, the reply has no
+                        // data. A reply that cannot be decoded is a protocol
+                        // error, not the server's REQUEST_FAILURE.
+                        let port = if r.is_empty() {
+                            0
                         } else {
-                            match u32::decode(&mut r) {
-                                Ok(port) => {
-                                    if let Err(e) = ensure_end(&r) {
-                                        error!(
-                                            "Error parsing port for TcpIpForward request: {e:?}"
-                                        );
-                                        None
-                                    } else {
-                                        Some(port)
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Error parsing port for TcpIpForward request: {e:?}");
-                                    None
-                                }
-                            }
+                            let port = map_err!(u32::decode(&mut r))?;
+                            map_err!(ensure_end(&r))?;
+                            port
                         };
-                        let _ = return_channel.send(result);
+                        let _ = return_channel.send(Some(port));
                     }
                     Some(GlobalRequestResponse::CancelTcpIpForward(return_channel)) => {
                         map_err!(ensure_end(&r))?;
@@ -1122,265 +1145,6 @@ impl Session {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::num::Wrapping;
-
-    use byteorder::{BigEndian, ByteOrder};
-    use ssh_encoding::{Decode, Encode};
-
-    use super::*;
-    use crate::compression::{Compression, Decompress};
-    use crate::kex::{KEXES, NONE};
-    use crate::session::Exchange;
-    use crate::{CryptoVec, MethodKind};
-
-    fn test_encrypted() -> Encrypted {
-        Encrypted {
-            state: EncryptedState::Authenticated,
-            exchange: Some(Exchange::default()),
-            kex: KEXES.get(&NONE).unwrap().make(),
-            key: 0,
-            client_mac: crate::mac::NONE,
-            server_mac: crate::mac::NONE,
-            session_id: CryptoVec::from(&b"session-id"[..]),
-            channels: HashMap::new(),
-            last_channel_id: Wrapping(0),
-            write: Vec::new(),
-            write_cursor: 0,
-            last_rekey: russh_util::time::Instant::now(),
-            server_compression: Compression::None,
-            client_compression: Compression::None,
-            decompress: Decompress::None,
-            rekey_wanted: false,
-            received_extensions: Vec::new(),
-            extension_info_awaiters: HashMap::new(),
-        }
-    }
-
-    fn payloads(buf: &[u8]) -> Vec<&[u8]> {
-        let mut payloads = Vec::new();
-        let mut cursor = 0;
-        while cursor < buf.len() {
-            let packet_len = BigEndian::read_u32(&buf[cursor..cursor + 4]) as usize;
-            let payload_start = cursor + 4;
-            let payload_end = payload_start + packet_len;
-            payloads.push(&buf[payload_start..payload_end]);
-            cursor = payload_end;
-        }
-        payloads
-    }
-
-    #[test]
-    fn method_kind_parses_gssapi_with_mic() {
-        assert_eq!(
-            "gssapi-with-mic".parse::<MethodKind>(),
-            Ok(MethodKind::GssapiWithMic)
-        );
-        assert_eq!(<&str>::from(&MethodKind::GssapiWithMic), "gssapi-with-mic");
-    }
-
-    #[test]
-    fn write_auth_request_encodes_gssapi_with_mic() {
-        let krb5_oid = b"\x06\x09\x2a\x86\x48\x86\xf7\x12\x01\x02\x02".to_vec();
-        let mut encrypted = test_encrypted();
-        let wrote = encrypted
-            .write_auth_request(
-                "alice",
-                &auth::Method::GssapiWithMic {
-                    mechanism_oids: vec![krb5_oid.clone()],
-                },
-            )
-            .unwrap();
-        assert!(wrote);
-
-        let payloads = payloads(&encrypted.write);
-        assert_eq!(payloads.len(), 1);
-        let mut r = payloads[0];
-        assert_eq!(u8::decode(&mut r).unwrap(), msg::USERAUTH_REQUEST);
-        assert_eq!(String::decode(&mut r).unwrap(), "alice");
-        assert_eq!(String::decode(&mut r).unwrap(), "ssh-connection");
-        assert_eq!(String::decode(&mut r).unwrap(), "gssapi-with-mic");
-        assert_eq!(u32::decode(&mut r).unwrap(), 1);
-        assert_eq!(Vec::<u8>::decode(&mut r).unwrap(), krb5_oid);
-        ensure_end(&r).unwrap();
-    }
-
-    #[test]
-    fn client_make_gssapi_mic_data_matches_rfc_4462() {
-        let mut encrypted = test_encrypted();
-        let mut got = Vec::new();
-        let mic_data = encrypted
-            .client_make_gssapi_mic_data("alice", &mut got)
-            .unwrap();
-
-        let mut expected = Vec::new();
-        b"session-id".as_slice().encode(&mut expected).unwrap();
-        expected.push(msg::USERAUTH_REQUEST);
-        "alice".encode(&mut expected).unwrap();
-        "ssh-connection".encode(&mut expected).unwrap();
-        "gssapi-with-mic".encode(&mut expected).unwrap();
-        assert_eq!(mic_data, expected);
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn client_send_gssapi_mic_sends_optional_token_before_mic() {
-        let mut encrypted = test_encrypted();
-        encrypted
-            .client_send_gssapi_mic(Some(b"context-token"), b"mic")
-            .unwrap();
-
-        let payloads = payloads(&encrypted.write);
-        assert_eq!(payloads.len(), 2);
-
-        let mut token = payloads[0];
-        assert_eq!(u8::decode(&mut token).unwrap(), msg::USERAUTH_GSSAPI_TOKEN);
-        assert_eq!(
-            Vec::<u8>::decode(&mut token).unwrap(),
-            b"context-token".to_vec()
-        );
-        ensure_end(&token).unwrap();
-
-        let mut mic = payloads[1];
-        assert_eq!(u8::decode(&mut mic).unwrap(), msg::USERAUTH_GSSAPI_MIC);
-        assert_eq!(Vec::<u8>::decode(&mut mic).unwrap(), b"mic".to_vec());
-        ensure_end(&mic).unwrap();
-    }
-
-    #[test]
-    fn client_send_gssapi_exchange_complete_sends_optional_token_first() {
-        let mut encrypted = test_encrypted();
-        encrypted
-            .client_send_gssapi_exchange_complete(Some(b"context-token"))
-            .unwrap();
-
-        let payloads = payloads(&encrypted.write);
-        assert_eq!(payloads.len(), 2);
-
-        let mut token = payloads[0];
-        assert_eq!(u8::decode(&mut token).unwrap(), msg::USERAUTH_GSSAPI_TOKEN);
-        assert_eq!(
-            Vec::<u8>::decode(&mut token).unwrap(),
-            b"context-token".to_vec()
-        );
-        ensure_end(&token).unwrap();
-
-        let mut complete = payloads[1];
-        assert_eq!(
-            u8::decode(&mut complete).unwrap(),
-            msg::USERAUTH_GSSAPI_EXCHANGE_COMPLETE
-        );
-        ensure_end(&complete).unwrap();
-    }
-
-    #[test]
-    fn client_send_gssapi_mic_skips_empty_final_token() {
-        let mut encrypted = test_encrypted();
-        encrypted.client_send_gssapi_mic(Some(b""), b"mic").unwrap();
-
-        let payloads = payloads(&encrypted.write);
-        assert_eq!(payloads.len(), 1);
-        let mut mic = payloads[0];
-        assert_eq!(u8::decode(&mut mic).unwrap(), msg::USERAUTH_GSSAPI_MIC);
-        assert_eq!(Vec::<u8>::decode(&mut mic).unwrap(), b"mic".to_vec());
-        ensure_end(&mic).unwrap();
-    }
-
-    fn rsa_user_certificate() -> ssh_key::Certificate {
-        let subject =
-            ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Rsa { hash: None })
-                .unwrap();
-        let ca =
-            ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
-        let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
-            &mut rand::rng(),
-            subject.public_key(),
-            0,
-            u64::MAX,
-        )
-        .unwrap();
-        builder.key_id("rsa-user-cert").unwrap();
-        builder
-            .cert_type(ssh_key::certificate::CertType::User)
-            .unwrap();
-        builder.valid_principal("alice").unwrap();
-        builder.sign(&ca).unwrap()
-    }
-
-    fn decode_userauth_certificate_algorithm(
-        mut request: &[u8],
-        expected_has_signature: bool,
-    ) -> String {
-        assert_eq!(u8::decode(&mut request).unwrap(), msg::USERAUTH_REQUEST);
-        assert_eq!(String::decode(&mut request).unwrap(), "alice");
-        assert_eq!(String::decode(&mut request).unwrap(), "ssh-connection");
-        assert_eq!(String::decode(&mut request).unwrap(), "publickey");
-        assert_eq!(
-            u8::decode(&mut request).unwrap(),
-            u8::from(expected_has_signature)
-        );
-        let algorithm = String::decode(&mut request).unwrap();
-        let _certificate = Vec::<u8>::decode(&mut request).unwrap();
-        ensure_end(&request).unwrap();
-        algorithm
-    }
-
-    #[cfg(feature = "rsa")]
-    #[test]
-    fn rsa_future_certificate_hash_is_encoded_in_probe_and_signed_requests() {
-        let certificate = rsa_user_certificate();
-        for (hash_alg, expected) in [
-            (
-                Some(ssh_key::HashAlg::Sha512),
-                "rsa-sha2-512-cert-v01@openssh.com",
-            ),
-            (
-                Some(ssh_key::HashAlg::Sha256),
-                "rsa-sha2-256-cert-v01@openssh.com",
-            ),
-            (None, "ssh-rsa-cert-v01@openssh.com"),
-        ] {
-            let mut encrypted = test_encrypted();
-            encrypted
-                .write_auth_request(
-                    "alice",
-                    &auth::Method::FutureCertificate {
-                        cert: certificate.clone(),
-                        hash_alg,
-                    },
-                )
-                .unwrap();
-            let probe_payloads = payloads(&encrypted.write);
-            assert_eq!(probe_payloads.len(), 1);
-            assert_eq!(
-                decode_userauth_certificate_algorithm(probe_payloads[0], false),
-                expected
-            );
-
-            let mut signed = Vec::new();
-            encrypted
-                .client_make_to_sign(
-                    "alice",
-                    &PublicKeyOrCertificate::Certificate(certificate.clone()),
-                    hash_alg,
-                    &mut signed,
-                )
-                .unwrap();
-            let mut signed_request = signed.as_slice();
-            assert_eq!(
-                Vec::<u8>::decode(&mut signed_request).unwrap(),
-                b"session-id"
-            );
-            assert_eq!(
-                decode_userauth_certificate_algorithm(signed_request, true),
-                expected
-            );
-        }
-    }
-}
-
 impl Encrypted {
     fn write_auth_request(
         &mut self,
@@ -1398,12 +1162,18 @@ impl Encrypted {
                     "none".encode(&mut self.write)?;
                     true
                 }
-                auth::Method::Password { ref password } => {
+                auth::Method::Password {
+                    ref password,
+                    ref new_password,
+                } => {
                     user.encode(&mut self.write)?;
                     "ssh-connection".encode(&mut self.write)?;
                     "password".encode(&mut self.write)?;
-                    0u8.encode(&mut self.write)?;
+                    u8::from(new_password.is_some()).encode(&mut self.write)?;
                     password.encode(&mut self.write)?;
+                    if let Some(new_password) = new_password {
+                        new_password.encode(&mut self.write)?;
+                    }
                     true
                 }
                 auth::Method::PublicKey { ref key } => {
@@ -1619,5 +1389,291 @@ impl Encrypted {
             }
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)] // Test assertions on fixture replies and bytes must fail on unexpected values.
+    use std::collections::HashMap;
+    use std::num::Wrapping;
+
+    use byteorder::{BigEndian, ByteOrder};
+    use ssh_encoding::{Decode, Encode};
+
+    use super::*;
+    use crate::compression::{Compression, Decompress};
+    use crate::kex::{KEXES, NONE};
+    use crate::session::Exchange;
+    use crate::{CryptoVec, MethodKind};
+
+    fn test_encrypted() -> Encrypted {
+        Encrypted {
+            state: EncryptedState::Authenticated,
+            exchange: Some(Exchange::default()),
+            kex: KEXES.get(&NONE).unwrap().make(),
+            key: 0,
+            client_mac: crate::mac::NONE,
+            server_mac: crate::mac::NONE,
+            session_id: CryptoVec::from(&b"session-id"[..]),
+            channels: HashMap::new(),
+            last_channel_id: Wrapping(0),
+            write: Vec::new(),
+            write_cursor: 0,
+            last_rekey: russh_util::time::Instant::now(),
+            server_compression: Compression::None,
+            client_compression: Compression::None,
+            decompress: Decompress::None,
+            rekey_wanted: false,
+            received_extensions: Vec::new(),
+            extension_info_awaiters: HashMap::new(),
+        }
+    }
+
+    fn payloads(buf: &[u8]) -> Vec<&[u8]> {
+        let mut payloads = Vec::new();
+        let mut cursor = 0;
+        while cursor < buf.len() {
+            let packet_len = BigEndian::read_u32(&buf[cursor..cursor + 4]) as usize;
+            let payload_start = cursor + 4;
+            let payload_end = payload_start + packet_len;
+            payloads.push(&buf[payload_start..payload_end]);
+            cursor = payload_end;
+        }
+        payloads
+    }
+
+    #[test]
+    fn method_kind_parses_gssapi_with_mic() {
+        assert_eq!(
+            "gssapi-with-mic".parse::<MethodKind>(),
+            Ok(MethodKind::GssapiWithMic)
+        );
+        assert_eq!(<&str>::from(&MethodKind::GssapiWithMic), "gssapi-with-mic");
+    }
+
+    #[test]
+    fn password_change_encodes_only_an_explicit_replacement() {
+        for replacement in [None, Some("replacement")] {
+            let mut encrypted = test_encrypted();
+            let method = auth::Method::Password {
+                password: "old".into(),
+                new_password: replacement.map(str::to_owned),
+            };
+            assert!(matches!(AuthRequest::new(&method).current, Some(auth::CurrentRequest::Password)));
+            assert!(encrypted.write_auth_request("alice", &method).unwrap());
+            let packets = payloads(&encrypted.write);
+            assert_eq!(packets.len(), 1);
+            let mut r = packets[0];
+            assert_eq!(u8::decode(&mut r).unwrap(), msg::USERAUTH_REQUEST);
+            assert_eq!(String::decode(&mut r).unwrap(), "alice");
+            assert_eq!(String::decode(&mut r).unwrap(), "ssh-connection");
+            assert_eq!(String::decode(&mut r).unwrap(), "password");
+            assert_eq!(u8::decode(&mut r).unwrap(), u8::from(replacement.is_some()));
+            assert_eq!(String::decode(&mut r).unwrap(), "old");
+            if let Some(replacement) = replacement {
+                assert_eq!(String::decode(&mut r).unwrap(), replacement);
+            }
+            ensure_end(&r).unwrap();
+        }
+    }
+
+    #[test]
+    fn write_auth_request_encodes_gssapi_with_mic() {
+        let krb5_oid = b"\x06\x09\x2a\x86\x48\x86\xf7\x12\x01\x02\x02".to_vec();
+        let mut encrypted = test_encrypted();
+        let wrote = encrypted
+            .write_auth_request(
+                "alice",
+                &auth::Method::GssapiWithMic {
+                    mechanism_oids: vec![krb5_oid.clone()],
+                },
+            )
+            .unwrap();
+        assert!(wrote);
+
+        let payloads = payloads(&encrypted.write);
+        assert_eq!(payloads.len(), 1);
+        let mut r = payloads[0];
+        assert_eq!(u8::decode(&mut r).unwrap(), msg::USERAUTH_REQUEST);
+        assert_eq!(String::decode(&mut r).unwrap(), "alice");
+        assert_eq!(String::decode(&mut r).unwrap(), "ssh-connection");
+        assert_eq!(String::decode(&mut r).unwrap(), "gssapi-with-mic");
+        assert_eq!(u32::decode(&mut r).unwrap(), 1);
+        assert_eq!(Vec::<u8>::decode(&mut r).unwrap(), krb5_oid);
+        ensure_end(&r).unwrap();
+    }
+
+    #[test]
+    fn client_make_gssapi_mic_data_matches_rfc_4462() {
+        let mut encrypted = test_encrypted();
+        let mut got = Vec::new();
+        let mic_data = encrypted
+            .client_make_gssapi_mic_data("alice", &mut got)
+            .unwrap();
+
+        let mut expected = Vec::new();
+        b"session-id".as_slice().encode(&mut expected).unwrap();
+        expected.push(msg::USERAUTH_REQUEST);
+        "alice".encode(&mut expected).unwrap();
+        "ssh-connection".encode(&mut expected).unwrap();
+        "gssapi-with-mic".encode(&mut expected).unwrap();
+        assert_eq!(mic_data, expected);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn client_send_gssapi_mic_sends_optional_token_before_mic() {
+        let mut encrypted = test_encrypted();
+        encrypted
+            .client_send_gssapi_mic(Some(b"context-token"), b"mic")
+            .unwrap();
+
+        let payloads = payloads(&encrypted.write);
+        assert_eq!(payloads.len(), 2);
+
+        let mut token = payloads[0];
+        assert_eq!(u8::decode(&mut token).unwrap(), msg::USERAUTH_GSSAPI_TOKEN);
+        assert_eq!(
+            Vec::<u8>::decode(&mut token).unwrap(),
+            b"context-token".to_vec()
+        );
+        ensure_end(&token).unwrap();
+
+        let mut mic = payloads[1];
+        assert_eq!(u8::decode(&mut mic).unwrap(), msg::USERAUTH_GSSAPI_MIC);
+        assert_eq!(Vec::<u8>::decode(&mut mic).unwrap(), b"mic".to_vec());
+        ensure_end(&mic).unwrap();
+    }
+
+    #[test]
+    fn client_send_gssapi_exchange_complete_sends_optional_token_first() {
+        let mut encrypted = test_encrypted();
+        encrypted
+            .client_send_gssapi_exchange_complete(Some(b"context-token"))
+            .unwrap();
+
+        let payloads = payloads(&encrypted.write);
+        assert_eq!(payloads.len(), 2);
+
+        let mut token = payloads[0];
+        assert_eq!(u8::decode(&mut token).unwrap(), msg::USERAUTH_GSSAPI_TOKEN);
+        assert_eq!(
+            Vec::<u8>::decode(&mut token).unwrap(),
+            b"context-token".to_vec()
+        );
+        ensure_end(&token).unwrap();
+
+        let mut complete = payloads[1];
+        assert_eq!(
+            u8::decode(&mut complete).unwrap(),
+            msg::USERAUTH_GSSAPI_EXCHANGE_COMPLETE
+        );
+        ensure_end(&complete).unwrap();
+    }
+
+    #[test]
+    fn client_send_gssapi_mic_skips_empty_final_token() {
+        let mut encrypted = test_encrypted();
+        encrypted.client_send_gssapi_mic(Some(b""), b"mic").unwrap();
+
+        let payloads = payloads(&encrypted.write);
+        assert_eq!(payloads.len(), 1);
+        let mut mic = payloads[0];
+        assert_eq!(u8::decode(&mut mic).unwrap(), msg::USERAUTH_GSSAPI_MIC);
+        assert_eq!(Vec::<u8>::decode(&mut mic).unwrap(), b"mic".to_vec());
+        ensure_end(&mic).unwrap();
+    }
+
+    fn rsa_user_certificate() -> ssh_key::Certificate {
+        let subject =
+            ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Rsa { hash: None })
+                .unwrap();
+        let ca =
+            ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rand::rng(),
+            subject.public_key(),
+            0,
+            u64::MAX,
+        )
+        .unwrap();
+        builder.key_id("rsa-user-cert").unwrap();
+        builder
+            .cert_type(ssh_key::certificate::CertType::User)
+            .unwrap();
+        builder.valid_principal("alice").unwrap();
+        builder.sign(&ca).unwrap()
+    }
+
+    fn decode_userauth_certificate_algorithm(
+        mut request: &[u8],
+        expected_has_signature: bool,
+    ) -> String {
+        assert_eq!(u8::decode(&mut request).unwrap(), msg::USERAUTH_REQUEST);
+        assert_eq!(String::decode(&mut request).unwrap(), "alice");
+        assert_eq!(String::decode(&mut request).unwrap(), "ssh-connection");
+        assert_eq!(String::decode(&mut request).unwrap(), "publickey");
+        assert_eq!(
+            u8::decode(&mut request).unwrap(),
+            u8::from(expected_has_signature)
+        );
+        let algorithm = String::decode(&mut request).unwrap();
+        let _certificate = Vec::<u8>::decode(&mut request).unwrap();
+        ensure_end(&request).unwrap();
+        algorithm
+    }
+
+    #[cfg(feature = "rsa")]
+    #[test]
+    fn rsa_future_certificate_hash_is_encoded_in_probe_and_signed_requests() {
+        let certificate = rsa_user_certificate();
+        for (hash_alg, expected) in [
+            (
+                Some(ssh_key::HashAlg::Sha512),
+                "rsa-sha2-512-cert-v01@openssh.com",
+            ),
+            (
+                Some(ssh_key::HashAlg::Sha256),
+                "rsa-sha2-256-cert-v01@openssh.com",
+            ),
+            (None, "ssh-rsa-cert-v01@openssh.com"),
+        ] {
+            let mut encrypted = test_encrypted();
+            encrypted
+                .write_auth_request(
+                    "alice",
+                    &auth::Method::FutureCertificate {
+                        cert: certificate.clone(),
+                        hash_alg,
+                    },
+                )
+                .unwrap();
+            let probe_payloads = payloads(&encrypted.write);
+            assert_eq!(probe_payloads.len(), 1);
+            assert_eq!(
+                decode_userauth_certificate_algorithm(probe_payloads[0], false),
+                expected
+            );
+
+            let mut signed = Vec::new();
+            encrypted
+                .client_make_to_sign(
+                    "alice",
+                    &PublicKeyOrCertificate::Certificate(certificate.clone()),
+                    hash_alg,
+                    &mut signed,
+                )
+                .unwrap();
+            let mut signed_request = signed.as_slice();
+            assert_eq!(
+                Vec::<u8>::decode(&mut signed_request).unwrap(),
+                b"session-id"
+            );
+            assert_eq!(
+                decode_userauth_certificate_algorithm(signed_request, true),
+                expected
+            );
+        }
     }
 }

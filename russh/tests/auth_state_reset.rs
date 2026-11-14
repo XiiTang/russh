@@ -36,10 +36,12 @@ impl server::Handler for RemainingMethodsUserSwitchServer {
 
 #[tokio::test]
 async fn auth_does_not_carry_remaining_methods_across_username_change() {
-    let mut server_config = server::Config::default();
-    server_config.inactivity_timeout = None;
-    server_config.auth_rejection_time = Duration::from_millis(1);
-    server_config.auth_rejection_time_initial = Some(Duration::from_millis(1));
+    let mut server_config = server::Config {
+        inactivity_timeout: None,
+        auth_rejection_time: Duration::from_millis(1),
+        auth_rejection_time_initial: Some(Duration::from_millis(1)),
+        ..Default::default()
+    };
     server_config.keys.push(
         PrivateKey::random(&mut rand::rng(), russh::keys::ssh_key::Algorithm::Ed25519).unwrap(),
     );

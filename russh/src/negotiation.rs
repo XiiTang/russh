@@ -640,6 +640,7 @@ pub(crate) fn write_kex(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use ssh_encoding::Encode;
 
     use super::*;

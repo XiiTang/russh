@@ -264,9 +264,27 @@ impl<C> CommonSession<C> {
     }
 }
 
+/// The one gate every writer of a channel message passes: nothing follows
+/// this side's CLOSE (RFC 4254 section 5.3). [`Encrypted::close`] writes the
+/// CLOSE itself.
+pub(crate) fn sendable(
+    channels: &HashMap<ChannelId, ChannelParams>,
+    id: ChannelId,
+) -> Option<&ChannelParams> {
+    channels.get(&id).filter(|channel| !channel.close_sent)
+}
+
+/// [`sendable`], for a writer that also updates the channel's state.
+pub(crate) fn sendable_mut(
+    channels: &mut HashMap<ChannelId, ChannelParams>,
+    id: ChannelId,
+) -> Option<&mut ChannelParams> {
+    channels.get_mut(&id).filter(|channel| !channel.close_sent)
+}
+
 impl Encrypted {
     pub fn byte(&mut self, channel: ChannelId, msg: u8) -> Result<(), crate::Error> {
-        if let Some(channel) = self.channels.get(&channel) {
+        if let Some(channel) = sendable(&self.channels, channel) {
             push_packet!(self.write, {
                 self.write.push(msg);
                 channel.recipient_channel.encode(&mut self.write)?;
@@ -285,10 +303,55 @@ impl Encrypted {
     }
 
     pub fn close(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
-        if let Some(channel) = self.has_pending_data_mut(channel) {
-            channel.pending_close = true;
-        } else {
-            self.byte(channel, msg::CHANNEL_CLOSE)?;
+        let Some(ch) = self.channels.get_mut(&channel) else {
+            return Ok(());
+        };
+        if ch.close_sent {
+            return Ok(());
+        }
+        if !ch.pending_data.is_empty() && !ch.close_received {
+            ch.pending_close = true;
+            return Ok(());
+        }
+        ch.pending_close = false;
+        ch.close_sent = true;
+        let recipient_channel = ch.recipient_channel;
+        push_packet!(self.write, {
+            self.write.push(msg::CHANNEL_CLOSE);
+            recipient_channel.encode(&mut self.write)?;
+        });
+        if self
+            .channels
+            .get(&channel)
+            .is_some_and(|ch| ch.close_received)
+        {
+            self.channels.remove(&channel);
+        }
+        Ok(())
+    }
+
+    /// Cancels a channel: its unsent data is discarded and CLOSE is sent now.
+    /// Only a managed channel's cancellation does this; letting a channel go
+    /// closes it with [`Self::close`], behind its pending data.
+    pub(crate) fn cancel(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+        if let Some(ch) = self.channels.get_mut(&channel) {
+            ch.pending_data.clear();
+        }
+        self.close(channel)
+    }
+
+    pub(crate) fn receive_close(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+        if let Some(ch) = self.channels.get_mut(&channel) {
+            ch.close_received = true;
+            // The peer has closed its receive direction; queued writes cannot progress.
+            ch.pending_data.clear();
+        }
+        self.close(channel)?;
+        if self
+            .channels
+            .get(&channel)
+            .is_some_and(|ch| ch.close_sent && ch.close_received)
+        {
             self.channels.remove(&channel);
         }
         Ok(())
@@ -302,13 +365,45 @@ impl Encrypted {
         }
     }
 
+    pub(crate) fn debit_window(&mut self, id: ChannelId, bytes: usize) -> Result<(), crate::Error> {
+        if let Some(channel) = self.channels.get_mut(&id) {
+            let bytes = u32::try_from(bytes).map_err(|_| crate::Error::Inconsistent)?;
+            channel.sender_window_size = channel
+                .sender_window_size
+                .checked_sub(bytes)
+                .ok_or(crate::Error::Inconsistent)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn replenish_window(
+        &mut self,
+        id: ChannelId,
+        bytes: u32,
+    ) -> Result<(), crate::Error> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        if let Some(channel) = sendable_mut(&mut self.channels, id) {
+            channel.sender_window_size = channel
+                .sender_window_size
+                .checked_add(bytes)
+                .ok_or(crate::Error::Inconsistent)?;
+            push_packet!(self.write, {
+                self.write.push(msg::CHANNEL_WINDOW_ADJUST);
+                channel.recipient_channel.encode(&mut self.write)?;
+                bytes.encode(&mut self.write)?;
+            });
+        }
+        Ok(())
+    }
+
     pub fn adjust_window_size(
         &mut self,
         channel: ChannelId,
         data: &[u8],
         target: u32,
     ) -> Result<bool, crate::Error> {
-        if let Some(channel) = self.channels.get_mut(&channel) {
+        if let Some(channel) = sendable_mut(&mut self.channels, channel) {
             trace!(
                 "adjust_window_size, channel = {}, size = {},",
                 channel.sender_channel, target
@@ -403,7 +498,7 @@ impl Encrypted {
     }
 
     pub fn flush_pending(&mut self, channel: ChannelId) -> Result<usize, crate::Error> {
-        let flush_result = match self.channels.get_mut(&channel) {
+        let flush_result = match sendable_mut(&mut self.channels, channel) {
             Some(ch) => Self::flush_channel(&mut self.write, ch)?,
             None => return Ok(0),
         };
@@ -418,7 +513,7 @@ impl Encrypted {
         channel: ChannelId,
         is_rekeying: bool,
     ) -> Result<usize, crate::Error> {
-        let flush_result = match self.channels.get_mut(&channel) {
+        let flush_result = match sendable_mut(&mut self.channels, channel) {
             Some(ch) => Self::flush_channel_with_writer(&mut self.write, writer, ch, is_rekeying)?,
             None => return Ok(0),
         };
@@ -596,7 +691,10 @@ impl Encrypted {
         is_rekeying: bool,
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
-        if let Some(channel) = self.channels.get_mut(&channel) {
+        if let Some(channel) = sendable_mut(&mut self.channels, channel) {
+            if channel.close_received || channel.pending_close {
+                return Ok(());
+            }
             assert!(channel.confirmed);
             if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, None, 0));
@@ -620,7 +718,10 @@ impl Encrypted {
         is_rekeying: bool,
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
-        if let Some(channel) = self.channels.get_mut(&channel) {
+        if let Some(channel) = sendable_mut(&mut self.channels, channel) {
+            if channel.close_received || channel.pending_close {
+                return Ok(());
+            }
             assert!(channel.confirmed);
             if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, None, 0));
@@ -649,7 +750,10 @@ impl Encrypted {
         is_rekeying: bool,
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
-        if let Some(channel) = self.channels.get_mut(&channel) {
+        if let Some(channel) = sendable_mut(&mut self.channels, channel) {
+            if channel.close_received || channel.pending_close {
+                return Ok(());
+            }
             assert!(channel.confirmed);
             if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, Some(ext), 0));
@@ -672,7 +776,10 @@ impl Encrypted {
         is_rekeying: bool,
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
-        if let Some(channel) = self.channels.get_mut(&channel) {
+        if let Some(channel) = sendable_mut(&mut self.channels, channel) {
+            if channel.close_received || channel.pending_close {
+                return Ok(());
+            }
             assert!(channel.confirmed);
             if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, Some(ext), 0));
@@ -772,6 +879,7 @@ impl Encrypted {
                 self.channels.entry(ChannelId(self.last_channel_id.0))
             {
                 vacant_entry.insert(ChannelParams {
+                    _handles: None,
                     recipient_channel: 0,
                     sender_channel: ChannelId(self.last_channel_id.0),
                     sender_window_size: window_size,
@@ -783,6 +891,8 @@ impl Encrypted {
                     pending_data: std::collections::VecDeque::new(),
                     pending_eof: false,
                     pending_close: false,
+                    close_sent: false,
+                    close_received: false,
                 });
                 return ChannelId(self.last_channel_id.0);
             }
@@ -841,12 +951,12 @@ pub(crate) enum GlobalRequestResponse {
     /// request was for NoMoreSessions, disallow additional sessions
     NoMoreSessions,
     /// request was for TcpIpForward, sends Some(port) for success or None for failure
-    TcpIpForward(oneshot::Sender<Option<u32>>),
+    TcpIpForward(crate::client::ForwardReply<Option<u32>>),
     /// request was for CancelTcpIpForward, sends true for success or false for failure
-    CancelTcpIpForward(oneshot::Sender<bool>),
+    CancelTcpIpForward(crate::client::ForwardReply<bool>),
     /// request was for StreamLocalForward, sends true for success or false for failure
-    StreamLocalForward(oneshot::Sender<bool>),
-    CancelStreamLocalForward(oneshot::Sender<bool>),
+    StreamLocalForward(crate::client::ForwardReply<bool>),
+    CancelStreamLocalForward(crate::client::ForwardReply<bool>),
     /// OpenSSH host-key ownership proof
     HostKeysProve {
         return_channel: oneshot::Sender<Result<(), crate::Error>>,
@@ -859,6 +969,7 @@ pub(crate) enum GlobalRequestResponse {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use std::collections::{HashMap, VecDeque};
     use std::num::Wrapping;
 
@@ -901,6 +1012,7 @@ mod tests {
         pending_close: bool,
     ) -> ChannelParams {
         ChannelParams {
+            _handles: None,
             recipient_channel,
             sender_channel,
             recipient_window_size: 1024,
@@ -912,6 +1024,8 @@ mod tests {
             pending_data: VecDeque::from([(Bytes::from_static(b"hello"), None, 0)]),
             pending_eof,
             pending_close,
+            close_sent: false,
+            close_received: false,
         }
     }
 
@@ -955,6 +1069,7 @@ mod tests {
         pending_close: bool,
     ) -> ChannelParams {
         ChannelParams {
+            _handles: None,
             recipient_channel,
             sender_channel,
             recipient_window_size: window_size,
@@ -966,7 +1081,42 @@ mod tests {
             pending_data: VecDeque::from([(Bytes::from_static(b"hello"), None, 0)]),
             pending_eof,
             pending_close,
+            close_sent: false,
+            close_received: false,
         }
+    }
+
+    #[test]
+    fn nothing_follows_this_sides_close() {
+        let id = ChannelId(10);
+        let mut encrypted = test_encrypted();
+        encrypted.channels.insert(id, test_ready_channel(id, 42));
+        encrypted.close(id).unwrap();
+        encrypted.eof(id).unwrap();
+        encrypted.data(id, Bytes::from_static(b"late"), false).unwrap();
+        encrypted.replenish_window(id, 64).unwrap();
+        // CLOSE waits for pending data, so none is left to replay; the replay
+        // passes the gate all the same.
+        let channel = encrypted.channels.get_mut(&id).unwrap();
+        channel.pending_data.push_back((Bytes::from_static(b"held"), None, 0));
+        encrypted.flush_pending(id).unwrap();
+        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_CLOSE]);
+    }
+
+    #[test]
+    fn active_close_reclaims_state_only_after_peer_close() {
+        let id = ChannelId(10);
+        let mut encrypted = test_encrypted();
+        encrypted.channels.insert(id, test_ready_channel(id, 42));
+        encrypted.close(id).unwrap();
+        assert!(encrypted.channels[&id].close_sent);
+        assert!(!encrypted.channels[&id].close_received);
+        encrypted.close(id).unwrap();
+        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_CLOSE]);
+        encrypted.receive_close(id).unwrap();
+        assert!(!encrypted.channels.contains_key(&id));
+        encrypted.receive_close(id).unwrap();
+        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_CLOSE]);
     }
 
     // flush_pending (single-channel path)
@@ -995,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_pending_replays_deferred_close_and_removes_channel() {
+    fn flush_pending_replays_deferred_close_then_waits_for_peer() {
         let channel_id = ChannelId(11);
         let mut encrypted = test_encrypted();
         encrypted
@@ -1007,6 +1157,8 @@ mod tests {
             packet_types(&encrypted.write),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF, msg::CHANNEL_CLOSE]
         );
+        assert!(encrypted.channels[&channel_id].close_sent);
+        encrypted.receive_close(channel_id).unwrap();
         assert!(!encrypted.channels.contains_key(&channel_id));
     }
 
@@ -1053,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_all_pending_replays_deferred_close_and_removes_channel() {
+    fn flush_all_pending_replays_deferred_close_then_waits_for_peer() {
         let channel_id = ChannelId(2);
         let mut encrypted = test_encrypted();
         encrypted
@@ -1065,6 +1217,8 @@ mod tests {
             packet_types(&encrypted.write),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF, msg::CHANNEL_CLOSE]
         );
+        assert!(encrypted.channels[&channel_id].close_sent);
+        encrypted.receive_close(channel_id).unwrap();
         assert!(!encrypted.channels.contains_key(&channel_id));
     }
 
@@ -1105,6 +1259,8 @@ mod tests {
             1
         );
         assert!(encrypted.channels.contains_key(&channel_a));
+        assert!(encrypted.channels[&channel_b].close_sent);
+        encrypted.receive_close(channel_b).unwrap();
         assert!(!encrypted.channels.contains_key(&channel_b));
     }
 
@@ -1297,6 +1453,8 @@ mod tests {
             clear_packet_types(&writer.buffer().buffer),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF, msg::CHANNEL_CLOSE]
         );
+        assert!(encrypted.channels[&channel_id].close_sent);
+        encrypted.receive_close(channel_id).unwrap();
         assert!(!encrypted.channels.contains_key(&channel_id));
     }
 

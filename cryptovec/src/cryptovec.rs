@@ -483,6 +483,7 @@ fn optimization_barrier(dst: *mut u8, size: usize) {
 
 #[cfg(test)]
 mod test {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use super::{CryptoVec, checked_capacity};
 
     #[test]

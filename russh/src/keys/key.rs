@@ -13,7 +13,7 @@ use rand::rng;
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-use ssh_encoding::Decode;
+use ssh_encoding::{Decode, Reader};
 use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, EcdsaCurve, PublicKey};
 
@@ -42,21 +42,40 @@ const MAX_CERT_NESTING: usize = 8;
 
 /// Reject key/certificate blobs nested deeply enough to overflow the stack.
 ///
-/// `ssh-key` decodes a certificate's `signature_key` with `KeyData::decode`,
-/// which recurses into another certificate with no depth limit, so a crafted
-/// pre-auth blob aborts the process. Every nesting level must carry its own
-/// `*-cert-v01@*` algorithm name, so counting that marker bounds the depth.
-/// A legitimate certificate has one (its CA key is a plain key).
-// ponytail: substring count can over-count markers inside opaque fields; the
-// limit leaves headroom. Drop once ssh-key caps the depth itself.
-pub(crate) fn check_cert_nesting(blob: &[u8]) -> Result<(), ssh_key::Error> {
-    const MARKER: &[u8] = b"-cert-v01@";
-    if blob.windows(MARKER.len()).filter(|w| *w == MARKER).count() > MAX_CERT_NESTING {
-        return Err(ssh_key::Error::CertificateFieldInvalid(
-            ssh_key::certificate::Field::SignatureKey,
-        ));
+/// `ssh-key` recursively decodes a certificate's `signature_key` without a depth
+/// limit. Follow only that field iteratively, leaving opaque data such as key_id
+/// out of the nesting count. Drop once ssh-key caps the depth itself.
+pub(crate) fn check_cert_nesting(mut blob: &[u8]) -> Result<(), ssh_key::Error> {
+    let mut depth = 0;
+    loop {
+        // Use Certificate::decode's algorithm recognition, including custom names.
+        let Ok(algorithm) = Algorithm::new_certificate(&String::decode(&mut blob)?) else {
+            return Ok(());
+        };
+        depth += 1;
+        if depth > MAX_CERT_NESTING {
+            return Err(ssh_key::Error::CertificateFieldInvalid(
+                ssh_key::certificate::Field::SignatureKey,
+            ));
+        }
+
+        // Follow Certificate::decode_as without recursively decoding signature_key.
+        blob.read_prefixed(|_| Ok::<_, ssh_key::Error>(()))?; // nonce
+        KeyData::decode_as(&mut blob, algorithm)?; // nonrecursive subject key
+        u64::decode(&mut blob)?; // serial
+        u32::decode(&mut blob)?; // certificate type
+        for _ in 0..2 {
+            // key id and principals
+            blob.read_prefixed(|_| Ok::<_, ssh_key::Error>(()))?;
+        }
+        u64::decode(&mut blob)?; // valid after
+        u64::decode(&mut blob)?; // valid before
+        for _ in 0..3 {
+            // critical options, extensions and reserved
+            blob.read_prefixed(|_| Ok::<_, ssh_key::Error>(()))?;
+        }
+        blob = blob.read_prefixed(|body| Ok::<_, ssh_key::Error>(*body))?;
     }
-    Ok(())
 }
 
 /// Parse a public key from a byte slice.
@@ -185,16 +204,44 @@ mod test {
     }
 
     #[test]
+    fn certificate_key_id_markers_do_not_count_as_nesting() -> Result<(), ssh_key::Error> {
+        use ssh_key::certificate::Builder;
+
+        let ca = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[1; 32]));
+        let subject =
+            ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[2; 32]));
+        let mut builder = Builder::new(vec![0; 32], subject.public_key().clone(), 0, u64::MAX)?;
+        builder.key_id("-cert-v01@".repeat(8))?;
+        builder.valid_principal("fixture")?;
+        let certificate = builder.sign(&ca)?;
+        let blob = certificate.to_bytes()?;
+        let decoded = ssh_key::Certificate::from_bytes(&blob)?;
+        decoded.verify_signature()?;
+
+        assert!(super::check_cert_nesting(&blob).is_ok());
+        assert!(super::parse_public_key(&blob).is_ok());
+        assert!(crate::cert::PublicKeyOrCertificate::decode(
+            "ssh-ed25519-cert-v01@openssh.com",
+            &blob,
+        )
+        .is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn deeply_nested_certificate_is_rejected() {
         // Shallow chain is well-formed and still decodes.
         assert!(super::parse_public_key(&nested_cert(2)).is_ok());
+        assert!(super::parse_public_key(&nested_cert(8)).is_ok());
+        assert!(super::parse_public_key(&nested_cert(9)).is_err());
         // One packet's worth of nesting; without the guard this aborts on stack overflow.
         let deep = nested_cert(2848);
         assert!(super::parse_public_key(&deep).is_err());
         assert!(crate::cert::PublicKeyOrCertificate::decode("ssh-ed25519", &deep).is_err());
-        assert!(
-            crate::cert::PublicKeyOrCertificate::decode("ssh-ed25519-cert-v01@openssh.com", &deep)
-                .is_err()
-        );
+        assert!(crate::cert::PublicKeyOrCertificate::decode(
+            "ssh-ed25519-cert-v01@openssh.com",
+            &deep
+        )
+        .is_err());
     }
 }

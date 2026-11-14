@@ -209,6 +209,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // Test assertions on fixture replies and bytes must fail on unexpected values.
     use super::*;
 
     #[test]

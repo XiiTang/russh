@@ -60,7 +60,9 @@ macro_rules! push_packet {
 }
 
 mod channels;
-pub use channels::{Channel, ChannelMsg, ChannelReadHalf, ChannelStream, ChannelWriteHalf};
+pub use channels::{
+    Channel, ChannelInboxOverflow, ChannelMsg, ChannelReadHalf, ChannelStream, ChannelWriteHalf, ManagedChannel,
+};
 
 mod parsing;
 mod session;
@@ -149,7 +151,7 @@ pub enum Error {
 
     /// Server refused to open a channel.
     #[error("Failed to open channel ({0:?})")]
-    ChannelOpenFailure(ChannelOpenFailure),
+    ChannelOpenFailure(RemoteChannelOpenFailureInfo),
 
     /// Disconnected
     #[error("Disconnected")]
@@ -183,6 +185,9 @@ pub enum Error {
     /// Missing authentication method.
     #[error("No authentication method")]
     NoAuthMethod,
+    /// Use the explicit password-change authentication API to continue.
+    #[error("Server requires an explicit password change")]
+    PasswordChangeRequired,
 
     #[error("Channel send error")]
     SendError,
@@ -212,6 +217,11 @@ pub enum Error {
     #[error(transparent)]
     #[cfg(feature = "flate2")]
     Decompress(#[from] flate2::DecompressError),
+
+    /// The peer's compressed stream ended inside a packet.
+    #[error("Compressed stream ended inside a packet")]
+    #[cfg(feature = "flate2")]
+    CompressedStreamEnd,
 
     #[error(transparent)]
     Join(#[from] russh_util::runtime::JoinError),
@@ -405,6 +415,20 @@ impl Sig {
     }
 }
 
+/// The existing enforced transport and decompressed incoming packet bound.
+pub const MAXIMUM_INCOMING_PACKET_LEN: usize = cipher::MAXIMUM_DECOMPRESSED_PACKET_LEN;
+
+/// The peer's fields from the failure of one correlated channel OPEN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteChannelOpenFailureInfo {
+    /// The unmodified SSH reason code, including extension codes.
+    pub reason_code: u32,
+    /// The peer's description, including an empty description.
+    pub description: String,
+    /// The peer's language tag, including an empty tag.
+    pub language: String,
+}
+
 /// Reason for not being able to open a channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(missing_docs)]
@@ -512,6 +536,9 @@ pub(crate) struct ChannelParams {
     pending_data: std::collections::VecDeque<(bytes::Bytes, Option<u32>, usize)>,
     pending_eof: bool,
     pending_close: bool,
+    close_sent: bool,
+    close_received: bool,
+    _handles: Option<std::sync::Arc<crate::channels::handles::Handles>>,
 }
 
 impl ChannelParams {
@@ -592,18 +619,26 @@ impl<M: Send> ChannelOpenHandleInner<M> {
         }
     }
 
-    /// Accept the channel open request.
-    pub async fn accept(mut self) {
-        if let Some(pending) = self.inner.take() {
-            let _ = self.sender.send((self.make_msg)(pending, Ok(())));
-        }
+    /// Accept the channel open request. Fails with [`Error::SendError`] when
+    /// the session no longer runs, so that nothing was sent.
+    pub async fn accept(mut self) -> Result<(), Error> {
+        self.reply(Ok(()))
     }
 
-    /// Reject the channel open request with a reason.
-    pub async fn reject(mut self, reason: ChannelOpenFailure) {
-        if let Some(pending) = self.inner.take() {
-            let _ = self.sender.send((self.make_msg)(pending, Err(reason)));
-        }
+    /// Reject the channel open request with a reason. Fails with
+    /// [`Error::SendError`] when the session no longer runs, so that nothing
+    /// was sent.
+    pub async fn reject(mut self, reason: ChannelOpenFailure) -> Result<(), Error> {
+        self.reply(Err(reason))
+    }
+
+    fn reply(&mut self, result: Result<(), ChannelOpenFailure>) -> Result<(), Error> {
+        let Some(pending) = self.inner.take() else {
+            return Ok(());
+        };
+        self.sender
+            .send((self.make_msg)(pending, result))
+            .map_err(|_| Error::SendError)
     }
 }
 
