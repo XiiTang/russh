@@ -6,6 +6,49 @@ Retain upstream history and licenses; keep application behavior outside this
 fork. Keep a patch only while upstream lacks the behavior, and run its
 regression and Boundless's SSH tests before moving the pin.
 
+## A re-exchange checks a changed host key (Boundless #915)
+
+The client's initial key exchange asks `Handler::check_server_key` about the
+server's host key or certificate. A re-exchange (`Handle::rekey_soon`, the
+read/write/time limits, or the server's KEXINIT) verified the exchange
+signature with whatever key its reply carried and then dropped that key: the
+handler was never asked, so any key the server could sign with was accepted,
+including one the client's trust would refuse. Upstream `main` does the same
+(`d49f3e7` and `56a99987`, the rekey branch of `client/mod.rs`'s
+`KexProgress::Done`).
+
+OpenSSH runs its host verifier on every key exchange (`kexgen.c`,
+`kexgexc.c` → `kex_verify_host_key` → `verify_host_key_callback`) and reuses
+the verdict for its *previously accepted* key (`sshconnect.c`,
+`previous_host_key`). Here the client keeps what the initial exchange accepted
+(`Session::first_host`: a certificate as a whole, a plain key by its key data)
+and, at `KexProgress::Done` of a re-exchange, before `kex_done`, the new keys,
+the flush of queued writes and the replay of pending reads: an identical
+identity keeps the first verdict; any other is passed to `check_server_key`,
+and a refusal returns `Error::UnknownKey`, as the initial exchange does, so no
+traffic is protected by the refused keys. Comparing with the first identity,
+not the previous one, is deliberate: a changed key accepted once is checked
+again at every later re-exchange. A no-host-key exchange presents nothing and
+is unchanged. The server side is unchanged.
+
+`server::Session::set_host_keys_for_tests` (behind `cfg(test)` or the
+non-default `test-support` feature, which packaged builds never enable)
+replaces the keys a server session presents from its next exchange; it exists
+only so a client's re-exchange check can be tested against a server whose key
+changes, here and in Boundless's SSH tests.
+
+Regression: `tests::rekey_host_key` in `russh/src/tests.rs`. A server switches
+its host key at a client's request and the client re-keys: the same key keeps
+the first verdict (one handler call) and data flows; a changed key the client
+trusts is asked about and data flows; a changed key the client refuses ends the
+session with `UnknownKey` and the request sent after the re-key never echoes.
+On macOS arm64 the two changed-key cases fail on `a46c61b` (the handler is
+never asked again) and pass with the patch; `cargo test -p russh
+--no-default-features --features ring,rsa,flate2 --lib` passes all 250 tests,
+and `cargo clippy -p russh --no-default-features --features
+ring,rsa,flate2,test-support --lib -- -D warnings` exits 0 (all-targets keeps
+the existing `client/kex.rs` test-module findings of the base).
+
 ## 0.65.1 security release (Boundless #748)
 
 Reapply the existing Boundless patch set to upstream v0.65.1. The release fixes

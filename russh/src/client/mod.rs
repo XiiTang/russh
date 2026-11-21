@@ -108,6 +108,29 @@ pub struct Session {
     server_sig_algs: Option<Vec<Algorithm>>,
     /// Number of EXT_INFO messages received (RFC 8308 allows at most two).
     ext_info_count: u8,
+    /// The host identity `check_server_key` accepted at the initial key
+    /// exchange. A re-exchange presenting this identity again keeps that
+    /// verdict; any other identity is checked again.
+    first_host: Option<FirstHost>,
+}
+
+/// A host identity a key exchange presented, in the form it was presented:
+/// a certificate matches only the same certificate, a plain key only the
+/// same key data.
+#[derive(Debug, PartialEq)]
+enum FirstHost {
+    Key(ssh_key::public::KeyData),
+    Certificate(Box<Certificate>),
+}
+
+impl FirstHost {
+    fn of(key: Option<&PublicKey>, certificate: Option<&Certificate>) -> Option<Self> {
+        match (certificate, key) {
+            (Some(certificate), _) => Some(Self::Certificate(Box::new(certificate.clone()))),
+            (None, Some(key)) => Some(Self::Key(key.key_data().clone())),
+            (None, None) => None,
+        }
+    }
 }
 
 impl Drop for Session {
@@ -1792,6 +1815,7 @@ impl Session {
             open_global_requests: VecDeque::new(),
             server_sig_algs: None,
             ext_info_count: 0,
+            first_host: None,
         }
     }
 
@@ -2616,7 +2640,29 @@ async fn reply<H: Handler>(
                         session.common.strict_kex || newkeys.names.strict_kex();
 
                     if session.common.encrypted.is_some() {
-                        // This is a rekey
+                        // This is a rekey. Its host identity is checked before
+                        // its keys protect any traffic, queued writes or
+                        // pending reads: the first identity keeps its verdict,
+                        // any other asks the handler again, as the initial
+                        // exchange does.
+                        let presented = FirstHost::of(
+                            server_host_key.as_ref(),
+                            server_host_certificate.as_ref(),
+                        );
+                        if presented.is_some() && presented != session.first_host {
+                            let check = match (server_host_certificate, server_host_key) {
+                                (Some(certificate), _) => {
+                                    handler.check_server_key(&certificate.into()).await?
+                                }
+                                (None, Some(key)) => {
+                                    handler.check_server_key(&key.into()).await?
+                                }
+                                (None, None) => true,
+                            };
+                            if !check {
+                                return Err(crate::Error::UnknownKey.into());
+                            }
+                        }
                         handler
                             .kex_done(newkeys.kex.shared_secret_bytes(), &newkeys.names, session)
                             .await?;
@@ -2645,6 +2691,10 @@ async fn reply<H: Handler>(
                         // something the client was ever told to trust — asking
                         // about it as well would invite an implementation to
                         // answer yes to the wrong question.
+                        let first = FirstHost::of(
+                            server_host_key.as_ref(),
+                            server_host_certificate.as_ref(),
+                        );
                         if let Some(certificate) = server_host_certificate {
                             if !handler.check_server_key(&certificate.into()).await? {
                                 return Err(crate::Error::UnknownKey.into());
@@ -2655,6 +2705,7 @@ async fn reply<H: Handler>(
                                 return Err(crate::Error::UnknownKey.into());
                             }
                         }
+                        session.first_host = first;
 
                         handler
                             .kex_done(newkeys.kex.shared_secret_bytes(), &newkeys.names, session)

@@ -119,6 +119,9 @@ ring = ["dep:ring"]                           # Alternative crypto backend.
 rsa = ["dep:rsa", "dep:pkcs1", "ssh-key/rsa"]
 serde = ["ssh-key/serde"]
 _bench = ["dep:criterion"]
+# Fixture-only server hooks for downstream regression tests; never enabled in
+# packaged builds.
+test-support = []
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = [

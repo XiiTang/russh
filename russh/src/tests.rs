@@ -1911,3 +1911,217 @@ mod rekey_under_load {
         assert!(echoed == payload, "echoed data differs from what was sent");
     }
 }
+
+/// A re-exchange presents the host key again: the first identity keeps its
+/// verdict, a changed one is asked of the client handler, and a refused one
+/// ends the session before its keys protect traffic.
+mod rekey_host_key {
+    use std::sync::{Arc, Mutex};
+
+    use keys::PrivateKeyWithHashAlg;
+    use ssh_key::PrivateKey;
+
+    use super::*;
+    use crate::cert::PublicKeyOrCertificate;
+    use crate::server::Session;
+
+    /// Trusts only `trusted`, and records every key it is asked about and
+    /// how the session ended.
+    struct Client {
+        trusted: Vec<ssh_key::PublicKey>,
+        asked: Arc<Mutex<Vec<ssh_key::PublicKey>>>,
+        ended: Arc<Mutex<Option<String>>>,
+        disconnected: Arc<tokio::sync::Notify>,
+    }
+
+    impl client::Handler for Client {
+        type Error = crate::Error;
+
+        async fn check_server_key(
+            &mut self,
+            key: &PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            let PublicKeyOrCertificate::PublicKey { key, .. } = key else {
+                return Ok(false);
+            };
+            self.asked.lock().unwrap().push(key.clone());
+            Ok(self
+                .trusted
+                .iter()
+                .any(|trusted| trusted.key_data() == key.key_data()))
+        }
+
+        async fn disconnected(
+            &mut self,
+            reason: client::DisconnectReason<Self::Error>,
+        ) -> Result<(), Self::Error> {
+            if let client::DisconnectReason::Error(error) = &reason {
+                *self.ended.lock().unwrap() = Some(format!("{error:?}"));
+            }
+            self.disconnected.notify_one();
+            match reason {
+                client::DisconnectReason::ReceivedDisconnect(_) => Ok(()),
+                client::DisconnectReason::Error(error) => Err(error),
+            }
+        }
+    }
+
+    /// Echoes channel data. `switch` makes the session present `next` from
+    /// its next exchange on, then answers `switched`.
+    struct Server {
+        next: PrivateKey,
+    }
+
+    impl server::Handler for Server {
+        type Error = crate::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _: &str,
+            _: server::VerifiedPublicKey<'_>,
+        ) -> Result<server::Auth, Self::Error> {
+            Ok(server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: Channel<server::Msg>,
+            reply: server::ChannelOpenHandle,
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await?;
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            channel: ChannelId,
+            data: &[u8],
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if data == b"switch" {
+                assert!(session.set_host_keys_for_tests(vec![self.next.clone()]));
+                session.data(channel, b"switched".to_vec())?;
+            } else {
+                session.data(channel, data.to_vec())?;
+            }
+            Ok(())
+        }
+    }
+
+    async fn echo(channel: &mut Channel<client::Msg>, data: &[u8]) -> Option<Vec<u8>> {
+        channel.data(data).await.ok()?;
+        loop {
+            match channel.wait().await? {
+                ChannelMsg::Data { data } => return Some(data.to_vec()),
+                ChannelMsg::WindowAdjusted { .. } => {}
+                _ => return None,
+            }
+        }
+    }
+
+    /// Connects with `first` as the server key and `trusted` as the client's
+    /// trust, switches the server to `second`, re-keys, and reports the keys
+    /// the client was asked about, whether data still flows, and the end.
+    async fn rekey(
+        first: &PrivateKey,
+        second: &PrivateKey,
+        trusted: Vec<ssh_key::PublicKey>,
+    ) -> (Vec<ssh_key::PublicKey>, Option<Vec<u8>>, Option<String>) {
+        let _ = env_logger::try_init();
+        let mut config = server::Config {
+            inactivity_timeout: None,
+            ..Default::default()
+        };
+        config.keys.push(first.clone());
+        let config = Arc::new(config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let next = second.clone();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = server::run_stream(config, socket, Server { next })
+                .await
+                .unwrap()
+                .await;
+        });
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let ended = Arc::new(Mutex::new(None));
+        let disconnected = Arc::new(tokio::sync::Notify::new());
+        let mut session = client::connect(
+            Arc::new(client::Config::default()),
+            addr,
+            Client {
+                trusted,
+                asked: asked.clone(),
+                ended: ended.clone(),
+                disconnected: disconnected.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let user = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        assert!(session
+            .authenticate_publickey("user", PrivateKeyWithHashAlg::new(Arc::new(user), None))
+            .await
+            .unwrap()
+            .success());
+        let mut channel = session.channel_open_session().await.unwrap();
+        assert_eq!(echo(&mut channel, b"switch").await.unwrap(), b"switched");
+        session.rekey_soon().await.unwrap();
+        // Data written after the re-key request travels under whichever keys
+        // the exchange installs; with a refused exchange it never arrives.
+        let echoed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            echo(&mut channel, b"after"),
+        )
+        .await
+        .unwrap();
+        if echoed.is_none() {
+            tokio::time::timeout(std::time::Duration::from_secs(10), disconnected.notified())
+                .await
+                .unwrap();
+        }
+        let asked = asked.lock().unwrap().clone();
+        let ended = ended.lock().unwrap().clone();
+        (asked, echoed, ended)
+    }
+
+    #[tokio::test]
+    async fn the_same_host_key_keeps_its_first_verdict() {
+        let key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let (asked, echoed, ended) =
+            rekey(&key, &key, vec![key.public_key().clone()]).await;
+        assert_eq!(asked.len(), 1);
+        assert_eq!(echoed.unwrap(), b"after");
+        assert_eq!(ended, None);
+    }
+
+    #[tokio::test]
+    async fn a_changed_host_key_the_client_trusts_is_asked_and_accepted() {
+        let first = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let second = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let (asked, echoed, ended) = rekey(
+            &first,
+            &second,
+            vec![first.public_key().clone(), second.public_key().clone()],
+        )
+        .await;
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[1].key_data(), second.public_key().key_data());
+        assert_eq!(echoed.unwrap(), b"after");
+        assert_eq!(ended, None);
+    }
+
+    #[tokio::test]
+    async fn a_changed_host_key_the_client_refuses_ends_the_session() {
+        let first = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let second = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let (asked, echoed, ended) =
+            rekey(&first, &second, vec![first.public_key().clone()]).await;
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[1].key_data(), second.public_key().key_data());
+        assert_eq!(echoed, None);
+        assert!(ended.as_deref().is_some_and(|ended| ended.contains("UnknownKey")), "{ended:?}");
+    }
+}

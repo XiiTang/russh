@@ -498,6 +498,25 @@ impl Handle {
 }
 
 impl Session {
+    /// Replace the host keys this session presents from its next key
+    /// exchange on. The next exchange snapshots the session's configuration
+    /// when it begins, so a call before then decides the key it presents.
+    ///
+    /// Fixture only: it lets a client's re-exchange host-key check be tested
+    /// against a server whose key changes. It answers whether the keys were
+    /// replaced: the session must hold its configuration alone, as it does
+    /// between exchanges when it was started with an `Arc` nobody else keeps.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_host_keys_for_tests(&mut self, keys: Vec<ssh_key::PrivateKey>) -> bool {
+        match Arc::get_mut(&mut self.common.config) {
+            Some(config) => {
+                config.keys = keys;
+                true
+            }
+            None => false,
+        }
+    }
+
     fn maybe_decompress(&mut self, buffer: &SSHBuffer) -> Result<IncomingSshPacket, Error> {
         if let Some(ref mut enc) = self.common.encrypted {
             let mut decomp = Vec::new();
