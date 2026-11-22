@@ -104,9 +104,12 @@ where
                 let credit = this.credit.clone();
                 let ready = this
                     .ready
-                    .get_or_insert_with(|| Box::pin(async move { credit.ready().await }));
+                    .get_or_insert_with(|| Box::pin(async move { credit.ready_or_closed().await }));
                 ready!(ready.as_mut().poll(cx));
                 this.ready = None;
+                if this.credit.is_closed() {
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "channel closed")));
+                }
             }
             let permit = ready!(this.poll_permit(cx))?;
             let (id, ext) = (this.id, this.ext);

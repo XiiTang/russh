@@ -15,7 +15,12 @@ pub struct ChannelRef {
 }
 
 impl Drop for ChannelRef {
-    fn drop(&mut self) { if let Some(inbox) = &self.inbox { inbox.close_sender(); } }
+    fn drop(&mut self) {
+        self.window_size.close();
+        if let Some(inbox) = &self.inbox {
+            inbox.close_sender();
+        }
+    }
 }
 impl ChannelRef {
     pub(crate) async fn send(&self, message: ChannelMsg) -> Result<(), tokio::sync::mpsc::error::SendError<ChannelMsg>> {

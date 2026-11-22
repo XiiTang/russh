@@ -6,6 +6,67 @@ Retain upstream history and licenses; keep application behavior outside this
 fork. Keep a patch only while upstream lacks the behavior, and run its
 regression and Boundless's SSH tests before moving the pin.
 
+
+## Disconnect observation (Boundless #944)
+
+Boundless records the client session's end in
+`src/protocols/ssh/mod.rs::Handler::session_ended`. Its
+`src/protocols/ssh/native.rs::convert` reads that end when russh releases or
+refuses an operation. A nested SSH connection can use a channel stream as its
+transport, so a shutdown waiting for carrier queue space must leave other
+operations free to finish.
+
+- Upstream `b33092a` uses the same bare `Disconnect` result for processing
+  a local disconnect, losing all handles and a short read. The client loop now
+  distinguishes a processed local `Handle::disconnect` after its flush
+  succeeds. A received DISCONNECT keeps its decoded details. An unsuccessful
+  flush or read keeps its concrete error. The disconnect reason is `Copy` so
+  the synchronous observer can retain its wire value from the borrowed packet.
+- Upstream `Session::run` closes its command queues, awaits transport
+  shutdown, calls `disconnected` if shutdown succeeded, then releases the
+  session's reply senders and channel refs. The synchronous `session_ended`
+  runs as soon as the loop exits, before callers are released. The usual
+  queue closes and the reply senders' destruction now precede shutdown.
+  Buffered replies remain readable. The async `disconnected` callback still
+  follows shutdown, with the existing fork's error precedence (callback,
+  shutdown, session). It still observes a received DISCONNECT or an established
+  session's error when shutdown itself fails.
+- Upstream's connect waits for a successful key-exchange signal, then joins
+  the task on a lost signal. That makes a handshake error wait on shutdown
+  and allows a shutdown error to replace it. The signal now also carries its
+  handshake error (or `Disconnect` for a received DISCONNECT). A dropped
+  signal still joins to observe abort or panic. After a delivered error,
+  the `PendingSession` owner can stop and join for the native retirement
+  result, which retains a shutdown error. Pre-handshake received disconnects
+  still reach the async callback if the task runs through shutdown.
+- Upstream's `ChannelTx` waits for window notification before it reserves
+  an outbound slot. Channel retirement issues no window notification. In
+  this fork, dropping the `ChannelRef` wakes that stream wait and it
+  returns `BrokenPipe`, the same error already used when slot reservation
+  finds a closed queue. `ChannelWriteHalf::data_bytes` keeps its existing
+  credit wait under the Boundless channel worker's stop.
+
+Upstream `v0.65.4` still closes queues before shutdown and waits for shutdown
+before callback and reply retirement. Its handshake and stream writer still
+use the corresponding join and window notification paths.
+
+The `session_end` wire tests hold the async callback with a pending OPEN,
+observe command refusal and read the buffered channel data. They exercise
+local DISCONNECT, I/O EOF and flush failure, return a refused handshake while
+shutdown is held, and use the test-support fixture to present a refused host
+key before authentication. `disconnect_reason` checks shutdown error
+precedence and callback delivery. The channel credit regression in
+`channels::tests` drops the native ref with an active zero-credit writer,
+then polls `data_bytes` on the same channel to verify its wait.
+
+On macOS arm64 with Rust 1.97.0, the 104 selected regressions passed with
+`ring,rsa,flate2,test-support` and upstream registry RSA. With Boundless's
+RSA pin, 103 passed and the upstream RSA certificate fixture failed while
+signing its certificate because the pin refuses private-key operations.
+Strict Clippy passed for the library and the new `session_end` target.
+The broader test-target Clippy check reports the existing `client/kex.rs`
+test diagnostics. Formatting passed.
+
 ## A re-exchange checks a changed host key (Boundless #915)
 
 The client's initial key exchange asks `Handler::check_server_key` about the
@@ -26,16 +87,18 @@ and, at `KexProgress::Done` of a re-exchange, before `kex_done`, the new keys,
 the flush of queued writes and the replay of pending reads: an identical
 identity keeps the first verdict; any other is passed to `check_server_key`,
 and a refusal returns `Error::UnknownKey`, as the initial exchange does, so no
-traffic is protected by the refused keys. Comparing with the first identity,
-not the previous one, is deliberate: a changed key accepted once is checked
-again at every later re-exchange. A no-host-key exchange presents nothing and
-is unchanged. The server side is unchanged.
+traffic is protected by the refused keys. Every identity that differs from
+the first is checked on each exchange. A no-host-key exchange presents nothing
+and keeps the existing behavior.
 
-`server::Session::set_host_keys_for_tests` (behind `cfg(test)` or the
-non-default `test-support` feature, which packaged builds never enable)
-replaces the keys a server session presents from its next exchange; it exists
-only so a client's re-exchange check can be tested against a server whose key
-changes, here and in Boundless's SSH tests.
+The server fixtures are available under `cfg(test)` or the non-default
+`test-support` feature. `Session::set_host_keys_for_tests` replaces the keys
+the server presents on its next exchange. `Handle::rekey_with_host_keys_for_tests`
+also starts the exchange immediately, including during authentication, and
+signals once `begin_rekey` has queued its KEXINIT. Upstream's automatic rekey
+eligibility requires authentication and its server Handle has no such fixture.
+The feature lets Boundless's SSH tests control when the client receives a
+different host identity.
 
 Regression: `tests::rekey_host_key` in `russh/src/tests.rs`. A server switches
 its host key at a client's request and the client re-keys: the same key keeps
@@ -94,7 +157,7 @@ implementations add no separate production mechanism.
 | Fixed queue fence / blocked sibling | Keep the existing event-loop window gate and fixed accepted-message fence; do not drain more application data around that gate. Upstream ordered close remains ordered behind queued data. | blocked-sibling/fence/KEX library tests | 43b5059 |
 | No message after CLOSE | Keep `session::sendable` across EOF, requests, adjustment and pending replay; upstream has no sent-CLOSE refusal there. | `nothing_follows_this_sides_close`; `no_request_follows_this_sides_close` | b9c5b0d |
 | Writer credit at queue admission | Keep `SendCredit::admit`, `charge`, `grant`. Upstream #790 now adds WINDOW_ADJUST credit, so retain that corrected behavior through `grant`; it still debits writer credit before queue admission and has no difference-based repeated-confirmation accounting. No parallel upstream `grow` remains. | cancelled/pending write, window-adjust and repeated-confirmation library tests; upstream `test_window_adjust` | 11dff59 |
-| Disconnect observation | Keep handler publication before returning socket shutdown failure; upstream `Session::run` still uses `shutdown().await?` before the callback. Preserve upstream shutdown result and pre-handshake handling. | `disconnect_reason` | 3e80707 |
+| Disconnect observation | [Publish the client session end before releasing SSH operations](#disconnect-observation-boundless-944). | `session_end`, `disconnect_reason`, `channels::tests` | 3e80707, extended below |
 | Interrupted authentication | Keep `recv_auth_reply` returning Disconnect instead of a fabricated refusal; upstream still returns empty-method Failure on closed reply streams. Preserve 0.65's new SignFailed/abandon_sign_request behavior in both signing paths. Adapt the new upstream signer fixture to the fork's existing From<Error> contract. | `auth_session_end`; upstream `auth_signer_failure` | 6be5385 |
 | Channel reply consumption | Keep final `Handler::channel_reply` replacement for the old ordering-only hook; upstream always queues replies for the reader, even after the handler answers them. | `channel_reply` | c43f884 |
 | Owned pre-Handle establishment | Adapt `PendingSession::establish` to carry 0.65's optional AgentSessionBinding into the same Handle after key exchange. Preserve cancellation, joined-result and error paths; upstream's normal connect path still supplies the same binding. | `owned_establishment`; upstream `test_agent_session_bind` | 419548f, 9309c9c |

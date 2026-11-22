@@ -92,6 +92,14 @@ pub enum Msg {
         pending: PendingChannelOpen,
         result: Result<(), ChannelOpenFailure>,
     },
+    /// Fixture only: present `keys` from a key re-exchange this session
+    /// starts now, in whatever authentication state it is in; `started` is
+    /// answered once the exchange has begun (its KEXINIT is queued).
+    #[cfg(any(test, feature = "test-support"))]
+    RekeyForTests {
+        keys: Vec<ssh_key::PrivateKey>,
+        started: tokio::sync::oneshot::Sender<()>,
+    },
 }
 
 impl From<(ChannelId, ChannelMsg)> for Msg {
@@ -479,6 +487,27 @@ impl Handle {
             .map_err(|_| ())
     }
 
+    /// Fixture only: start a key re-exchange now, presenting `keys`, also
+    /// before the client authenticated (RFC 4253 section 9 lets either side
+    /// start one at any time; russh itself starts none before then).
+    /// Returns once the request is queued to the session; the receiver
+    /// answers once the session has begun the exchange (its KEXINIT is
+    /// written ahead of anything the session sends after). A handler that
+    /// holds the session (an authentication callback) is let go before
+    /// awaiting it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn rekey_with_host_keys_for_tests(
+        &self,
+        keys: Vec<ssh_key::PrivateKey>,
+    ) -> Result<tokio::sync::oneshot::Receiver<()>, Error> {
+        let (started, begun) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(Msg::RekeyForTests { keys, started })
+            .await
+            .map_err(|_| Error::SendError)?;
+        Ok(begun)
+    }
+
     /// Allows a server to disconnect a client session
     pub async fn disconnect(
         &self,
@@ -669,6 +698,12 @@ impl Session {
             }
             Msg::ChannelOpenReply { pending, result } => {
                 self.finalize_channel_open_reply(pending, result)?;
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            Msg::RekeyForTests { keys, started } => {
+                assert!(self.set_host_keys_for_tests(keys), "the session holds its configuration");
+                self.begin_rekey()?;
+                let _ = started.send(());
             }
             other => {
                 // should be unreachable, since the receiver only gets

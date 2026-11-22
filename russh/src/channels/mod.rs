@@ -1,6 +1,7 @@
 pub(crate) mod handles;
 pub(crate) mod inbox;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -151,6 +152,7 @@ pub(crate) struct SendCredit {
     // Below zero when the engine took data outside the writers beyond it.
     value: Arc<std::sync::Mutex<i64>>,
     notifier: Arc<Notify>,
+    closed: Arc<AtomicBool>,
 }
 
 impl SendCredit {
@@ -158,6 +160,7 @@ impl SendCredit {
         Self {
             value: Arc::new(std::sync::Mutex::new(i64::from(initial))),
             notifier: Arc::new(Notify::new()),
+            closed: Arc::default(),
         }
     }
 
@@ -182,13 +185,32 @@ impl SendCredit {
         *value = value.saturating_sub(i64::try_from(bytes).unwrap_or(i64::MAX));
     }
 
+    /// Wakes a stream writer waiting on a channel that can no longer receive credit.
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.notifier.notify_waiters();
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     /// Waits until there is credit to admit, taking none.
     pub(crate) async fn ready(&self) {
+        self.wait_for_credit(false).await;
+    }
+
+    /// The stream writer also wakes when its channel closes.
+    pub(crate) async fn ready_or_closed(&self) {
+        self.wait_for_credit(true).await;
+    }
+
+    async fn wait_for_credit(&self, wake_on_close: bool) {
         loop {
             let notified = self.notifier.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if *self.value() > 0 {
+            if (wake_on_close && self.is_closed()) || *self.value() > 0 {
                 return;
             }
             notified.await;
@@ -916,6 +938,38 @@ mod tests {
             }
             msg => panic!("unexpected message: {msg:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn losing_the_channel_wakes_a_stream_writer_waiting_for_credit() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::oneshot;
+
+        let (sender, _receiver) = mpsc::channel::<(ChannelId, ChannelMsg)>(1);
+        let (channel, reference) =
+            Channel::new(ChannelId(9), sender, 1024, 0, 1, Default::default());
+        let (entered, waiting) = oneshot::channel();
+        let mut stream_writer = Box::pin(channel.make_writer());
+        let writer = tokio::spawn(async move {
+            let mut write = Box::pin(stream_writer.write(b"needs credit"));
+            assert!(futures::poll!(write.as_mut()).is_pending());
+            entered.send(()).unwrap();
+            write.await.unwrap_err().kind()
+        });
+
+        waiting.await.unwrap();
+        drop(reference);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+                .await
+                .unwrap()
+                .unwrap(),
+            std::io::ErrorKind::BrokenPipe
+        );
+
+        // The native channel sender still waits for credit under its caller's stop.
+        let mut send = Box::pin(channel.data_bytes(Bytes::from_static(b"needs credit")));
+        assert!(futures::poll!(send.as_mut()).is_pending());
     }
 
     #[tokio::test]

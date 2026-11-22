@@ -112,6 +112,7 @@ pub struct Session {
     /// exchange. A re-exchange presenting this identity again keeps that
     /// verdict; any other identity is checked again.
     first_host: Option<FirstHost>,
+    local_disconnect: bool,
 }
 
 /// A host identity a key exchange presented, in the form it was presented:
@@ -460,6 +461,25 @@ pub enum DisconnectReason<E: From<crate::Error> + Send> {
     Error(E),
 }
 
+/// How the client session's loop ended.
+#[derive(Debug)]
+pub enum SessionEnd<'a, E> {
+    /// The server sent SSH_MSG_DISCONNECT.
+    Received(&'a RemoteDisconnectInfo),
+    /// The session processed and flushed a request from [`Handle::disconnect`].
+    Local,
+    /// The error that ended the loop, passed on to establishment or to the handler.
+    Error(&'a mut E),
+}
+
+enum LoopEnd {
+    Received(RemoteDisconnectInfo),
+    Local,
+    Bare,
+}
+
+type KexAnswer<E> = Result<Option<crate::keys::agent::AgentSessionBinding>, E>;
+
 /// Owns a client session while its initial key exchange is in progress.
 ///
 /// Register this owner before awaiting [`Self::establish`]. A cancelled
@@ -471,7 +491,7 @@ pub enum DisconnectReason<E: From<crate::Error> + Send> {
 #[must_use = "stop and await an abandoned session, or transfer it into a Handle"]
 pub struct PendingSession<H: Handler> {
     handle: Option<Handle<H>>,
-    kex_done: Option<oneshot::Receiver<Option<crate::keys::agent::AgentSessionBinding>>>,
+    kex_done: Option<oneshot::Receiver<KexAnswer<H::Error>>>,
     established: bool,
     joined: bool,
 }
@@ -483,8 +503,9 @@ impl<H: Handler> PendingSession<H> {
         }
     }
 
-    /// Wait for the initial key exchange. Cancelling this wait retains the
-    /// native owner, which can still be stopped and awaited.
+    /// Wait for the initial key exchange. The answer is available before
+    /// transport shutdown. Cancelling this wait retains the native owner,
+    /// which can still be stopped and awaited.
     pub async fn establish(&mut self) -> Result<(), H::Error> {
         if self.established {
             return Ok(());
@@ -496,7 +517,7 @@ impl<H: Handler> PendingSession<H> {
             .await;
         self.kex_done.take();
         let agent_session_binding = match result {
-            Ok(binding) => binding,
+            Ok(answer) => answer?,
             Err(err) => {
                 debug!("kex_done_signal sender was dropped {err:?}");
                 let result = self
@@ -1816,6 +1837,7 @@ impl Session {
             server_sig_algs: None,
             ext_info_count: 0,
             first_host: None,
+            local_disconnect: false,
         }
     }
 
@@ -1823,9 +1845,7 @@ impl Session {
         mut self,
         stream: SshRead<R>,
         mut handler: H,
-        mut kex_done_signal: Option<
-            oneshot::Sender<Option<crate::keys::agent::AgentSessionBinding>>,
-        >,
+        mut kex_done_signal: Option<oneshot::Sender<KexAnswer<H::Error>>>,
     ) -> Result<(), H::Error> {
         let (stream_read, mut stream_write) = stream.split();
         let result = self
@@ -1836,38 +1856,66 @@ impl Session {
                 &mut kex_done_signal,
             )
             .await;
+        let result = match result {
+            Ok(LoopEnd::Received(info)) => {
+                handler.session_ended(SessionEnd::Received(&info));
+                Ok(info)
+            }
+            Ok(LoopEnd::Local) => {
+                handler.session_ended(SessionEnd::Local);
+                Err(crate::Error::Disconnect.into())
+            }
+            Ok(LoopEnd::Bare) => {
+                let mut error = crate::Error::Disconnect.into();
+                handler.session_ended(SessionEnd::Error(&mut error));
+                Err(error)
+            }
+            Err(mut error) => {
+                handler.session_ended(SessionEnd::Error(&mut error));
+                Err(error)
+            }
+        };
         trace!("disconnected");
+
+        let result = match (kex_done_signal, result) {
+            (Some(signal), Err(error)) => {
+                let _ = signal.send(Err(error));
+                None
+            }
+            (Some(signal), Ok(info)) => {
+                let _ = signal.send(Err(crate::Error::Disconnect.into()));
+                Some(Ok(info))
+            }
+            (None, result) => Some(result),
+        };
+
         self.receiver.close();
         self.priority_receiver.close();
         self.inbound_channel_receiver.close();
-        // The handler learns how the session ended even when the socket's
-        // shutdown fails: that failure is returned after it, never instead.
+        // Drop native reply senders and channel refs before transport shutdown.
+        // Replies already sent remain in their receivers.
+        drop(self);
+
+        // The async handler still sees the end after the shutdown attempt.
+        // Its error takes precedence over the shutdown or session result.
         let shutdown = map_err!(stream_write.shutdown().await);
         match result {
-            Ok(v) => {
+            // Establishment already owns the handshake error.
+            None => {
+                shutdown?;
+                Ok(())
+            }
+            Some(Ok(info)) => {
                 handler
-                    .disconnected(DisconnectReason::ReceivedDisconnect(v))
+                    .disconnected(DisconnectReason::ReceivedDisconnect(info))
                     .await?;
                 shutdown?;
                 Ok(())
             }
-            Err(e) => {
-                if kex_done_signal.is_some() {
-                    // The kex signal has not been consumed yet,
-                    // so we can send return the concrete error to be propagated
-                    // into the JoinHandle and returned from `connect_stream`
-                    debug!("disconnected during handshake {e:?}");
-                    shutdown?;
-                    Err(e)
-                } else {
-                    // The kex signal has been consumed, so no one is
-                    // awaiting the result of this coroutine
-                    // We're better off passing the error into the Handler
-                    debug!("disconnected {e:?}");
-                    handler.disconnected(DisconnectReason::Error(e)).await?;
-                    shutdown?;
-                    Err(H::Error::from(crate::Error::Disconnect))
-                }
+            Some(Err(error)) => {
+                handler.disconnected(DisconnectReason::Error(error)).await?;
+                shutdown?;
+                Err(crate::Error::Disconnect.into())
             }
         }
     }
@@ -1877,11 +1925,9 @@ impl Session {
         stream_read: SshRead<ReadHalf<R>>,
         stream_write: &mut WriteHalf<R>,
         handler: &mut H,
-        kex_done_signal: &mut Option<
-            tokio::sync::oneshot::Sender<Option<crate::keys::agent::AgentSessionBinding>>,
-        >,
-    ) -> Result<RemoteDisconnectInfo, H::Error> {
-        let mut result: Result<RemoteDisconnectInfo, H::Error> = Err(Error::Disconnect.into());
+        kex_done_signal: &mut Option<oneshot::Sender<KexAnswer<H::Error>>>,
+    ) -> Result<LoopEnd, H::Error> {
+        let mut remote_end = None;
         self.flush()?;
 
         map_err!(self.common.packet_writer.flush_into(stream_write).await)?;
@@ -1938,7 +1984,7 @@ impl Session {
                         #[allow(clippy::indexing_slicing)] // length checked
                         if pkt.buffer[0] == crate::msg::DISCONNECT {
                             debug!("received disconnect");
-                            result = self.process_disconnect(&pkt).map_err(H::Error::from);
+                            remote_end = Some(self.process_disconnect(&pkt));
                         } else {
                             self.common.received_data = true;
                             let kex_was_active = self.kex.active();
@@ -2074,7 +2120,11 @@ impl Session {
             }
         }
 
-        result
+        match remote_end {
+            Some(result) => result.map(LoopEnd::Received).map_err(H::Error::from),
+            None if self.local_disconnect => Ok(LoopEnd::Local),
+            None => Ok(LoopEnd::Bare),
+        }
     }
 
     fn process_disconnect(
@@ -2299,7 +2349,10 @@ impl Session {
                 reason,
                 description,
                 language_tag,
-            } => self.disconnect(reason, &description, &language_tag)?,
+            } => {
+                self.disconnect(reason, &description, &language_tag)?;
+                self.local_disconnect = true;
+            }
             // A writer's data took its credit when it was queued.
             Msg::Channel(id, ChannelMsg::Data { data }) => self.admitted_data(id, None, data)?,
             Msg::Channel(id, ChannelMsg::Eof) => {
@@ -2549,9 +2602,7 @@ impl Session {
 async fn reply<H: Handler>(
     session: &mut Session,
     handler: &mut H,
-    kex_done_signal: &mut Option<
-        tokio::sync::oneshot::Sender<Option<crate::keys::agent::AgentSessionBinding>>,
-    >,
+    kex_done_signal: &mut Option<oneshot::Sender<KexAnswer<H::Error>>>,
     pkt: &mut IncomingSshPacket,
 ) -> Result<(), H::Error> {
     if let Some(message_type) = pkt.buffer.first() {
@@ -2716,7 +2767,7 @@ async fn reply<H: Handler>(
                             .encrypted(initial_encrypted_state(session), newkeys);
 
                         if let Some(sender) = kex_done_signal.take() {
-                            sender.send(agent_session_binding).unwrap_or(());
+                            let _ = sender.send(Ok(agent_session_binding));
                         }
                     }
 
@@ -4359,6 +4410,14 @@ pub trait Handler: Sized + Send {
             Ok(())
         }
     }
+
+    /// Called once when the loop returns, before closing command queues,
+    /// releasing pending replies, or attempting transport shutdown.
+    /// Record the end here for callers the session is about to release.
+    /// This hook must return immediately. [`Self::disconnected`] still
+    /// follows the shutdown attempt for established sessions.
+    #[allow(unused_variables)]
+    fn session_ended(&mut self, end: SessionEnd<'_, Self::Error>) {}
 
     /// Called when the server sent a disconnect message
     ///
