@@ -982,10 +982,22 @@ effect tests cover original Terminal completion before normal end and preserve
 listener-grant validation and late-cancellation ownership. Test commands and
 platform results are in the consuming change's report; no full lane is claimed.
 
-## Typed receive EOF for unfinished input
+## Retired identification EOF patch
 
-Upstream returns Disconnect on a zero read before server identification completes. The patch returns I/O UnexpectedEof at that read. Parsed identification, banner limits, SSH disconnect messages, established packet reads and local session stop retain their paths.
+The batch-C change that made SshRead::read_ssh_id_inner return I/O UnexpectedEof
+on zero read is retired. The existing public connect_stream_owned API performs
+identification before it creates the session task or returns PendingSession.
+In that pre-session call, Disconnect comes only from the identification reader's
+zero read; version/banner refusals have Version, and I/O retains IO. Boundless's
+ssh::native::SessionError::into_identification_failure can therefore classify it
+through network::failure at that single call site. Later establish/join/session
+Disconnect values continue through the original session-end converter.
 
-The rule is that a reliable stream ending before required input completes reports a receive cut. The check point is SshRead::read_ssh_id_inner. Boundless converts its typed native evidence through network::failure and keeps existing answer and end selection. The regression is protocols::ssh::tests::unfinished_ssh_identification_keeps_the_receive_cut. These tests are run with the Boundless integration change for #836.
-
-Upstream submission is deferred under the owner's no-GitHub-writes instruction for this batch.
+Upstream returns Disconnect for identification zero read, and continues doing so
+here. Its parsed identification, bounds, established packet reads, decoded
+Disconnect and local stop are unchanged. No byte observer or second SSH parser
+is introduced. The regression is Boundless
+protocols::ssh::tests::unfinished_ssh_identification_keeps_the_receive_cut, with
+normal SSH end/reader tests. Prior native-change evidence at
+cd211e9eb3595a25fbaa524e1fb272fe11600aed passed on macOS arm64; the Boundless-only
+replacement is verified by the rebased integration run, not assumed from that result.

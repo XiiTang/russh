@@ -167,7 +167,7 @@ impl<R: AsyncRead + Unpin> SshRead<R> {
                     trace!("{:?}", std::str::from_utf8(&ssh_id.buf[..ssh_id.total]));
                 }
                 if n == 0 {
-                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                    return Err(Error::Disconnect);
                 }
 
                 if let Some((line_len, bytes_read)) = ssh_id.line() {
@@ -239,7 +239,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_ssh_id_too_long() {
-        let data = String::from_iter(iter::once("SSH-2.0-").chain(iter::repeat_n("A", 500)));
+        let data = String::from_iter(iter::once("SSH-2.0-").chain(
+            iter::repeat_n("A", 500)));
         let mut read = SshRead::new(data.as_bytes());
 
         let received = read.read_ssh_id().await;
