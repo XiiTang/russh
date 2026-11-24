@@ -981,3 +981,11 @@ convenience waiter before the next global reply. Boundless's gated forwarding
 effect tests cover original Terminal completion before normal end and preserve
 listener-grant validation and late-cancellation ownership. Test commands and
 platform results are in the consuming change's report; no full lane is claimed.
+
+## Typed receive EOF for unfinished input
+
+Upstream returns Disconnect on a zero read before server identification completes. The patch returns I/O UnexpectedEof at that read. Parsed identification, banner limits, SSH disconnect messages, established packet reads and local session stop retain their paths.
+
+The rule is that a reliable stream ending before required input completes reports a receive cut. The check point is SshRead::read_ssh_id_inner. Boundless converts its typed native evidence through network::failure and keeps existing answer and end selection. The regression is protocols::ssh::tests::unfinished_ssh_identification_keeps_the_receive_cut. These tests are run with the Boundless integration change for #836.
+
+Upstream submission is deferred under the owner's no-GitHub-writes instruction for this batch.
